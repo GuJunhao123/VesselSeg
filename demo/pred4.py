@@ -9,15 +9,15 @@ from monai.transforms import (
     CropForegroundd, SpatialPadd, ScaleIntensityRanged, NormalizeIntensityd, 
     EnsureTyped
 )
-from network.cotu import UNet3D 
+# 
 from monai.inferers import SlidingWindowInferer
 from datetime import datetime
 
 # ========================= 基础配置 =========================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "/home/qjl/mnt/qjl/Mobile-U-ViT/result_msd_vessel_3cls_dec/20260214_101918/best_model.pth" 
-INPUT_IMAGE = "/home/qjl/mnt/qjl/Task08/imagesTr/hepaticvessel_437.nii.gz"
-INPUT_LABEL = "/home/qjl/mnt/qjl/Task08/labelsTr/hp437.nii.gz"
+MODEL_PATH = "d:\\Code_Program\\program\\VesselSeg\\resource\\best_model.pth" 
+INPUT_IMAGE = "d:\\Code_Program\\program\\VesselSeg\\resource\\hepaticvessel_437.nii\\hepaticvessel_437.nii"
+INPUT_LABEL = "d:\\Code_Program\\program\\VesselSeg\\resource\\hp437.nii\\hp437.nii"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 RESULT_DIR = f"./vis_results/{current_time}"
 PATCH_SIZE = (96, 96, 96)
@@ -178,15 +178,12 @@ class GenerateVesselDecompositiond:
 def run_inference():
     # A. 加载模型
     from monai.networks.nets.dynunet import DynUNet
-    # from network.MobileUViT_3D import mobileuvit_l
-    from network.ori import OriNet
-    from network.superlightnet import NormalU_Net
     from monai.networks.nets.swin_unetr import SwinUNETR
     from monai.networks.nets.basic_unet import BasicUNet
     from monai.networks.nets.basic_unetplusplus import BasicUnetPlusPlus
     from monai.networks.nets.unetr import UNETR
     from monai.networks.nets.vnet import VNet
-    from network.model1 import mobileuvit_l
+    from model1 import mobileuvit_l
     # model = mobileuvit_l(inch=1,out_channel=NUM_CLASSES).to(DEVICE)
     # model = NormalU_Net(init_channels=1,class_nums=NUM_CLASSES,depths_unidirectional='small').to(DEVICE)
     # model = UNETR(
