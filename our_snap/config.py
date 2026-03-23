@@ -1,5 +1,6 @@
 # our_snap_new/config.py
 import os
+from datetime import datetime
 
 class Config:
     # 1. 基础路径配置
@@ -9,20 +10,13 @@ class Config:
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
 
-    # 2. 数据库连接配置 (最关键的部分)
-    # 驱动：通常用 'ODBC Driver 17 for SQL Server'，如果报错改用 'SQL Server'
-    DB_DRIVER = 'ODBC Driver 17 for SQL Server'
+    # 2. 日志文件配置
+    LOG_DIR = os.path.join(BASE_DIR, "logs")
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
     
-    # 服务器地址：这是你之前连成功的那个地址
-    # 注意前面的 r 不能少
-    DB_SERVER = r'LAPTOP-QNGAAJ92\SQLEXPRESS'
+    # 主日志文件路径
+    MAIN_LOG_FILE = os.path.join(LOG_DIR, "main.log")
     
-    # 数据库名：你之前建好的那个库
-    DB_NAME = 'MedicalDB'
-
-    # 认证方式：Windows 身份验证 (True)
-    USE_WINDOWS_AUTH = True
-    
-    # 备用账号密码 (仅当 USE_WINDOWS_AUTH=False 时生效)
-    DB_USER = 'sa'
-    DB_PASSWORD = 'your_password'
+    # 病例记录日志文件路径
+    CASE_LOG_FILE = os.path.join(LOG_DIR, "case_records.log")

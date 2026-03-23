@@ -20,6 +20,9 @@ openpyxl>=3.0.0  # 用于读取.xlsx文件
 
 # AI模型推理
 onnxruntime>=1.10.0
+torch>=1.9.0  # PyTorch 基础库
+monai>=1.0.0  # MONAI 医学影像库
+nilearn>=0.9.0  # 用于图像重采样
 
 # 3D可视化（用于3D预览功能）
 pyvista>=0.32.0

@@ -1,5 +1,7 @@
 # case_data_service.py
 from database import DatabaseManager
+import json
+from config import Config
 
 class CaseDataService:
     def __init__(self):
@@ -7,42 +9,34 @@ class CaseDataService:
 
     def get_patient_excel_records(self, p_code):
         """
-        从数据库的两个 Excel 对应表中查询数据
-        假设数据库表名为: StatTable (数据统计) 和 CheckTable (检查检验)
+        从日志文件中查询患者记录
         """
-        conn = self.db.get_connection()
-        if not conn:
-            return None, None
-            
         p_code = str(p_code).strip()
         stat_data = {}
         check_data = {}
 
         try:
-            cursor = conn.cursor()
-
-            # 1. 查询数据统计表 (根据编号匹配)
-            # 请将 StatTable 替换为你实际的数据库表名
-            sql_stat = "SELECT * FROM [dbo].[patient_info] WHERE 编号 = ?" 
-            cursor.execute(sql_stat, (p_code,))
-            row = cursor.fetchone()
-            if row:
-                # 将 pyodbc row 转为字典
-                columns = [column[0] for column in cursor.description]
-                stat_data = dict(zip(columns, row))
-
-            # 2. 查询检查检验表
-            # 请将 CheckTable 替换为你实际的数据库表名
-            sql_check = "SELECT * FROM [dbo].[clinical_indicators] WHERE 病人编号 = ?"
-            cursor.execute(sql_check, (p_code,))
-            row = cursor.fetchone()
-            if row:
-                columns = [column[0] for column in cursor.description]
-                check_data = dict(zip(columns, row))
+            # 从日志文件中获取患者记录
+            records = self.db.get_patient_history(p_code)
+            
+            if records:
+                # 取最新的记录
+                latest_record = records[0]
+                stat_data = {
+                    "编号": latest_record.get('patient_code', ''),
+                    "姓名": latest_record.get('patient_name', ''),
+                    "分割时间": latest_record.get('created_at', ''),
+                    "备注": latest_record.get('diagnosis_note', '')
+                }
+                
+                check_data = {
+                    "病人编号": latest_record.get('patient_code', ''),
+                    "检查时间": latest_record.get('created_at', ''),
+                    "影像路径": latest_record.get('original_path', ''),
+                    "分割结果路径": latest_record.get('mask_path', '')
+                }
 
         except Exception as e:
-            print(f"❌ 数据库 Excel 项查询失败: {e}")
-        finally:
-            conn.close()
-
+            print(f"❌ 日志查询失败: {e}")
+        
         return stat_data, check_data
