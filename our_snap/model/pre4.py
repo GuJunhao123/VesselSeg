@@ -10,9 +10,13 @@ from monai.transforms import (
     EnsureTyped
 )
 from monai.inferers import SlidingWindowInferer
+from monai.utils import set_determinism
 from datetime import datetime
 from functools import partial
 from timm.models.layers import DropPath
+
+# 启用确定性模式以确保结果可重复
+set_determinism(seed=42)
 
 # ========================= 模型定义 =========================
 class Residual(torch.nn.Module):
@@ -374,6 +378,12 @@ def mobileuvit_l(inch=1, dims=[32, 64, 128, 256], depths=[1, 1, 3, 3, 4], kernel
 # ========================= 推理功能 =========================
 # ========================= 基础配置 =========================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# 启用 CUDA 优化
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    print("CUDA 优化已启用")
+
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "best_model.pth") 
 INPUT_IMAGE = os.path.join(os.path.dirname(__file__), "hepaticvessel_437.nii", "hepaticvessel_437.nii")
 INPUT_LABEL = os.path.join(os.path.dirname(__file__), "hp437.nii", "hp437.nii")
@@ -385,6 +395,10 @@ NUM_CLASSES = 3
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 # ========================= 1. 叠加可视化 (使用原始 CT 强度) =========================
+# 禁用 matplotlib 交互模式以提高速度
+plt.switch_backend('Agg')
+
+
 def visualize_overlay_clean(img, pred, path):
     """
     img: 原始 HU 值的切片
@@ -398,7 +412,8 @@ def visualize_overlay_clean(img, pred, path):
     colors = [(0,0,0,0), (1,0,0,0.7), (0,0,1,0.7)] 
     cmap_custom = ListedColormap(colors)
 
-    plt.figure(figsize=(10, 10))
+    # 减少图像大小和 DPI 以提高速度
+    plt.figure(figsize=(8, 8))
     
     # 或者直接让 plt 根据百分位自动调整，这里设置 vmin, vmax 使其看起来像标准 CT
     plt.imshow(img_slice, cmap='gray') 
@@ -407,7 +422,8 @@ def visualize_overlay_clean(img, pred, path):
     plt.imshow(masked_pred, cmap=cmap_custom, interpolation='nearest', vmin=0, vmax=2)
     
     plt.axis('off')
-    plt.savefig(path, bbox_inches='tight', pad_inches=0, dpi=200)
+    # 减少 DPI 以提高保存速度
+    plt.savefig(path, bbox_inches='tight', pad_inches=0, dpi=150)
     plt.close()
     print(f"2D 原始强度叠加图已保存: {path}")
 
@@ -425,7 +441,8 @@ def visualize_gt_overlay(img, gt, path):
     colors = [(0,0,0,0), (1,0,0,0.7), (0,0,1,0.7)] 
     cmap_custom = ListedColormap(colors)
 
-    plt.figure(figsize=(10, 10))
+    # 减少图像大小和 DPI 以提高速度
+    plt.figure(figsize=(8, 8))
     
     plt.imshow(img_slice, cmap='gray') 
     
@@ -434,7 +451,8 @@ def visualize_gt_overlay(img, gt, path):
     plt.imshow(masked_gt, cmap=cmap_custom, interpolation='nearest', vmin=0, vmax=2)
     
     plt.axis('off')
-    plt.savefig(path, bbox_inches='tight', pad_inches=0, dpi=200)
+    # 减少 DPI 以提高保存速度
+    plt.savefig(path, bbox_inches='tight', pad_inches=0, dpi=150)
     plt.close()
     print(f"2D GT 叠加图已保存: {path}")
 
@@ -571,11 +589,17 @@ def run_inference():
     input_tensor = data_inf["image"].unsqueeze(0).to(DEVICE)
 
     # E. 滑窗推理
-    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.6, mode="gaussian")
+    # 优化滑窗推理参数：增加批量大小，减少重叠率以提高速度
+    sw_batch_size = 2 if torch.cuda.is_available() else 1  # 根据 GPU 内存调整
+    overlap = 0.4  # 减少重叠率以提高速度
     
-    print("正在进行滑窗推理...")
+    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=sw_batch_size, overlap=overlap, mode="gaussian")
+    
+    print(f"正在进行滑窗推理... (批量大小: {sw_batch_size}, 重叠率: {overlap})")
     with torch.no_grad():
-        output = inferer(input_tensor, model)
+        # 启用自动混合精度以提高速度
+        with torch.cuda.amp.autocast():
+            output = inferer(input_tensor, model)
         pred_label = torch.argmax(output[0], dim=1).cpu().numpy() # [1, H, W, D]
 
     # F. 2D 可视化 (传入 data_vis["image"]，即原始 CT 强度)
