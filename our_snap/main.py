@@ -20,7 +20,7 @@ def main():
     # 设置高DPI支持
     app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
+
     # 创建主窗口
     window = MainWindow()
     window.show()

@@ -735,7 +735,7 @@ class MainWindow(QMainWindow):
             ai_interface = AISegmentationInterface()
 
             # 模型路径（使用 pred4.py 中的模型）
-            model_path = "d:\\Code_Program\\program\\VesselSeg\\resource\\best_model.pth"
+            model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
 
             # 加载模型
             QMessageBox.information(self, "提示", "正在加载模型，请稍候...")

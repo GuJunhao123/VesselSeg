@@ -1,0 +1,39 @@
+# 临时文件和缓存
+__pycache__/
+.idea/
+logs/
+saved_records/
+model/vis_results/
+
+# 二进制文件
+*.dll
+*.exe
+*.pth
+
+# 数据文件
+*.nii
+*.nii.gz
+*.dcm
+*.xlsx
+*.docx
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+
+# 环境文件
+.env
+.venv/
+env/
+
+# 测试文件
+.test_output/
+
+# 其他大型文件
+model/hepaticvessel_437.nii/
+model/hp437.nii/

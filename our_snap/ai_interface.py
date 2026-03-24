@@ -12,7 +12,7 @@ import os
 import sys
 
 # 添加模型所在目录到路径
-sys.path.append('d:\\Code_Program\\program\\VesselSeg\\demo')
+sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 
 # 尝试导入 PyTorch，用于支持 pred4.py 中的模型
 try:
