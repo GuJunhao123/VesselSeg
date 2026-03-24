@@ -34,6 +34,14 @@ env/
 # 测试文件
 .test_output/
 
-# 其他大型文件
-model/hepaticvessel_437.nii/
-model/hp437.nii/
+**/model/hepaticvessel_437.nii/
+**/model/hp437.nii/
+our_snap/model/hepaticvessel_437.nii/
+our_snap/model/hp437.nii/
+
+**/model/*.nii
+**/model/*.nii.gz
+**/model/*.png
+**/saved_records/*.nii
+**/saved_records/*.nii.gz
+**/saved_records/*.png
