@@ -14,10 +14,14 @@ import sys
 # 添加模型所在目录到路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
 
-# 尝试导入 PyTorch，用于支持 pred4.py 中的模型
+# 尝试导入 PyTorch，用于支持 pre4.py 中的模型
 try:
     import torch
-    from model1 import mobileuvit_l
+    # 确保导入路径正确
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
+    from pre4 import mobileuvit_l
     from monai.transforms import (
         Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
         CropForegroundd, SpatialPadd, ScaleIntensityRanged, NormalizeIntensityd, 

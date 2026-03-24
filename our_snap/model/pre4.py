@@ -375,6 +375,9 @@ def mobileuvit(inch=1, dims=[16, 32, 64, 128], depths=[1, 1, 3, 3, 3], kernels=[
 def mobileuvit_l(inch=1, dims=[32, 64, 128, 256], depths=[1, 1, 3, 3, 4], kernels=[3, 3, 7], embed_dim=512):
     return MobileUViT(inch=inch, dims=dims, depths=depths, kernels=kernels, embed_dim=embed_dim)
 
+# 确保模块导入时可以访问这些函数
+__all__ = ['mobileuvit', 'mobileuvit_l', 'MobileUViT']
+
 # ========================= 推理功能 =========================
 # ========================= 基础配置 =========================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -634,5 +637,6 @@ def run_inference():
     nib.save(final_pred_nii, save_path)
     print(f"全尺寸 NIfTI 已保存: {save_path}")
 
+# 确保在作为模块导入时不会执行主函数
 if __name__ == "__main__":
     run_inference()

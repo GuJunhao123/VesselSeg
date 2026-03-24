@@ -730,18 +730,54 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            # 导入必要的模块
+            import os
             # 初始化 AI 分割接口
             from ai_interface import AISegmentationInterface
             ai_interface = AISegmentationInterface()
 
-            # 模型路径（使用 pred4.py 中的模型）
+            # 模型路径（使用 pre4.py 中的模型）
             model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
 
             # 加载模型
             QMessageBox.information(self, "提示", "正在加载模型，请稍候...")
             if not ai_interface.load_model(model_path):
-                QMessageBox.critical(self, "错误", "模型加载失败")
-                return
+                # 尝试使用 pre4.py 直接进行分割
+                QMessageBox.information(self, "提示", "模型加载失败，尝试使用 pre4.py 直接分割...")
+                try:
+                    # 导入 pre4 模块
+                    import sys
+                    import os
+                    sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
+                    from pre4 import run_inference
+                    
+                    # 保存当前图像为临时文件
+                    import tempfile
+                    import nibabel as nib
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
+                        tmp_path = tmp.name
+                    
+                    # 保存临时 NIfTI 文件
+                    tmp_nii = nib.Nifti1Image(self.current_image_data, affine=np.eye(4))
+                    nib.save(tmp_nii, tmp_path)
+                    
+                    # 修改 pre4.py 的输入路径
+                    import pre4
+                    pre4.INPUT_IMAGE = tmp_path
+                    
+                    # 执行分割
+                    run_inference()
+                    
+                    # 清理临时文件
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    
+                    QMessageBox.information(self, "成功", "AI分割完成，结果已保存到 vis_results 目录")
+                    return
+                except Exception as e:
+                    QMessageBox.critical(self, "错误", f"使用 pre4.py 分割失败:\n{e}")
+                    return
 
             # 执行分割
             QMessageBox.information(self, "提示", "正在执行分割，请稍候...")
