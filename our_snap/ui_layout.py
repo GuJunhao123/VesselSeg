@@ -199,12 +199,16 @@ class MainWindow(QMainWindow):
         # 初始化模块
         self.image_io = ImageIO()
         self.segmentation = ActiveContourSegmentation()
-        self.ai_interface = AISegmentationInterface()
+        self.ai_interface = None  # 延迟初始化，加快启动速度
+        
+        # 后台预加载AI模型
+        self._preload_ai_model()
         
         # === [新增] 初始化数据库管理器 ===
         self.db = None
         if DB_AVAILABLE:
             try:
+                from database import DatabaseManager
                 self.db = DatabaseManager()
                 print("DatabaseManager initialized successfully.")
             except Exception as e:
@@ -274,6 +278,10 @@ class MainWindow(QMainWindow):
         main_toolbar_group = QGroupBox("Main Toolbar")
         main_toolbar_layout = QVBoxLayout()
         main_toolbar_layout.setSpacing(3)
+        
+        # 左侧面板宽度设置，保持灵活性
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(400)
         
         # 工具按钮组
         tools_layout = QHBoxLayout()
@@ -729,70 +737,81 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先加载一张影像")
             return
 
+        # 显示状态栏提示
+        self.statusBar().showMessage("正在初始化AI分割...")
+        
+        # 确保AI接口已初始化
+        if not self.ai_interface:
+            self.statusBar().showMessage("正在加载AI模型，请稍候...")
+            try:
+                # 延迟导入，减少启动时的模块加载
+                from ai_interface import AISegmentationInterface
+                self.ai_interface = AISegmentationInterface()
+                
+                # 模型路径
+                model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
+                
+                # 加载模型
+                if not self.ai_interface.load_model(model_path):
+                    # 尝试使用 pre4.py 直接进行分割
+                    self.statusBar().showMessage("模型加载失败，尝试使用 pre4.py 直接分割...")
+                    try:
+                        # 导入 pre4 模块
+                        import sys
+                        import os
+                        sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
+                        from pre4 import run_inference
+                        
+                        # 保存当前图像为临时文件
+                        import tempfile
+                        import nibabel as nib
+                        
+                        with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
+                            tmp_path = tmp.name
+                        
+                        # 保存临时 NIfTI 文件
+                        tmp_nii = nib.Nifti1Image(self.current_image_data, affine=np.eye(4))
+                        nib.save(tmp_nii, tmp_path)
+                        
+                        # 修改 pre4.py 的输入路径
+                        import pre4
+                        pre4.INPUT_IMAGE = tmp_path
+                        
+                        # 执行分割
+                        run_inference()
+                        
+                        # 清理临时文件
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                        
+                        self.statusBar().showMessage("AI分割完成，结果已保存到 vis_results 目录")
+                        return
+                    except Exception as e:
+                        self.statusBar().showMessage("AI分割失败")
+                        QMessageBox.critical(self, "错误", f"使用 pre4.py 分割失败:\n{e}")
+                        return
+            except Exception as e:
+                self.statusBar().showMessage("AI分割初始化失败")
+                QMessageBox.critical(self, "错误", f"AI分割初始化失败:\n{e}")
+                return
+
+        # 执行分割
+        self.statusBar().showMessage("正在执行AI分割，请稍候...")
         try:
-            # 导入必要的模块
-            import os
-            # 初始化 AI 分割接口
-            from ai_interface import AISegmentationInterface
-            ai_interface = AISegmentationInterface()
-
-            # 模型路径（使用 pre4.py 中的模型）
-            model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
-
-            # 加载模型
-            QMessageBox.information(self, "提示", "正在加载模型，请稍候...")
-            if not ai_interface.load_model(model_path):
-                # 尝试使用 pre4.py 直接进行分割
-                QMessageBox.information(self, "提示", "模型加载失败，尝试使用 pre4.py 直接分割...")
-                try:
-                    # 导入 pre4 模块
-                    import sys
-                    import os
-                    sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
-                    from pre4 import run_inference
-                    
-                    # 保存当前图像为临时文件
-                    import tempfile
-                    import nibabel as nib
-                    
-                    with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
-                        tmp_path = tmp.name
-                    
-                    # 保存临时 NIfTI 文件
-                    tmp_nii = nib.Nifti1Image(self.current_image_data, affine=np.eye(4))
-                    nib.save(tmp_nii, tmp_path)
-                    
-                    # 修改 pre4.py 的输入路径
-                    import pre4
-                    pre4.INPUT_IMAGE = tmp_path
-                    
-                    # 执行分割
-                    run_inference()
-                    
-                    # 清理临时文件
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                    
-                    QMessageBox.information(self, "成功", "AI分割完成，结果已保存到 vis_results 目录")
-                    return
-                except Exception as e:
-                    QMessageBox.critical(self, "错误", f"使用 pre4.py 分割失败:\n{e}")
-                    return
-
-            # 执行分割
-            QMessageBox.information(self, "提示", "正在执行分割，请稍候...")
-            mask = ai_interface.segment(self.current_image_data)
+            mask = self.ai_interface.segment(self.current_image_data)
 
             if mask is not None:
                 # 更新当前标签数据
                 self.current_label_data = mask
                 # 更新视图
                 self.four_view.set_label_data(mask)
-                QMessageBox.information(self, "成功", "AI分割完成")
+                self.statusBar().showMessage("AI分割完成")
             else:
+                self.statusBar().showMessage("AI分割失败")
                 QMessageBox.critical(self, "错误", "AI分割失败")
 
         except Exception as e:
+            self.statusBar().showMessage("AI分割过程中发生错误")
             QMessageBox.critical(self, "错误", f"AI分割过程中发生错误:\n{e}")
 
     def _on_open_db_dialog(self):
@@ -814,6 +833,49 @@ class MainWindow(QMainWindow):
     def _update_seed_count(self):
         """更新种子点数量"""
         pass
+    
+    def _preload_ai_model(self):
+        """后台预加载AI模型"""
+        class ModelPreloadWorker(QThread):
+            finished = pyqtSignal(bool)
+            
+            def __init__(self, parent):
+                super().__init__(parent)
+                self.parent = parent
+            
+            def run(self):
+                try:
+                    # 延迟导入，减少启动时的模块加载
+                    from ai_interface import AISegmentationInterface
+                    
+                    # 初始化AI接口
+                    ai_interface = AISegmentationInterface()
+                    
+                    # 模型路径
+                    model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
+                    
+                    # 尝试加载模型
+                    if os.path.exists(model_path):
+                        ai_interface.load_model(model_path)
+                    
+                    # 保存到父对象
+                    self.parent.ai_interface = ai_interface
+                    self.finished.emit(True)
+                except Exception as e:
+                    print(f"模型预加载失败: {e}")
+                    self.finished.emit(False)
+        
+        # 创建并启动预加载线程
+        self.preload_worker = ModelPreloadWorker(self)
+        self.preload_worker.finished.connect(self._on_model_preloaded)
+        self.preload_worker.start()
+    
+    def _on_model_preloaded(self, success):
+        """模型预加载完成回调"""
+        if success:
+            print("AI模型预加载成功")
+        else:
+            print("AI模型预加载失败")
 
     def _build_entry_from_metadata(self, metadata, path):
         """从元数据构建entry"""
