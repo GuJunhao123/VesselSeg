@@ -11,8 +11,6 @@ model/vis_results/
 *.pth
 
 # 数据文件
-*.nii
-*.nii.gz
 *.dcm
 *.xlsx
 *.docx
@@ -34,14 +32,9 @@ env/
 # 测试文件
 .test_output/
 
+# 特定目录忽略
+our_snap/model/vis_results/
+
+# 其他大型文件（已由Git LFS管理，此处为备份）
 **/model/hepaticvessel_437.nii/
 **/model/hp437.nii/
-our_snap/model/hepaticvessel_437.nii/
-our_snap/model/hp437.nii/
-
-**/model/*.nii
-**/model/*.nii.gz
-**/model/*.png
-**/saved_records/*.nii
-**/saved_records/*.nii.gz
-**/saved_records/*.png
