@@ -256,6 +256,11 @@ class SliceViewer(QWidget):
         """设置活动标签ID"""
         self.active_label_id = label_id
     
+    def set_label_opacity(self, opacity: float):
+        """设置标签透明度"""
+        self.label_opacity = max(0.0, min(1.0, opacity))
+        self._update_display()
+    
     def set_window(self, window_width: float, window_level: float):
         """设置窗宽窗位"""
         self.window_width = window_width

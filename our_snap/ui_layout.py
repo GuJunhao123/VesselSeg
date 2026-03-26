@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QColorDialog, QComboBox, QProgressDialog,
     QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QLineEdit,
     QSizePolicy, QDialog, QFormLayout, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QInputDialog, QTextEdit
+    QAbstractItemView, QInputDialog, QTextEdit, QSplitter
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QFont
@@ -186,6 +186,144 @@ class CaseHistoryDialog(QDialog):
             self.accept()
         else:
             QMessageBox.warning(self, "错误", f"原始文件不存在:\n{orig_path}")
+
+
+class DatabaseDialog(QDialog):
+    """数据库对话框 - 用于浏览和选择DICOM序列"""
+    
+    def __init__(self, db_root: str, parent=None):
+        super().__init__(parent)
+        self.db_root = db_root
+        self.selected_entry = None
+        self.setWindowTitle("数据库浏览器")
+        self.setMinimumSize(800, 600)
+        self._init_ui()
+        self._load_patient_dirs()
+    
+    def _init_ui(self):
+        """初始化UI"""
+        layout = QVBoxLayout()
+        
+        # 顶部信息
+        info_label = QLabel(f"数据库路径: {self.db_root}")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # 创建分割器
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # 左侧：病人列表
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(QLabel("病人列表:"))
+        self.patient_list = QListWidget()
+        self.patient_list.itemClicked.connect(self._on_patient_selected)
+        left_layout.addWidget(self.patient_list)
+        left_panel.setLayout(left_layout)
+        splitter.addWidget(left_panel)
+        
+        # 右侧：序列列表
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(QLabel("序列列表:"))
+        self.series_list = QListWidget()
+        self.series_list.itemDoubleClicked.connect(self._on_series_double_clicked)
+        right_layout.addWidget(self.series_list)
+        right_panel.setLayout(right_layout)
+        splitter.addWidget(right_panel)
+        
+        # 设置分割器比例
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
+        
+        # 底部按钮
+        button_layout = QHBoxLayout()
+        btn_load = QPushButton("加载选中序列")
+        btn_load.clicked.connect(self._on_load_clicked)
+        button_layout.addWidget(btn_load)
+        
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        button_layout.addWidget(btn_cancel)
+        
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+    
+    def _load_patient_dirs(self):
+        """加载病人目录列表"""
+        self.patient_list.clear()
+        try:
+            patient_dirs = find_patient_dirs_522(self.db_root)
+            for patient_dir in patient_dirs:
+                patient_name = os.path.basename(patient_dir)
+                item = QListWidgetItem(patient_name)
+                item.setData(Qt.UserRole, patient_dir)
+                self.patient_list.addItem(item)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"加载病人列表失败:\n{e}")
+    
+    def _on_patient_selected(self, item):
+        """病人选择改变"""
+        patient_dir = item.data(Qt.UserRole)
+        self._load_series_list(patient_dir)
+    
+    def _load_series_list(self, patient_dir: str):
+        """加载序列列表"""
+        self.series_list.clear()
+        try:
+            # 创建进度对话框
+            progress = QProgressDialog("正在扫描序列...", "取消", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # 创建工作线程扫描序列
+            worker = PatientIndexWorker(patient_dir)
+            worker.finished.connect(self._on_series_scan_finished)
+            worker.error.connect(self._on_series_scan_error)
+            
+            # 保存进度对话框引用
+            self._scan_progress = progress
+            
+            worker.start()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"加载序列列表失败:\n{e}")
+    
+    def _on_series_scan_finished(self, entries):
+        """序列扫描完成"""
+        if hasattr(self, '_scan_progress'):
+            self._scan_progress.close()
+        
+        for entry in entries:
+            item = QListWidgetItem(entry.display_name)
+            item.setData(Qt.UserRole, entry)
+            item.setToolTip(entry.tooltip_text)
+            self.series_list.addItem(item)
+    
+    def _on_series_scan_error(self, error_msg):
+        """序列扫描错误"""
+        if hasattr(self, '_scan_progress'):
+            self._scan_progress.close()
+        QMessageBox.warning(self, "错误", f"序列扫描失败:\n{error_msg}")
+    
+    def _on_series_double_clicked(self, item):
+        """双击序列项"""
+        self.selected_entry = item.data(Qt.UserRole)
+        self.accept()
+    
+    def _on_load_clicked(self):
+        """加载按钮点击"""
+        current_item = self.series_list.currentItem()
+        if current_item:
+            self.selected_entry = current_item.data(Qt.UserRole)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "提示", "请先选择一个序列")
+    
+    def get_selected_entry(self):
+        """获取选中的序列条目"""
+        return self.selected_entry
 
 
 class MainWindow(QMainWindow):
@@ -673,51 +811,221 @@ class MainWindow(QMainWindow):
 
     def _on_brush_size_changed(self, value):
         """画笔大小改变"""
-        pass
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_brush_size(value)
+            self.four_view.coronal_view.set_brush_size(value)
+            self.four_view.sagittal_view.set_brush_size(value)
 
     def _on_undo(self):
         """撤销操作"""
-        pass
+        if self.undo_history:
+            # 保存当前状态到重做栈
+            if self.current_label_data is not None:
+                self.redo_history.append(np.copy(self.current_label_data))
+                # 限制重做栈大小
+                if len(self.redo_history) > self.max_history_size:
+                    self.redo_history.pop(0)
+            
+            # 从撤销栈恢复
+            self.current_label_data = self.undo_history.pop()
+            self.four_view.set_label_data(self.current_label_data)
 
     def _on_redo(self):
         """重做操作"""
-        pass
+        if self.redo_history:
+            # 保存当前状态到撤销栈
+            if self.current_label_data is not None:
+                self.undo_history.append(np.copy(self.current_label_data))
+                # 限制撤销栈大小
+                if len(self.undo_history) > self.max_history_size:
+                    self.undo_history.pop(0)
+            
+            # 从重做栈恢复
+            self.current_label_data = self.redo_history.pop()
+            self.four_view.set_label_data(self.current_label_data)
 
     def _on_load_label(self):
         """加载标签"""
-        pass
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载一张影像")
+            return
+        
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "加载标签", "",
+            "NIfTI文件 (*.nii *.nii.gz);;NRRD文件 (*.nrrd);;所有文件 (*.*)"
+        )
+        
+        if filepath:
+            try:
+                label_data = self.image_io.load_label_map(filepath)
+                if label_data is not None:
+                    # 检查尺寸是否匹配
+                    if label_data.shape == self.current_image_data.shape:
+                        # 保存当前状态到撤销栈
+                        if self.current_label_data is not None:
+                            self.undo_history.append(np.copy(self.current_label_data))
+                            # 限制撤销栈大小
+                            if len(self.undo_history) > self.max_history_size:
+                                self.undo_history.pop(0)
+                        
+                        # 更新标签数据
+                        self.current_label_data = label_data
+                        self.four_view.set_label_data(label_data)
+                        # 清空重做栈
+                        self.redo_history.clear()
+                        QMessageBox.information(self, "成功", "标签加载成功")
+                    else:
+                        QMessageBox.warning(self, "错误", f"标签尺寸与影像不匹配\n影像尺寸: {self.current_image_data.shape}\n标签尺寸: {label_data.shape}")
+                else:
+                    QMessageBox.warning(self, "错误", "标签加载失败")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"加载标签时发生错误:\n{e}")
 
     def _on_save_label(self):
         """保存标签"""
-        pass
+        if self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "没有标签数据可保存")
+            return
+        
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "保存标签", "",
+            "NIfTI文件 (*.nii.gz);;NRRD文件 (*.nrrd);;所有文件 (*.*)"
+        )
+        
+        if filepath:
+            try:
+                self.image_io.save_label_map(self.current_label_data, filepath, self.current_metadata)
+                QMessageBox.information(self, "成功", "标签保存成功")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存标签时发生错误:\n{e}")
 
     def _on_clear_label(self):
         """清除标签"""
-        pass
+        if self.current_label_data is not None:
+            # 保存当前状态到撤销栈
+            self.undo_history.append(np.copy(self.current_label_data))
+            # 限制撤销栈大小
+            if len(self.undo_history) > self.max_history_size:
+                self.undo_history.pop(0)
+            
+            # 清空标签
+            self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
+            self.four_view.set_label_data(self.current_label_data)
+            # 清空重做栈
+            self.redo_history.clear()
+            QMessageBox.information(self, "成功", "标签已清除")
 
     def _on_label_opacity_changed(self, value):
         """标签透明度改变"""
-        pass
+        opacity = value / 100.0
+        self.label_opacity_value_label.setText(str(value))
+        
+        # 更新所有视图的标签透明度
+        if hasattr(self.four_view, 'axial_view'):
+            try:
+                self.four_view.axial_view.set_label_opacity(opacity)
+                self.four_view.coronal_view.set_label_opacity(opacity)
+                self.four_view.sagittal_view.set_label_opacity(opacity)
+            except Exception as e:
+                print(f"设置标签透明度时发生错误: {e}")
 
     def _on_label_selection_changed(self):
         """标签选择改变"""
-        pass
+        selected_items = self.label_list_widget.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            label_id = int(item.data(Qt.UserRole))
+            self.active_label_id = label_id
+            self.active_label_name_label.setText(f"Active label: Label {label_id}")
+            self.paint_over_label.setText(f"Paint over: Label {label_id}")
+            # 更新视图中的活动标签
+            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_active_label_id(label_id)
+                self.four_view.coronal_view.set_active_label_id(label_id)
+                self.four_view.sagittal_view.set_active_label_id(label_id)
 
     def _on_add_label(self):
         """添加标签"""
-        pass
+        # 生成新标签ID
+        new_label_id = len(self.label_list) + 1
+        # 添加到标签列表
+        self.label_list.append(new_label_id)
+        # 更新标签列表控件
+        item = QListWidgetItem(f"Label {new_label_id}")
+        item.setData(Qt.UserRole, new_label_id)
+        self.label_list_widget.addItem(item)
+        # 选择新标签
+        self.label_list_widget.setCurrentItem(item)
+        # 更新活动标签
+        self.active_label_id = new_label_id
+        self.active_label_name_label.setText(f"Active label: Label {new_label_id}")
+        self.paint_over_label.setText(f"Paint over: Label {new_label_id}")
+        # 更新视图中的活动标签
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_active_label_id(new_label_id)
+            self.four_view.coronal_view.set_active_label_id(new_label_id)
+            self.four_view.sagittal_view.set_active_label_id(new_label_id)
 
     def _on_delete_label(self):
         """删除标签"""
-        pass
+        selected_items = self.label_list_widget.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            label_id = int(item.data(Qt.UserRole))
+            # 从标签列表中移除
+            if label_id in self.label_list:
+                self.label_list.remove(label_id)
+            # 从列表控件中移除
+            self.label_list_widget.takeItem(self.label_list_widget.row(item))
+            # 如果删除的是当前活动标签，选择第一个标签
+            if self.active_label_id == label_id:
+                if self.label_list:
+                    new_label_id = self.label_list[0]
+                    self.active_label_id = new_label_id
+                    self.active_label_name_label.setText(f"Active label: Label {new_label_id}")
+                    self.paint_over_label.setText(f"Paint over: Label {new_label_id}")
+                    # 更新视图中的活动标签
+                    if hasattr(self.four_view, 'axial_view'):
+                        self.four_view.axial_view.set_active_label_id(new_label_id)
+                        self.four_view.coronal_view.set_active_label_id(new_label_id)
+                        self.four_view.sagittal_view.set_active_label_id(new_label_id)
+                else:
+                    # 如果没有标签了，设置为默认值
+                    self.active_label_id = 1
+                    self.active_label_name_label.setText("Active label: Label 1")
+                    self.paint_over_label.setText("Paint over: Label 1")
 
     def _on_label_color(self):
         """标签颜色选择"""
-        pass
+        color = QColorDialog.getColor()
+        if color.isValid():
+            # 更新活动标签颜色
+            color_str = color.name()
+            self.active_label_color_widget.setStyleSheet(f"background-color: {color_str}; border: 1px solid black;")
+            # 更新视图中的标签颜色
+            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_label_color(self.active_label_id, color_str)
+                self.four_view.coronal_view.set_label_color(self.active_label_id, color_str)
+                self.four_view.sagittal_view.set_label_color(self.active_label_id, color_str)
 
     def _on_update_3d_view_clicked(self):
         """更新3D视图"""
-        pass
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载一张影像")
+            return
+        
+        # 检查是否有3D视图组件
+        if hasattr(self, 'three_d_view') and self.three_d_view:
+            # 更新3D视图
+            try:
+                self.three_d_view.update_view(self.current_image_data, self.current_label_data)
+                QMessageBox.information(self, "成功", "3D视图已更新")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"更新3D视图时发生错误:\n{e}")
+        else:
+            # 提示用户3D视图功能需要额外配置
+            QMessageBox.information(self, "提示", "3D视图功能已触发\n\n注意：完整的3D视图功能需要额外的可视化库支持（如VTK或Mayavi）。\n当前版本仅提供基本触发功能。")
+            # 实际项目中，这里应该初始化3D视图组件并调用其更新方法
 
     def _on_toggle_seed_mode(self):
         """切换种子点模式"""
@@ -814,13 +1122,152 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("AI分割过程中发生错误")
             QMessageBox.critical(self, "错误", f"AI分割过程中发生错误:\n{e}")
 
+    def _load_series_entry(self, entry):
+        """从数据库条目加载序列"""
+        try:
+            # 根据entry中的file_list加载序列
+            if entry.file_list:
+                data, metadata = self.image_io.load_dicom_series(entry.file_list)
+            else:
+                # 回退到直接加载目录
+                data, metadata = self.image_io.load_image(entry.series_dir)
+            
+            if data is not None:
+                self.current_image_data = data
+                self.current_metadata = metadata
+                self.current_entry = entry
+                self.current_image_path = entry.series_dir
+                
+                # 传递spacing信息（如果可用）
+                spacing = metadata.get('spacing') if metadata else None
+                self.four_view.set_image_data(data, spacing)
+                
+                # 初始化标签数据
+                self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+                self.four_view.set_label_data(self.current_label_data)
+                
+                # 设置活动标签ID
+                self.four_view.axial_view.set_active_label_id(self.active_label_id)
+                self.four_view.coronal_view.set_active_label_id(self.active_label_id)
+                self.four_view.sagittal_view.set_active_label_id(self.active_label_id)
+                
+                # 清空历史记录
+                self.undo_history.clear()
+                self.redo_history.clear()
+                
+                # 清空种子点
+                self.seed_points = []
+                self._update_seed_count()
+                
+                # 关闭种子点模式
+                self.seed_mode_enabled = False
+                self.btn_add_seed.setChecked(False)
+                self.btn_add_seed.setText("Add Seed")
+                self.btn_add_seed.setStyleSheet("")
+                
+                # 更新病人信息显示
+                self._update_patient_info_from_entry(entry, metadata)
+                
+                QMessageBox.information(self, "成功", f"序列加载成功\n尺寸: {data.shape}")
+            else:
+                QMessageBox.warning(self, "错误", "序列加载失败")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载序列时发生错误:\n{e}")
+
+    def _update_patient_info_from_entry(self, entry, metadata):
+        """从数据库条目更新病人信息"""
+        # 使用entry中的信息
+        self.pi_id_label.setText(f"ID: {entry.patient_id}")
+        self.pi_name_label.setText(f"Name: {entry.patient_name or '--'}")
+        self.pi_sex_label.setText("Sex: --")
+        self.pi_birth_label.setText("Birth: --")
+        self.pi_study_date_label.setText(f"Study Date: {entry.study_date or '--'}")
+        self.pi_modality_label.setText(f"Modality: {entry.modality or '--'}")
+        self.pi_series_label.setText(f"Series: {entry.series_id}")
+        
+        # 保存当前病人信息
+        self.current_patient_info = {
+            "PatientID": entry.patient_id,
+            "PatientName": entry.patient_name or "Unknown",
+            "StudyDate": entry.study_date,
+            "Modality": entry.modality,
+            "SeriesID": entry.series_id
+        }
+    
+    def _update_patient_info_from_metadata(self, metadata):
+        """从元数据更新病人信息"""
+        dicom_info = metadata.get('dicom_info', {})
+        
+        self.pi_id_label.setText(f"ID: {dicom_info.get('PatientID', '--')}")
+        self.pi_name_label.setText(f"Name: {dicom_info.get('PatientName', '--')}")
+        self.pi_sex_label.setText(f"Sex: {dicom_info.get('PatientSex', '--')}")
+        self.pi_birth_label.setText(f"Birth: {dicom_info.get('PatientBirthDate', '--')}")
+        self.pi_study_date_label.setText(f"Study Date: {dicom_info.get('StudyDate', '--')}")
+        self.pi_modality_label.setText(f"Modality: {dicom_info.get('Modality', '--')}")
+        self.pi_series_label.setText(f"Series: {dicom_info.get('SeriesNumber', '--')}")
+        
+        # 保存当前病人信息
+        self.current_patient_info = {
+            "PatientID": dicom_info.get('PatientID', "Unknown"),
+            "PatientName": dicom_info.get('PatientName', "Unknown"),
+            "PatientSex": dicom_info.get('PatientSex'),
+            "PatientBirthDate": dicom_info.get('PatientBirthDate'),
+            "StudyDate": dicom_info.get('StudyDate'),
+            "Modality": dicom_info.get('Modality'),
+            "SeriesID": dicom_info.get('SeriesNumber')
+        }
+
     def _on_open_db_dialog(self):
         """打开数据库对话框"""
-        pass
+        # 选择数据库根目录
+        db_root = QFileDialog.getExistingDirectory(
+            self, "选择数据库根目录", 
+            self.last_db_root if self.last_db_root else ""
+        )
+        
+        if not db_root:
+            return
+        
+        # 保存选择的路径
+        self.last_db_root = db_root
+        
+        # 创建并显示数据库对话框
+        dialog = DatabaseDialog(db_root, self)
+        if dialog.exec_() == QDialog.Accepted:
+            # 用户选择了一个序列
+            entry = dialog.get_selected_entry()
+            if entry:
+                self._load_series_entry(entry)
 
     def _on_tool_selected(self, tool):
         """选择工具"""
-        pass
+        # 重置所有工具按钮
+        self.btn_pointer.setChecked(False)
+        self.btn_zoom.setChecked(False)
+        self.btn_pan.setChecked(False)
+        self.btn_brush.setChecked(False)
+        self.btn_eraser.setChecked(False)
+        
+        # 设置当前工具
+        self.current_tool_mode = tool
+        
+        # 激活选中的工具按钮
+        if tool == 'pointer':
+            self.btn_pointer.setChecked(True)
+        elif tool == 'zoom':
+            self.btn_zoom.setChecked(True)
+        elif tool == 'pan':
+            self.btn_pan.setChecked(True)
+        elif tool == 'brush':
+            self.btn_brush.setChecked(True)
+        elif tool == 'eraser':
+            self.btn_eraser.setChecked(True)
+        
+        # 更新视图中的工具模式
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_tool_mode(tool)
+            self.four_view.coronal_view.set_tool_mode(tool)
+            self.four_view.sagittal_view.set_tool_mode(tool)
 
     def _on_crosshair_changed(self, x, y, z):
         """十字准线变化"""
