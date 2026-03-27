@@ -682,6 +682,13 @@ class MainWindow(QMainWindow):
         self.seed_count_label.setToolTip("Current seed count")
         toolbar_3d_layout.addWidget(self.seed_count_label)
         
+        # 标签统计按钮
+        btn_label_stats = QPushButton("标签统计")
+        btn_label_stats.setFixedSize(120, 30)
+        btn_label_stats.setToolTip("计算标签的统计信息")
+        btn_label_stats.clicked.connect(self._on_label_statistics)
+        toolbar_3d_layout.addWidget(btn_label_stats)
+        
         # 分割相关按钮
         btn_segment_3d = QPushButton("Segment 3D")
         btn_segment_3d.clicked.connect(self._on_segment_3d)
@@ -739,13 +746,51 @@ class MainWindow(QMainWindow):
         return panel
     
     def _create_right_panel(self) -> QWidget:
-        """创建右侧参数设置区（只保留分割算法参数）"""
+        """创建右侧参数设置区（分割算法参数 + 窗宽窗位）"""
         panel = QWidget()
         panel.setMaximumWidth(220)
         layout = QVBoxLayout()
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(5)
         panel.setLayout(layout)
+        
+        # 窗宽窗位参数组
+        window_group = QGroupBox("窗宽窗位")
+        window_layout = QVBoxLayout()
+        window_layout.setSpacing(5)
+        
+        # 窗宽
+        window_layout.addWidget(QLabel("窗宽 (Window Width):"))
+        self.window_width_spin = QDoubleSpinBox()
+        self.window_width_spin.setMinimum(1.0)
+        self.window_width_spin.setMaximum(4000.0)
+        self.window_width_spin.setValue(400.0)
+        self.window_width_spin.setSingleStep(10.0)
+        self.window_width_spin.valueChanged.connect(self._on_window_width_changed)
+        window_layout.addWidget(self.window_width_spin)
+        
+        # 窗位
+        window_layout.addWidget(QLabel("窗位 (Window Level):"))
+        self.window_level_spin = QDoubleSpinBox()
+        self.window_level_spin.setMinimum(-2000.0)
+        self.window_level_spin.setMaximum(2000.0)
+        self.window_level_spin.setValue(0.0)
+        self.window_level_spin.setSingleStep(10.0)
+        self.window_level_spin.valueChanged.connect(self._on_window_level_changed)
+        window_layout.addWidget(self.window_level_spin)
+        
+        # 自动窗宽窗位按钮
+        btn_auto_window = QPushButton("自动窗宽窗位")
+        btn_auto_window.clicked.connect(self._on_auto_window)
+        window_layout.addWidget(btn_auto_window)
+        
+        # 默认窗宽窗位按钮
+        btn_default_window = QPushButton("默认窗宽窗位")
+        btn_default_window.clicked.connect(self._on_default_window)
+        window_layout.addWidget(btn_default_window)
+        
+        window_group.setLayout(window_layout)
+        layout.addWidget(window_group)
         
         # 分割算法参数组
         algo_group = QGroupBox("分割算法参数")
@@ -928,6 +973,140 @@ class MainWindow(QMainWindow):
                 self.four_view.sagittal_view.set_label_opacity(opacity)
             except Exception as e:
                 print(f"设置标签透明度时发生错误: {e}")
+
+    def _on_window_width_changed(self, value):
+        """窗宽改变"""
+        if hasattr(self.four_view, 'axial_view'):
+            try:
+                window_level = self.window_level_spin.value()
+                self.four_view.axial_view.set_window(value, window_level)
+                self.four_view.coronal_view.set_window(value, window_level)
+                self.four_view.sagittal_view.set_window(value, window_level)
+            except Exception as e:
+                print(f"设置窗宽时发生错误: {e}")
+
+    def _on_window_level_changed(self, value):
+        """窗位改变"""
+        if hasattr(self.four_view, 'axial_view'):
+            try:
+                window_width = self.window_width_spin.value()
+                self.four_view.axial_view.set_window(window_width, value)
+                self.four_view.coronal_view.set_window(window_width, value)
+                self.four_view.sagittal_view.set_window(window_width, value)
+            except Exception as e:
+                print(f"设置窗位时发生错误: {e}")
+
+    def _on_auto_window(self):
+        """自动计算窗宽窗位"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载一张影像")
+            return
+        
+        try:
+            # 计算图像的统计信息
+            img_data = self.current_image_data
+            min_val = np.min(img_data)
+            max_val = np.max(img_data)
+            mean_val = np.mean(img_data)
+            std_val = np.std(img_data)
+            
+            # 自动计算窗宽窗位
+            window_width = std_val * 4  # 4倍标准差
+            window_level = mean_val
+            
+            # 更新界面
+            self.window_width_spin.setValue(window_width)
+            self.window_level_spin.setValue(window_level)
+            
+            # 应用到视图
+            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_window(window_width, window_level)
+                self.four_view.coronal_view.set_window(window_width, window_level)
+                self.four_view.sagittal_view.set_window(window_width, window_level)
+            
+            QMessageBox.information(self, "成功", f"自动窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"自动计算窗宽窗位时发生错误:\n{e}")
+
+    def _on_default_window(self):
+        """默认窗宽窗位"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载一张影像")
+            return
+        
+        try:
+            # 设置默认窗宽窗位
+            window_width = 400.0  # 默认窗宽
+            window_level = 0.0    # 默认窗位
+            
+            # 更新界面
+            self.window_width_spin.setValue(window_width)
+            self.window_level_spin.setValue(window_level)
+            
+            # 应用到视图
+            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_window(window_width, window_level)
+                self.four_view.coronal_view.set_window(window_width, window_level)
+                self.four_view.sagittal_view.set_window(window_width, window_level)
+            
+            QMessageBox.information(self, "成功", f"默认窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"设置默认窗宽窗位时发生错误:\n{e}")
+
+    def _on_label_statistics(self):
+        """标签统计"""
+        if self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "请先加载或创建标签")
+            return
+        
+        try:
+            # 计算所有标签的统计信息
+            unique_labels = np.unique(self.current_label_data)
+            unique_labels = unique_labels[unique_labels > 0]  # 排除背景(0)
+            
+            if len(unique_labels) == 0:
+                QMessageBox.information(self, "提示", "当前没有标签数据")
+                return
+            
+            stats_text = "标签统计信息:\n\n"
+            
+            for label_id in unique_labels:
+                label_mask = (self.current_label_data == label_id)
+                voxel_count = np.sum(label_mask)
+                
+                # 计算物理体积
+                if self.current_metadata and 'spacing' in self.current_metadata:
+                    spacing = self.current_metadata['spacing']
+                    voxel_volume = spacing[0] * spacing[1] * spacing[2]  # mm³
+                    volume_mm3 = voxel_count * voxel_volume
+                    volume_cm3 = volume_mm3 / 1000.0  # cm³
+                    volume_text = f"{volume_cm3:.2f} cm³ ({volume_mm3:.2f} mm³)"
+                else:
+                    volume_text = f"{voxel_count} 体素"
+                
+                # 计算表面积（近似）
+                from scipy import ndimage
+                # 使用形态学梯度计算表面积
+                edges = ndimage.binary_dilation(label_mask) ^ label_mask
+                surface_pixels = np.sum(edges)
+                
+                if self.current_metadata and 'spacing' in self.current_metadata:
+                    spacing = self.current_metadata['spacing']
+                    pixel_area = spacing[0] * spacing[1]  # mm²
+                    surface_area_mm2 = surface_pixels * pixel_area
+                    surface_area_cm2 = surface_area_mm2 / 100.0  # cm²
+                    area_text = f"{surface_area_cm2:.2f} cm² ({surface_area_mm2:.2f} mm²)"
+                else:
+                    area_text = f"{surface_pixels} 像素"
+                
+                stats_text += f"标签 {label_id}:\n"
+                stats_text += f"  体积: {volume_text}\n"
+                stats_text += f"  表面积: {area_text}\n"
+                stats_text += f"  体素数: {voxel_count}\n\n"
+            
+            QMessageBox.information(self, "标签统计", stats_text)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"计算标签统计时发生错误:\n{e}")
 
     def _on_label_selection_changed(self):
         """标签选择改变"""
@@ -1269,13 +1448,71 @@ class MainWindow(QMainWindow):
             self.four_view.coronal_view.set_tool_mode(tool)
             self.four_view.sagittal_view.set_tool_mode(tool)
 
-    def _on_crosshair_changed(self, x, y, z):
+    def _on_crosshair_changed(self, view_type, x, y):
         """十字准线变化"""
-        pass
+        if self.current_image_data is None:
+            return
+        
+        try:
+            # 计算z坐标
+            z = 0
+            if view_type == 'axial':
+                if hasattr(self.four_view, 'axial_view'):
+                    z = self.four_view.axial_view.current_slice
+            elif view_type == 'coronal':
+                if hasattr(self.four_view, 'coronal_view'):
+                    z = self.four_view.coronal_view.current_slice
+            elif view_type == 'sagittal':
+                if hasattr(self.four_view, 'sagittal_view'):
+                    z = self.four_view.sagittal_view.current_slice
+            
+            # 更新光标位置标签
+            self.cursor_pos_label.setText(f"Cursor position (x,y,z): ({int(x)}, {int(y)}, {int(z)})")
+            
+            # 更新光标下的强度值
+            if (0 <= x < self.current_image_data.shape[0] and 
+                0 <= y < self.current_image_data.shape[1] and 
+                0 <= z < self.current_image_data.shape[2]):
+                intensity = self.current_image_data[int(x), int(y), int(z)]
+                self.cursor_intensity_value_label.setText(f"  Intensity: {intensity:.1f}")
+                self.cursor_layer_label.setText(f"  Layer: Image")
+                
+                # 更新光标下的标签值
+                if self.current_label_data is not None:
+                    label_value = self.current_label_data[int(x), int(y), int(z)]
+                    self.cursor_label_value_label.setText(f"  Label: {label_value}")
+                else:
+                    self.cursor_label_value_label.setText("  Label: --")
+        except Exception as e:
+            print(f"更新十字准线时发生错误: {e}")
 
     def _on_slice_changed(self, view, slice_idx):
         """切片变化"""
-        pass
+        if self.current_image_data is None:
+            return
+        
+        try:
+            # 获取当前十字准线位置
+            if hasattr(self.four_view, 'axial_view'):
+                axial_slice = self.four_view.axial_view.current_slice
+                coronal_slice = self.four_view.coronal_view.current_slice
+                sagittal_slice = self.four_view.sagittal_view.current_slice
+                
+                # 根据变化的视图更新其他视图
+                if view == 'axial':
+                    # 轴位切片变化，更新冠状位和矢状位的十字准线
+                    self.four_view.coronal_view.set_slice(axial_slice)
+                    self.four_view.sagittal_view.set_slice(axial_slice)
+                elif view == 'coronal':
+                    # 冠状位切片变化，更新轴位和矢状位的十字准线
+                    self.four_view.axial_view.set_slice(coronal_slice)
+                    self.four_view.sagittal_view.set_slice(coronal_slice)
+                elif view == 'sagittal':
+                    # 矢状位切片变化，更新轴位和冠状位的十字准线
+                    self.four_view.axial_view.set_slice(sagittal_slice)
+                    self.four_view.coronal_view.set_slice(sagittal_slice)
+        except Exception as e:
+            print(f"更新切片时发生错误: {e}")
 
     def _update_seed_count(self):
         """更新种子点数量"""
