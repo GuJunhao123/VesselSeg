@@ -2,7 +2,7 @@
 # 使用清华镜像源安装
 # 安装前请确保已安装Python 3.11
 
-# 安装指令：
+# 核心依赖库（必须安装）
 pip install -i https://pypi.tuna.tsinghua.edu.cn/simple numpy==2.3.5
 pip install -i https://pypi.tuna.tsinghua.edu.cn/simple PyQt5==5.15.11
 pip install -i https://pypi.tuna.tsinghua.edu.cn/simple nibabel==5.4.2

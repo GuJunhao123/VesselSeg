@@ -21,7 +21,7 @@ try:
     import sys
     import os
     sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
-    from pre4 import mobileuvit_l
+    from pre4 import mobileuvit, mobileuvit_l
     from monai.transforms import (
         Compose, LoadImaged, EnsureChannelFirstd, Orientationd, Spacingd,
         CropForegroundd, SpatialPadd, ScaleIntensityRanged, NormalizeIntensityd, 
@@ -46,6 +46,10 @@ class AISegmentationInterface:
         self.model_input_shape = None
         self.model_output_shape = None
         self.is_model_loaded = False
+        
+        # MobileUViT 模型参数
+        self.model_variant = 'mobileuvit_l'  # 'mobileuvit' 或 'mobileuvit_l'
+        self.decomposition_method = 'percentile_50'  # 血管分解方法
     
     def load_model(self, model_path: str) -> bool:
         """
@@ -83,11 +87,78 @@ class AISegmentationInterface:
                 print(f"输入形状: {self.model_input_shape}")
                 print(f"输出形状: {self.model_output_shape}")
                 
-            elif ext in ['.pth', '.pt'] and PYTORCH_AVAILABLE:
+            elif ext in ['.pth', '.pt']:
+                if not PYTORCH_AVAILABLE:
+                    raise RuntimeError("PyTorch 不可用，无法加载.pth模型文件")
+                
                 # 加载 PyTorch 模型
-                self.pytorch_model = mobileuvit_l(inch=1)
+                try:
+                    if self.model_variant == 'mobileuvit':
+                        self.pytorch_model = mobileuvit(inch=1)
+                        print("使用 mobileuvit 小型模型")
+                    else:
+                        self.pytorch_model = mobileuvit_l(inch=1)
+                        print("使用 mobileuvit_l 大型模型")
+                except Exception as e:
+                    print(f"模型实例化失败: {e}")
+                    raise RuntimeError(f"无法创建模型变体 {self.model_variant}: {e}")
+                
                 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                self.pytorch_model.load_state_dict(torch.load(model_path, map_location=device))
+                print(f"使用设备: {device}")
+                
+                try:
+                    state_dict = torch.load(model_path, map_location=device)
+                    
+                    # 智能加载权重，处理模型变体之间的差异
+                    if self.model_variant == 'mobileuvit':
+                        # 小型模型：过滤掉不匹配的权重
+                        print("为小型模型调整权重...")
+                        
+                        # 构建新的state_dict，只包含匹配的权重
+                        new_state_dict = {}
+                        for key, value in state_dict.items():
+                            # 跳过transformer_bottleneck.3（小型模型没有第4层）
+                            if 'transformer_bottleneck.3' in key:
+                                print(f"跳过不匹配的权重: {key}")
+                                continue
+                            
+                            # 处理patch_embeddings.stem.0的大小不匹配
+                            if key == 'patch_embeddings.stem.0.weight':
+                                # 从32通道裁剪到16通道
+                                if value.shape[0] == 32 and self.pytorch_model.patch_embeddings.stem[0].weight.shape[0] == 16:
+                                    print("调整patch_embeddings.stem.0.weight从32通道到16通道")
+                                    new_value = value[:16, :, :, :, :]
+                                    new_state_dict[key] = new_value
+                                    continue
+                            elif key == 'patch_embeddings.stem.0.bias':
+                                # 从32通道裁剪到16通道
+                                if value.shape[0] == 32 and self.pytorch_model.patch_embeddings.stem[0].bias.shape[0] == 16:
+                                    print("调整patch_embeddings.stem.0.bias从32通道到16通道")
+                                    new_value = value[:16]
+                                    new_state_dict[key] = new_value
+                                    continue
+                            
+                            # 其他权重，如果形状匹配则保留
+                            if key in self.pytorch_model.state_dict():
+                                if value.shape == self.pytorch_model.state_dict()[key].shape:
+                                    new_state_dict[key] = value
+                                    print(f"加载权重: {key}")
+                                else:
+                                    print(f"跳过形状不匹配的权重: {key}")
+                            else:
+                                print(f"跳过不存在的权重: {key}")
+                        
+                        # 加载调整后的权重
+                        self.pytorch_model.load_state_dict(new_state_dict, strict=False)
+                        print("小型模型权重加载成功（部分权重可能被跳过）")
+                    else:
+                        # 大型模型：直接加载
+                        self.pytorch_model.load_state_dict(state_dict)
+                        print("大型模型权重加载成功")
+                except Exception as e:
+                    print(f"模型权重加载失败: {e}")
+                    raise RuntimeError(f"无法加载模型权重: {e}")
+                
                 self.pytorch_model.to(device)
                 self.pytorch_model.eval()
                 
@@ -96,6 +167,8 @@ class AISegmentationInterface:
                 self.model_type = 'pytorch'
                 
                 print(f"PyTorch 模型加载成功: {model_path}")
+                print(f"模型变体: {self.model_variant}")
+                print(f"血管分解方法: {self.decomposition_method}")
                 print(f"输入形状: {self.model_input_shape}")
                 print(f"输出形状: {self.model_output_shape}")
                 
@@ -109,6 +182,43 @@ class AISegmentationInterface:
             print(f"模型加载失败: {e}")
             self.is_model_loaded = False
             return False
+    
+    def set_model_variant(self, variant: str):
+        """设置MobileUViT模型变体
+        
+        Args:
+            variant: 'mobileuvit' 或 'mobileuvit_l'
+        """
+        self.model_variant = variant
+        print(f"模型变体已设置为: {variant}")
+    
+    def set_decomposition_method(self, method: str):
+        """设置血管分解方法
+        
+        Args:
+            method: 'adaptive', 'fixed_1.0', 'fixed_1.5', 'fixed_2.0', 'fixed_2.5',
+                    'median', 'percentile_25', 'percentile_50', 'percentile_75'
+        """
+        self.decomposition_method = method
+        print(f"血管分解方法已设置为: {method}")
+    
+    def get_model_variants(self):
+        """获取可用的模型变体列表"""
+        return ['mobileuvit', 'mobileuvit_l']
+    
+    def get_decomposition_methods(self):
+        """获取可用的血管分解方法列表"""
+        return [
+            'adaptive',
+            'fixed_1.0',
+            'fixed_1.5', 
+            'fixed_2.0',
+            'fixed_2.5',
+            'median',
+            'percentile_25',
+            'percentile_50',
+            'percentile_75'
+        ]
     
     def preprocess_image(self, image_data: np.ndarray) -> np.ndarray:
         """
@@ -176,6 +286,126 @@ class AISegmentationInterface:
                 mask = (1.0 / (1.0 + np.exp(-output_data)) > 0.5).astype(np.uint8)
         else:
             mask = output_data.astype(np.uint8)
+        
+        # 应用血管分解方法进行后处理
+        if self.decomposition_method and mask.max() > 0:
+            try:
+                # 导入必要的库
+                from skimage import morphology
+                from scipy import ndimage
+                from skimage.filters import threshold_otsu
+                
+                print(f"开始应用血管分解方法: {self.decomposition_method}")
+                
+                # 对每个标签进行分解处理
+                processed_mask = np.zeros_like(mask, dtype=np.uint8)
+                
+                for label in range(1, mask.max() + 1):
+                    vessel_mask = (mask == label).astype(bool)
+                    
+                    if not np.any(vessel_mask):
+                        continue
+                    
+                    # 提取骨架
+                    skeleton = morphology.skeletonize(vessel_mask)
+                    
+                    if not np.any(skeleton):
+                        # 无法提取骨架，整体视为small
+                        processed_mask[vessel_mask] = label
+                        continue
+                    
+                    # 计算距离变换
+                    edt = ndimage.distance_transform_edt(vessel_mask)
+                    radii = edt[skeleton]
+                    
+                    if radii.size == 0:
+                        processed_mask[vessel_mask] = label
+                        continue
+                    
+                    # 根据分解方法选择阈值
+                    if self.decomposition_method.startswith("fixed_"):
+                        fixed_val = float(self.decomposition_method.split("_")[1])
+                        th = fixed_val
+                        print(f"  使用固定阈值: {th}")
+                    elif self.decomposition_method == "adaptive":
+                        if np.unique(radii).size > 1:
+                            th = threshold_otsu(radii)
+                        else:
+                            th = radii.max() + 1e-5
+                        print(f"  使用自适应阈值: {th:.3f}")
+                    elif self.decomposition_method == "median":
+                        th = np.median(radii)
+                        print(f"  使用中位数阈值: {th:.3f}")
+                    elif self.decomposition_method.startswith("percentile_"):
+                        percentile_val = int(self.decomposition_method.split("_")[1])
+                        th = np.percentile(radii, percentile_val)
+                        print(f"  使用{percentile_val}%百分位数阈值: {th:.3f}")
+                    else:
+                        # 默认使用adaptive
+                        if np.unique(radii).size > 1:
+                            th = threshold_otsu(radii)
+                        else:
+                            th = radii.max() + 1e-5
+                        print(f"  使用默认自适应阈值: {th:.3f}")
+                    
+                    # 计算trunk、small和junction
+                    _, idx = ndimage.distance_transform_edt(~skeleton, return_indices=True)
+                    prop_r = edt[tuple(idx)]
+                    
+                    trunk = (prop_r >= th) & vessel_mask
+                    non_trunk = vessel_mask & (~trunk)
+                    
+                    if not np.any(trunk):
+                        # 没有主干，全部视为small
+                        processed_mask[vessel_mask] = label
+                        print(f"  标签{label}: 无主干，全部为细血管")
+                        continue
+                    
+                    trunk_dil = ndimage.binary_dilation(trunk, iterations=2)
+                    junction = trunk_dil & non_trunk
+                    small = non_trunk & (~junction)
+                    
+                    # 根据分解方法应用不同的后处理策略
+                    if self.decomposition_method == "adaptive":
+                        # 自适应：保留所有部分
+                        processed_mask[trunk] = label
+                        processed_mask[small] = label
+                        processed_mask[junction] = label
+                        print(f"  标签{label}: 自适应模式 - 保留主干{np.sum(trunk)}，细血管{np.sum(small)}，连接点{np.sum(junction)}")
+                    elif self.decomposition_method.startswith("fixed_"):
+                        # 固定阈值：只保留主干
+                        processed_mask[trunk] = label
+                        # 可选：根据阈值大小决定是否保留细血管
+                        if float(self.decomposition_method.split("_")[1]) >= 2.0:
+                            # 高阈值：只保留主干
+                            print(f"  标签{label}: 高阈值模式 - 只保留主干{np.sum(trunk)}")
+                        else:
+                            # 低阈值：保留主干和部分细血管
+                            processed_mask[small] = label
+                            print(f"  标签{label}: 低阈值模式 - 保留主干{np.sum(trunk)}和细血管{np.sum(small)}")
+                    elif self.decomposition_method == "median":
+                        # 中位数：平衡保留
+                        processed_mask[trunk] = label
+                        processed_mask[small] = label
+                        print(f"  标签{label}: 中位数模式 - 保留主干{np.sum(trunk)}和细血管{np.sum(small)}")
+                    elif self.decomposition_method.startswith("percentile_"):
+                        percentile_val = int(self.decomposition_method.split("_")[1])
+                        if percentile_val >= 50:
+                            # 高百分位数：更保守，只保留主干
+                            processed_mask[trunk] = label
+                            print(f"  标签{label}: 高百分位数{percentile_val}% - 只保留主干{np.sum(trunk)}")
+                        else:
+                            # 低百分位数：更激进，保留更多
+                            processed_mask[trunk] = label
+                            processed_mask[small] = label
+                            print(f"  标签{label}: 低百分位数{percentile_val}% - 保留主干{np.sum(trunk)}和细血管{np.sum(small)}")
+                
+                mask = processed_mask
+                print(f"血管分解后处理完成，最终非零像素: {np.count_nonzero(mask)}")
+            except Exception as e:
+                print(f"血管分解后处理失败: {e}")
+                import traceback
+                traceback.print_exc()
         
         # 调整尺寸（如果需要）
         if mask.shape != original_shape:
@@ -250,6 +480,8 @@ class AISegmentationInterface:
                         CropForegroundd(keys=["image"], source_key="image", select_fn=lambda x: x > 0),
                         SpatialPadd(keys=["image"], spatial_size=PATCH_SIZE),
                     ]
+                    
+                    print(f"使用参数: 模型变体={self.model_variant}, 血管分解方法={self.decomposition_method}")
                     
                     # 推理专用 Transform
                     inf_transforms = Compose(spatial_ops + [

@@ -1224,6 +1224,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先加载一张影像")
             return
 
+        # 显示AI分割参数选择对话框
+        if not self._show_ai_segmentation_dialog():
+            return
+
         # 显示状态栏提示
         self.statusBar().showMessage("正在初始化AI分割...")
         
@@ -1234,57 +1238,34 @@ class MainWindow(QMainWindow):
                 # 延迟导入，减少启动时的模块加载
                 from ai_interface import AISegmentationInterface
                 self.ai_interface = AISegmentationInterface()
-                
-                # 模型路径
-                model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
-                
-                # 加载模型
-                if not self.ai_interface.load_model(model_path):
-                    # 尝试使用 pre4.py 直接进行分割
-                    self.statusBar().showMessage("模型加载失败，尝试使用 pre4.py 直接分割...")
-                    try:
-                        # 导入 pre4 模块
-                        import sys
-                        import os
-                        sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
-                        from pre4 import run_inference
-                        
-                        # 保存当前图像为临时文件
-                        import tempfile
-                        import nibabel as nib
-                        
-                        with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
-                            tmp_path = tmp.name
-                        
-                        # 保存临时 NIfTI 文件
-                        tmp_nii = nib.Nifti1Image(self.current_image_data, affine=np.eye(4))
-                        nib.save(tmp_nii, tmp_path)
-                        
-                        # 修改 pre4.py 的输入路径
-                        import pre4
-                        pre4.INPUT_IMAGE = tmp_path
-                        
-                        # 执行分割
-                        run_inference()
-                        
-                        # 清理临时文件
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                        
-                        self.statusBar().showMessage("AI分割完成，结果已保存到 vis_results 目录")
-                        return
-                    except Exception as e:
-                        self.statusBar().showMessage("AI分割失败")
-                        QMessageBox.critical(self, "错误", f"使用 pre4.py 分割失败:\n{e}")
-                        return
             except Exception as e:
                 self.statusBar().showMessage("AI分割初始化失败")
                 QMessageBox.critical(self, "错误", f"AI分割初始化失败:\n{e}")
                 return
+        
+        # 重新加载模型（使用新选择的参数）
+        try:
+            self.statusBar().showMessage("正在加载AI模型，请稍候...")
+            model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
+            
+            # 加载模型
+            if not self.ai_interface.load_model(model_path):
+                self.statusBar().showMessage("AI分割失败")
+                QMessageBox.critical(self, "错误", "AI模型加载失败")
+                return
+        except Exception as e:
+            self.statusBar().showMessage("AI分割初始化失败")
+            QMessageBox.critical(self, "错误", f"AI模型加载失败:\n{e}")
+            return
 
         # 执行分割
         self.statusBar().showMessage("正在执行AI分割，请稍候...")
         try:
+            # 清除现有标签
+            self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
+            self.four_view.set_label_data(self.current_label_data)
+            
+            # 执行分割
             mask = self.ai_interface.segment(self.current_image_data)
 
             if mask is not None:
@@ -1300,6 +1281,82 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage("AI分割过程中发生错误")
             QMessageBox.critical(self, "错误", f"AI分割过程中发生错误:\n{e}")
+
+    def _show_ai_segmentation_dialog(self):
+        """显示AI分割参数选择对话框"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QHBoxLayout, QGroupBox, QFormLayout
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AI分割参数设置")
+        dialog.setMinimumSize(400, 250)
+        
+        layout = QVBoxLayout()
+        
+        # 模型参数组
+        model_group = QGroupBox("模型参数")
+        model_layout = QFormLayout()
+        
+        # 模型变体选择
+        model_variant_combo = QComboBox()
+        model_variant_combo.addItems(['mobileuvit_l (大型模型 - 高精度)', 'mobileuvit (小型模型 - 高速度)'])
+        model_variant_combo.setCurrentIndex(0)
+        model_layout.addRow("模型变体:", model_variant_combo)
+        
+        # 血管分解方法选择
+        decomposition_combo = QComboBox()
+        decomposition_combo.addItems([
+            'percentile_50 (推荐)',
+            'adaptive',
+            'fixed_1.0',
+            'fixed_1.5',
+            'fixed_2.0',
+            'fixed_2.5',
+            'median',
+            'percentile_25',
+            'percentile_75'
+        ])
+        decomposition_combo.setCurrentIndex(0)
+        model_layout.addRow("血管分解方法:", decomposition_combo)
+        
+        model_group.setLayout(model_layout)
+        layout.addWidget(model_group)
+        
+        # 添加说明
+        info_label = QLabel(
+            "说明:\n"
+            "• mobileuvit_l: 大型模型，精度更高\n"
+            "• mobileuvit: 小型模型，速度更快\n"
+            "• percentile_50: 使用50%百分位数作为阈值\n"
+            "• adaptive: 自适应阈值，适合不同图像"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        btn_ok = QPushButton("开始分割")
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(dialog.reject)
+        button_layout.addWidget(btn_ok)
+        button_layout.addWidget(btn_cancel)
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        
+        # 显示对话框
+        if dialog.exec_() == QDialog.Accepted:
+            # 获取用户选择的参数
+            model_variant = model_variant_combo.currentText().split()[0]
+            decomposition_method = decomposition_combo.currentText().split()[0]
+            
+            # 设置AI接口参数
+            self.ai_interface.set_model_variant(model_variant)
+            self.ai_interface.set_decomposition_method(decomposition_method)
+            
+            return True
+        else:
+            return False
 
     def _load_series_entry(self, entry):
         """从数据库条目加载序列"""
