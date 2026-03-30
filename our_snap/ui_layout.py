@@ -702,6 +702,54 @@ class MainWindow(QMainWindow):
         
         toolbar_3d_group.setLayout(toolbar_3d_layout)
         layout.addWidget(toolbar_3d_group)
+        
+        # ===== 5. 量化分析 =====
+        quant_analysis_group = QGroupBox("量化分析")
+        quant_analysis_layout = QVBoxLayout()
+        quant_analysis_layout.setSpacing(3)
+        
+        btn_quant_analysis = QPushButton("运行量化分析")
+        btn_quant_analysis.setFixedSize(150, 30)
+        btn_quant_analysis.setToolTip("基于门静脉供血区自动划分肝脏8个功能区段，计算各段体积")
+        btn_quant_analysis.clicked.connect(self._on_quantitative_analysis)
+        quant_analysis_layout.addWidget(btn_quant_analysis)
+        
+        quant_analysis_group.setLayout(quant_analysis_layout)
+        layout.addWidget(quant_analysis_group)
+        
+        # ===== 6. 3D可视化 =====
+        three_d_visualization_group = QGroupBox("3D可视化")
+        three_d_visualization_layout = QVBoxLayout()
+        three_d_visualization_layout.setSpacing(3)
+        
+        btn_3d_visualization = QPushButton("显示3D血管树")
+        btn_3d_visualization.setFixedSize(150, 30)
+        btn_3d_visualization.setToolTip("显示红蓝双色区分的3D血管树")
+        btn_3d_visualization.clicked.connect(self._on_3d_visualization)
+        three_d_visualization_layout.addWidget(btn_3d_visualization)
+        
+        btn_cutting_plane = QPushButton("添加切割平面")
+        btn_cutting_plane.setFixedSize(150, 30)
+        btn_cutting_plane.setToolTip("手动放置虚拟切割平面")
+        btn_cutting_plane.clicked.connect(self._on_add_cutting_plane)
+        three_d_visualization_layout.addWidget(btn_cutting_plane)
+        
+        three_d_visualization_group.setLayout(three_d_visualization_layout)
+        layout.addWidget(three_d_visualization_group)
+        
+        # ===== 7. 报告生成 =====
+        report_group = QGroupBox("报告生成")
+        report_layout = QVBoxLayout()
+        report_layout.setSpacing(3)
+        
+        btn_generate_report = QPushButton("生成PDF报告")
+        btn_generate_report.setFixedSize(150, 30)
+        btn_generate_report.setToolTip("一键导出包含图文数据与风险评估的PDF手术规划报告")
+        btn_generate_report.clicked.connect(self._on_generate_report)
+        report_layout.addWidget(btn_generate_report)
+        
+        report_group.setLayout(report_layout)
+        layout.addWidget(report_group)
 
         # ===== 5. 数据库对接（522范式） - 现在以弹窗形式打开 =====
         btn_open_db_dialog = QPushButton("打开数据库 (522)")
@@ -1504,6 +1552,207 @@ class MainWindow(QMainWindow):
             self.four_view.axial_view.set_tool_mode(tool)
             self.four_view.coronal_view.set_tool_mode(tool)
             self.four_view.sagittal_view.set_tool_mode(tool)
+    
+    def _on_quantitative_analysis(self):
+        """运行量化分析"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
+            return
+        
+        try:
+            # 延迟导入，减少启动时的模块加载
+            from quantitative_analysis import QuantitativeAnalyzer
+            
+            # 显示状态栏提示
+            self.statusBar().showMessage("正在进行量化分析...")
+            
+            # 初始化量化分析器
+            analyzer = QuantitativeAnalyzer()
+            
+            # 提取门静脉和肝静脉掩码
+            portal_vein_mask = (self.current_label_data == 1)
+            hepatic_vein_mask = (self.current_label_data == 2)
+            
+            # 计算肝脏分段
+            segmentation = analyzer.couinaud_segmentation(
+                np.ones_like(self.current_label_data),  # 假设整个区域都是肝脏
+                portal_vein_mask,
+                hepatic_vein_mask
+            )
+            
+            # 计算体积
+            volumes = analyzer.calculate_volumes(segmentation)
+            
+            # 提取血管量化指标
+            vascular_metrics = analyzer.extract_vascular_metrics(portal_vein_mask, hepatic_vein_mask)
+            
+            # 模拟肿瘤-血管距离评估
+            tumor_vessel_assessment = analyzer.assess_tumor_vessel_distance(
+                np.zeros_like(self.current_label_data),  # 假设没有肿瘤
+                portal_vein_mask, 
+                hepatic_vein_mask
+            )
+            
+            # 手术风险评估
+            risk_assessment = analyzer.assess_surgical_risk(
+                volumes, 
+                vascular_metrics, 
+                tumor_vessel_assessment
+            )
+            
+            # 显示分析结果
+            result_text = "量化分析结果:\n\n"
+            result_text += "肝脏体积分析:\n"
+            for key, value in volumes.items():
+                if key != 'total_liver':
+                    result_text += f"{key.replace('segment_', '段 ')}: {value:.2f} ml\n"
+            result_text += f"总体积: {volumes.get('total_liver', 0):.2f} ml\n\n"
+            
+            result_text += "血管量化指标:\n"
+            for key, value in vascular_metrics.items():
+                if isinstance(value, float):
+                    result_text += f"{key}: {value:.2f}\n"
+                else:
+                    result_text += f"{key}: {value}\n"
+            
+            QMessageBox.information(self, "量化分析结果", result_text)
+            
+            # 保存分析结果
+            self.quantitative_results = {
+                'volumes': volumes,
+                'vascular_metrics': vascular_metrics,
+                'tumor_vessel_assessment': tumor_vessel_assessment,
+                'risk_assessment': risk_assessment
+            }
+            
+            # 显示状态栏提示
+            self.statusBar().showMessage("量化分析完成")
+            
+        except Exception as e:
+            self.statusBar().showMessage("量化分析失败")
+            QMessageBox.critical(self, "错误", f"量化分析失败:\n{e}")
+    
+    def _on_3d_visualization(self):
+        """显示3D血管树"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
+            return
+        
+        try:
+            # 延迟导入，减少启动时的模块加载
+            from visualization import SliceViewer
+            
+            # 创建3D视图窗口
+            from PyQt5.QtWidgets import QDialog
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle("3D血管树可视化")
+            dialog.setGeometry(100, 100, 800, 600)
+            
+            layout = QVBoxLayout()
+            
+            # 创建3D视图
+            viewer = SliceViewer('3d')
+            spacing = self.current_metadata['spacing'] if (self.current_metadata and 'spacing' in self.current_metadata) else None
+            viewer.set_image_data(self.current_image_data, spacing)
+            viewer.set_label_data(self.current_label_data)
+            viewer._update_display()
+            
+            layout.addWidget(viewer)
+            dialog.setLayout(layout)
+            
+            dialog.exec_()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"3D可视化失败:\n{e}")
+    
+    def _on_add_cutting_plane(self):
+        """添加切割平面"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
+            return
+        
+        QMessageBox.information(self, "提示", "请先打开3D血管树可视化，然后在3D视图中添加切割平面。\n\n操作步骤：\n1. 点击'显示3D血管树'按钮\n2. 在3D视图中，切割平面会自动显示")
+    
+    def _on_generate_report(self):
+        """生成PDF报告"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
+            return
+        
+        try:
+            # 延迟导入，减少启动时的模块加载
+            import sys
+            import os
+            import subprocess
+            
+            # 确保当前目录在Python路径中
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+            
+            # 尝试安装reportlab库
+            print("尝试安装reportlab库...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
+                print("reportlab库安装成功")
+            except subprocess.CalledProcessError as e:
+                print(f"reportlab库安装失败: {e}")
+            
+            # 直接导入reportlab库，确保它可用
+            import reportlab
+            print(f"reportlab版本: {reportlab.__version__}")
+            
+            from report_generator import ReportGenerator
+            
+            # 创建ReportGenerator实例
+            generator = ReportGenerator()
+            
+            # 显示状态栏提示
+            self.statusBar().showMessage("正在生成PDF报告...")
+            
+            # 准备报告数据
+            report_data = {
+                'patient_id': self.current_patient_info.get('id', 'N/A'),
+                'exam_date': self.current_patient_info.get('study_date', ''),
+                'segmentation_method': 'AI自动分割',
+                'model_variant': getattr(self, 'ai_model_variant', 'mobileuvit_l')
+            }
+            
+            # 添加量化分析结果
+            if hasattr(self, 'quantitative_results'):
+                report_data.update(self.quantitative_results)
+            
+            # 添加图像
+            if self.current_image_data is not None:
+                # 提取中间切片作为示例
+                middle_slice = self.current_image_data.shape[2] // 2
+                slice_data = self.current_image_data[:, :, middle_slice]
+                report_data['images'] = {
+                    '肝脏影像 (中间切片)': slice_data
+                }
+            
+            # 生成报告
+            generator = ReportGenerator()
+            
+            # 选择保存路径
+            from PyQt5.QtWidgets import QFileDialog
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "保存PDF报告", "", "PDF文件 (*.pdf)"
+            )
+            
+            if filepath:
+                success = generator.generate_report(report_data, filepath)
+                if success:
+                    QMessageBox.information(self, "成功", f"PDF报告生成成功:\n{filepath}")
+                    self.statusBar().showMessage("PDF报告生成成功")
+                else:
+                    QMessageBox.critical(self, "错误", "PDF报告生成失败")
+                    self.statusBar().showMessage("PDF报告生成失败")
+            
+        except Exception as e:
+            self.statusBar().showMessage("PDF报告生成失败")
+            QMessageBox.critical(self, "错误", f"PDF报告生成失败:\n{e}")
 
     def _on_crosshair_changed(self, view_type, x, y):
         """十字准线变化"""

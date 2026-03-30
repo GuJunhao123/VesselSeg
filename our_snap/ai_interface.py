@@ -265,6 +265,10 @@ class AISegmentationInterface:
             
         Returns:
             后处理后的掩码 (H, W, D)，uint8类型
+            标签定义：
+            0: 背景
+            1: 门静脉
+            2: 肝静脉
         """
         # 获取输出数据
         if isinstance(model_output, list):
@@ -272,20 +276,17 @@ class AISegmentationInterface:
         else:
             output_data = model_output
         
-        # 移除batch和channel维度
+        # 处理多通道输出（3通道：背景、门静脉、肝静脉）
+        if output_data.shape[0] == 3:
+            # 多通道输出，选择每个体素的最大概率通道
+            output_data = np.argmax(output_data, axis=0)
+        
+        # 移除batch维度
         while len(output_data.shape) > 3:
             output_data = np.squeeze(output_data, axis=0)
         
-        # 如果输出是概率图，进行二值化
-        if output_data.dtype == np.float32 or output_data.dtype == np.float64:
-            if output_data.max() <= 1.0:
-                # 概率图，阈值0.5
-                mask = (output_data > 0.5).astype(np.uint8)
-            else:
-                # 可能是logits，使用sigmoid
-                mask = (1.0 / (1.0 + np.exp(-output_data)) > 0.5).astype(np.uint8)
-        else:
-            mask = output_data.astype(np.uint8)
+        # 确保是uint8类型
+        mask = output_data.astype(np.uint8)
         
         # 应用血管分解方法进行后处理
         if self.decomposition_method and mask.max() > 0:
@@ -300,11 +301,19 @@ class AISegmentationInterface:
                 # 对每个标签进行分解处理
                 processed_mask = np.zeros_like(mask, dtype=np.uint8)
                 
-                for label in range(1, mask.max() + 1):
+                # 血管类型定义
+                vessel_types = {
+                    1: "门静脉",
+                    2: "肝静脉"
+                }
+                
+                for label in [1, 2]:  # 只处理门静脉和肝静脉
                     vessel_mask = (mask == label).astype(bool)
                     
                     if not np.any(vessel_mask):
                         continue
+                    
+                    print(f"处理{label} ({vessel_types[label]})...")
                     
                     # 提取骨架
                     skeleton = morphology.skeletonize(vessel_mask)
@@ -352,56 +361,98 @@ class AISegmentationInterface:
                     _, idx = ndimage.distance_transform_edt(~skeleton, return_indices=True)
                     prop_r = edt[tuple(idx)]
                     
-                    trunk = (prop_r >= th) & vessel_mask
-                    non_trunk = vessel_mask & (~trunk)
+                    # 血管分级（5级以上微小血管）
+                    # 1级：主干（直径 > 3mm）
+                    # 2级：大分支（直径 2-3mm）
+                    # 3级：中分支（直径 1-2mm）
+                    # 4级：小分支（直径 0.5-1mm）
+                    # 5级及以上：微小分支（直径 < 0.5mm）
+                    level1 = (prop_r >= 1.5) & vessel_mask  # 3mm直径
+                    level2 = (prop_r >= 1.0) & (prop_r < 1.5) & vessel_mask  # 2-3mm
+                    level3 = (prop_r >= 0.5) & (prop_r < 1.0) & vessel_mask  # 1-2mm
+                    level4 = (prop_r >= 0.25) & (prop_r < 0.5) & vessel_mask  # 0.5-1mm
+                    level5_plus = (prop_r < 0.25) & vessel_mask  # < 0.5mm
                     
-                    if not np.any(trunk):
-                        # 没有主干，全部视为small
-                        processed_mask[vessel_mask] = label
-                        print(f"  标签{label}: 无主干，全部为细血管")
-                        continue
+                    # 识别分叉点
+                    # 分叉点：骨架上具有3个或更多邻居的点
+                    structure = ndimage.generate_binary_structure(3, 2)  # 26连通
+                    neighbors = ndimage.convolve(skeleton.astype(int), structure, mode='constant')
+                    junction_points = (skeleton & (neighbors >= 3))
                     
-                    trunk_dil = ndimage.binary_dilation(trunk, iterations=2)
-                    junction = trunk_dil & non_trunk
-                    small = non_trunk & (~junction)
+                    # 膨胀分叉点以提高可见性
+                    junction_mask = ndimage.binary_dilation(junction_points, iterations=1)
                     
                     # 根据分解方法应用不同的后处理策略
                     if self.decomposition_method == "adaptive":
                         # 自适应：保留所有部分
-                        processed_mask[trunk] = label
-                        processed_mask[small] = label
-                        processed_mask[junction] = label
-                        print(f"  标签{label}: 自适应模式 - 保留主干{np.sum(trunk)}，细血管{np.sum(small)}，连接点{np.sum(junction)}")
+                        processed_mask[level1 | level2 | level3 | level4 | level5_plus] = label
+                        print(f"  {vessel_types[label]}: 自适应模式 - 保留所有级别血管")
+                        print(f"    1级主干: {np.sum(level1)}")
+                        print(f"    2级大分支: {np.sum(level2)}")
+                        print(f"    3级中分支: {np.sum(level3)}")
+                        print(f"    4级小分支: {np.sum(level4)}")
+                        print(f"    5级及以上微小分支: {np.sum(level5_plus)}")
+                        print(f"    分叉点: {np.sum(junction_points)}")
                     elif self.decomposition_method.startswith("fixed_"):
-                        # 固定阈值：只保留主干
-                        processed_mask[trunk] = label
-                        # 可选：根据阈值大小决定是否保留细血管
-                        if float(self.decomposition_method.split("_")[1]) >= 2.0:
-                            # 高阈值：只保留主干
-                            print(f"  标签{label}: 高阈值模式 - 只保留主干{np.sum(trunk)}")
+                        # 固定阈值：根据阈值决定保留哪些级别
+                        fixed_val = float(self.decomposition_method.split("_")[1])
+                        if fixed_val >= 2.0:
+                            # 高阈值：只保留主干和大分支
+                            processed_mask[level1 | level2] = label
+                            print(f"  {vessel_types[label]}: 高阈值模式 - 只保留主干和大分支")
+                            print(f"    1级主干: {np.sum(level1)}")
+                            print(f"    2级大分支: {np.sum(level2)}")
+                        elif fixed_val >= 1.0:
+                            # 中等阈值：保留主干、大分支和中分支
+                            processed_mask[level1 | level2 | level3] = label
+                            print(f"  {vessel_types[label]}: 中等阈值模式 - 保留主干、大分支和中分支")
+                            print(f"    1级主干: {np.sum(level1)}")
+                            print(f"    2级大分支: {np.sum(level2)}")
+                            print(f"    3级中分支: {np.sum(level3)}")
                         else:
-                            # 低阈值：保留主干和部分细血管
-                            processed_mask[small] = label
-                            print(f"  标签{label}: 低阈值模式 - 保留主干{np.sum(trunk)}和细血管{np.sum(small)}")
+                            # 低阈值：保留所有级别
+                            processed_mask[level1 | level2 | level3 | level4 | level5_plus] = label
+                            print(f"  {vessel_types[label]}: 低阈值模式 - 保留所有级别血管")
+                            print(f"    1级主干: {np.sum(level1)}")
+                            print(f"    2级大分支: {np.sum(level2)}")
+                            print(f"    3级中分支: {np.sum(level3)}")
+                            print(f"    4级小分支: {np.sum(level4)}")
+                            print(f"    5级及以上微小分支: {np.sum(level5_plus)}")
                     elif self.decomposition_method == "median":
                         # 中位数：平衡保留
-                        processed_mask[trunk] = label
-                        processed_mask[small] = label
-                        print(f"  标签{label}: 中位数模式 - 保留主干{np.sum(trunk)}和细血管{np.sum(small)}")
+                        processed_mask[level1 | level2 | level3 | level4] = label
+                        print(f"  {vessel_types[label]}: 中位数模式 - 保留主干、大分支、中分支和小分支")
+                        print(f"    1级主干: {np.sum(level1)}")
+                        print(f"    2级大分支: {np.sum(level2)}")
+                        print(f"    3级中分支: {np.sum(level3)}")
+                        print(f"    4级小分支: {np.sum(level4)}")
                     elif self.decomposition_method.startswith("percentile_"):
                         percentile_val = int(self.decomposition_method.split("_")[1])
-                        if percentile_val >= 50:
+                        if percentile_val >= 75:
                             # 高百分位数：更保守，只保留主干
-                            processed_mask[trunk] = label
-                            print(f"  标签{label}: 高百分位数{percentile_val}% - 只保留主干{np.sum(trunk)}")
+                            processed_mask[level1] = label
+                            print(f"  {vessel_types[label]}: 高百分位数{percentile_val}% - 只保留主干")
+                            print(f"    1级主干: {np.sum(level1)}")
+                        elif percentile_val >= 50:
+                            # 中等百分位数：保留主干和大分支
+                            processed_mask[level1 | level2] = label
+                            print(f"  {vessel_types[label]}: 中等百分位数{percentile_val}% - 保留主干和大分支")
+                            print(f"    1级主干: {np.sum(level1)}")
+                            print(f"    2级大分支: {np.sum(level2)}")
                         else:
                             # 低百分位数：更激进，保留更多
-                            processed_mask[trunk] = label
-                            processed_mask[small] = label
-                            print(f"  标签{label}: 低百分位数{percentile_val}% - 保留主干{np.sum(trunk)}和细血管{np.sum(small)}")
+                            processed_mask[level1 | level2 | level3 | level4 | level5_plus] = label
+                            print(f"  {vessel_types[label]}: 低百分位数{percentile_val}% - 保留所有级别血管")
+                            print(f"    1级主干: {np.sum(level1)}")
+                            print(f"    2级大分支: {np.sum(level2)}")
+                            print(f"    3级中分支: {np.sum(level3)}")
+                            print(f"    4级小分支: {np.sum(level4)}")
+                            print(f"    5级及以上微小分支: {np.sum(level5_plus)}")
                 
                 mask = processed_mask
                 print(f"血管分解后处理完成，最终非零像素: {np.count_nonzero(mask)}")
+                print(f"  门静脉: {np.sum(mask == 1)}")
+                print(f"  肝静脉: {np.sum(mask == 2)}")
             except Exception as e:
                 print(f"血管分解后处理失败: {e}")
                 import traceback

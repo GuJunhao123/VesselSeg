@@ -1,0 +1,16 @@
+# 医学影像分割软件依赖库
+
+# 核心依赖库
+numpy==2.3.5
+PyQt5==5.15.11
+nibabel==5.4.2
+onnxruntime==1.24.4
+torch
+monai
+scikit-image==0.25.2
+pandas==2.3.3
+scipy==1.16.3
+matplotlib==3.10.6
+nilearn
+simpleitk==2.5.3
+reportlab==4.0.8

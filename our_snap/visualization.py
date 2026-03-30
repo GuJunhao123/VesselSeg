@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 可视化模块
-功能：2×2布局视图（轴位/矢状位/冠状位/3D预览），十字线联动，方向标识
+功能：2×2布局视图（轴位/矢状位/冠状位/3D预览），十字线联动，方向标识，3D血管树可视化，虚拟切割平面
 """
 
 import numpy as np
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSizePolicy
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSizePolicy, QSlider, QDoubleSpinBox, QComboBox
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.colors as mcolors
 
 
 class SliceViewer(QWidget):
@@ -50,6 +53,10 @@ class SliceViewer(QWidget):
         
         # 方向标识
         self.direction_labels = self._get_direction_labels()
+        
+        # 切割平面相关
+        self.cutting_planes = []  # 存储切割平面信息
+        self.selected_plane = None  # 当前选中的切割平面
         
         self._init_ui()
     
@@ -374,6 +381,11 @@ class SliceViewer(QWidget):
         # 纯白色背景
         self.ax.set_facecolor('white')
         
+        if self.view_type == '3d':
+            # 3D视图：显示血管树和切割平面
+            self._update_3d_display()
+            return
+        
         slice_img = self._get_slice_data()
         if slice_img is None:
             self.canvas.draw()
@@ -652,6 +664,29 @@ class SliceViewer(QWidget):
         if self.image_data is None:
             return
         
+        if self.view_type == '3d':
+            # 3D视图的拟合
+            if self.image_data is not None:
+                # 计算图像范围
+                if self.image_spacing is not None:
+                    x_range = (0, self.image_data.shape[0] * self.image_spacing[0])
+                    y_range = (0, self.image_data.shape[1] * self.image_spacing[1])
+                    z_range = (0, self.image_data.shape[2] * self.image_spacing[2])
+                else:
+                    x_range = (0, self.image_data.shape[0])
+                    y_range = (0, self.image_data.shape[1])
+                    z_range = (0, self.image_data.shape[2])
+                
+                # 设置坐标轴范围
+                self.ax.set_xlim(x_range)
+                self.ax.set_ylim(y_range)
+                self.ax.set_zlim(z_range)
+                
+                # 调整视图
+                self.ax.view_init(elev=30, azim=45)
+                self.canvas.draw()
+            return
+        
         slice_img = self._get_slice_data()
         if slice_img is not None:
             h, w = slice_img.shape
@@ -680,6 +715,209 @@ class SliceViewer(QWidget):
                 self.set_slice(self.current_slice - 1)
             elif event.button == 'down':
                 self.set_slice(self.current_slice + 1)
+    
+    def _update_3d_display(self):
+        """更新3D显示"""
+        # 清除当前轴
+        self.ax.clear()
+        
+        # 设置3D视图
+        if not hasattr(self.ax, 'get_proj'):
+            # 如果不是3D轴，创建一个新的
+            self.ax = self.figure.add_subplot(111, projection='3d')
+        
+        self.ax.set_facecolor('white')
+        
+        # 检查是否有图像数据
+        if self.image_data is None:
+            self.canvas.draw()
+            return
+        
+        # 检查是否有标签数据（血管分割结果）
+        if self.label_data is None:
+            self.canvas.draw()
+            return
+        
+        # 提取血管数据
+        portal_vein = (self.label_data == 1)
+        hepatic_vein = (self.label_data == 2)
+        
+        # 计算物理坐标
+        if self.image_spacing is not None:
+            spacing = self.image_spacing
+        else:
+            spacing = (1.0, 1.0, 1.0)
+        
+        # 绘制血管树
+        if np.any(portal_vein):
+            # 门静脉：蓝色
+            self._plot_vessel_tree(portal_vein, spacing, color='#0000FF', alpha=0.6, label='门静脉')
+        
+        if np.any(hepatic_vein):
+            # 肝静脉：红色
+            self._plot_vessel_tree(hepatic_vein, spacing, color='#FF0000', alpha=0.6, label='肝静脉')
+        
+        # 添加图例
+        self.ax.legend()
+        
+        # 设置坐标轴标签
+        self.ax.set_xlabel('X (mm)')
+        self.ax.set_ylabel('Y (mm)')
+        self.ax.set_zlabel('Z (mm)')
+        
+        # 设置标题
+        self.ax.set_title('3D血管树')
+        
+        # 调整视图
+        self.ax.view_init(elev=30, azim=45)
+        
+        # 绘制虚拟切割平面
+        self._plot_cutting_plane()
+        
+        # 优化渲染性能
+        self.ax.set_rasterized(True)  # 使用光栅化渲染
+        self.figure.set_dpi(80)  # 降低DPI以提高性能
+        
+        self.canvas.draw()
+    
+    def _plot_vessel_tree(self, vessel_mask, spacing, color, alpha, label):
+        """绘制血管树"""
+        # 提取血管坐标
+        coords = np.where(vessel_mask)
+        x = coords[0] * spacing[0]
+        y = coords[1] * spacing[1]
+        z = coords[2] * spacing[2]
+        
+        # 对点云进行降采样，减少绘制的点数量
+        total_points = len(x)
+        if total_points > 10000:
+            # 降采样到10000个点
+            step = total_points // 10000
+            x = x[::step]
+            y = y[::step]
+            z = z[::step]
+        elif total_points > 5000:
+            # 降采样到5000个点
+            step = total_points // 5000
+            x = x[::step]
+            y = y[::step]
+            z = z[::step]
+        
+        # 绘制点云
+        if len(x) > 0:
+            # 使用更高效的方式绘制
+            self.ax.scatter(x, y, z, c=color, alpha=alpha, s=1, label=label, marker='.', linewidths=0)
+    
+    def _plot_cutting_plane(self):
+        """绘制虚拟切割平面"""
+        if self.image_data is not None:
+            # 绘制所有切割平面
+            for plane in self.cutting_planes:
+                # 提取平面参数
+                center = plane['center']
+                normal = plane['normal']
+                size = plane['size']
+                color = plane['color']
+                alpha = plane['alpha']
+                
+                # 生成平面的四个顶点
+                # 计算平面上的两个正交向量
+                if abs(normal[0]) < 0.1:
+                    # 法线接近y-z平面，使用x轴作为第一个方向向量
+                    v1 = np.array([1, 0, 0])
+                else:
+                    # 否则使用y轴作为第一个方向向量
+                    v1 = np.array([0, 1, 0])
+                
+                # 计算第二个方向向量（垂直于法线和第一个方向向量）
+                v2 = np.cross(normal, v1)
+                v1 = np.cross(v2, normal)
+                
+                # 归一化方向向量
+                v1 = v1 / np.linalg.norm(v1)
+                v2 = v2 / np.linalg.norm(v2)
+                
+                # 生成四个顶点
+                half_size = size / 2
+                p1 = center - v1 * half_size - v2 * half_size
+                p2 = center + v1 * half_size - v2 * half_size
+                p3 = center + v1 * half_size + v2 * half_size
+                p4 = center - v1 * half_size + v2 * half_size
+                
+                # 创建多边形
+                vertices = [p1, p2, p3, p4]
+                poly = Poly3DCollection([vertices])
+                poly.set_color(color)
+                poly.set_alpha(alpha)
+                poly.set_edgecolor('black')
+                poly.set_linewidth(1)
+                
+                # 添加到轴
+                self.ax.add_collection3d(poly)
+        
+        # 如果没有切割平面，添加一个默认平面
+        if not self.cutting_planes and self.image_data is not None:
+            # 计算图像中心
+            center_x = self.image_data.shape[0] * (self.image_spacing[0] if self.image_spacing else 1) / 2
+            center_y = self.image_data.shape[1] * (self.image_spacing[1] if self.image_spacing else 1) / 2
+            center_z = self.image_data.shape[2] * (self.image_spacing[2] if self.image_spacing else 1) / 2
+            
+            # 创建默认平面
+            default_plane = {
+                'center': np.array([center_x, center_y, center_z]),
+                'normal': np.array([0, 0, 1]),  # 垂直于z轴
+                'size': 100,
+                'color': 'cyan',
+                'alpha': 0.3
+            }
+            self.cutting_planes.append(default_plane)
+            
+            # 重新绘制
+            self._update_3d_display()
+    
+    def add_cutting_plane(self, center=None, normal=None, size=100, color='cyan', alpha=0.3):
+        """
+        添加一个新的切割平面
+        
+        Args:
+            center: 平面中心坐标，如果为None则使用图像中心
+            normal: 平面法线向量，如果为None则使用默认法线
+            size: 平面大小
+            color: 平面颜色
+            alpha: 平面透明度
+        """
+        if self.image_data is not None:
+            # 计算图像中心
+            if center is None:
+                center_x = self.image_data.shape[0] * (self.image_spacing[0] if self.image_spacing else 1) / 2
+                center_y = self.image_data.shape[1] * (self.image_spacing[1] if self.image_spacing else 1) / 2
+                center_z = self.image_data.shape[2] * (self.image_spacing[2] if self.image_spacing else 1) / 2
+                center = np.array([center_x, center_y, center_z])
+            
+            # 使用默认法线
+            if normal is None:
+                normal = np.array([0, 0, 1])  # 垂直于z轴
+            
+            # 归一化法线
+            normal = normal / np.linalg.norm(normal)
+            
+            # 创建新平面
+            new_plane = {
+                'center': center,
+                'normal': normal,
+                'size': size,
+                'color': color,
+                'alpha': alpha
+            }
+            
+            # 添加到切割平面列表
+            self.cutting_planes.append(new_plane)
+            
+            # 更新显示
+            self._update_3d_display()
+            
+            return True
+        return False
     
     def _on_mouse_press(self, event):
         """鼠标按下事件"""

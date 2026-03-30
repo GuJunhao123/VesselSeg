@@ -3,20 +3,21 @@
 # 安装前请确保已安装Python 3.11
 
 # 核心依赖库（必须安装）
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple numpy==2.3.5
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple PyQt5==5.15.11
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple nibabel==5.4.2
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple onnxruntime==1.24.4
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple torch
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple monai
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple scikit-image==0.25.2
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pandas==2.3.3
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple scipy==1.16.3
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple matplotlib==3.10.6
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple nilearn
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple simpleitk==2.5.3
+numpy==2.3.5
+PyQt5==5.15.11
+nibabel==5.4.2
+onnxruntime==1.24.4
+torch
+monai
+scikit-image==0.25.2
+pandas==2.3.3
+scipy==1.16.3
+matplotlib==3.10.6
+nilearn
+simpleitk==2.5.3
+reportlab==4.4.10
 
 # 其他依赖库（根据需要安装）
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple jupyterlab==4.4.7
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple notebook==7.4.5
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple spyder==6.1.0
+jupyterlab==4.4.7
+notebook==7.4.5
+spyder==6.1.0
