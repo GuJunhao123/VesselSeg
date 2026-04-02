@@ -201,6 +201,9 @@ class SliceViewer(QWidget):
         """
         if len(color) == 3:
             color = (*color, self.label_opacity)
+        else:
+            # 保留RGB值，使用当前透明度
+            color = (color[0], color[1], color[2], self.label_opacity)
         self.label_colors[label_value] = color
         self._update_display()
     
@@ -266,6 +269,15 @@ class SliceViewer(QWidget):
     def set_label_opacity(self, opacity: float):
         """设置标签透明度"""
         self.label_opacity = max(0.0, min(1.0, opacity))
+        # 更新所有已设置的标签颜色的透明度
+        for label_value in self.label_colors:
+            color = self.label_colors[label_value]
+            if len(color) == 4:
+                # 保留RGB值，更新透明度
+                self.label_colors[label_value] = (color[0], color[1], color[2], self.label_opacity)
+            else:
+                # 添加透明度
+                self.label_colors[label_value] = (*color, self.label_opacity)
         self._update_display()
     
     def set_window(self, window_width: float, window_level: float):
@@ -478,15 +490,15 @@ class SliceViewer(QWidget):
                         if label_value in self.label_colors:
                             color = self.label_colors[label_value]
                         else:
-                            # 默认红色，50%透明度
-                            color = (1.0, 0.0, 0.0, 0.5)  # 默认50%透明度
+                            # 默认红色，使用当前透明度
+                            color = (1.0, 0.0, 0.0, self.label_opacity)  # 使用当前透明度
                         
                         mask = (slice_label == label_value)
                         label_colored[mask, 0] = color[0]
                         label_colored[mask, 1] = color[1]
                         label_colored[mask, 2] = color[2]
-                        # 使用标签的透明度设置（50%默认）
-                        label_colored[mask, 3] = color[3] if len(color) > 3 else self.label_opacity
+                        # 总是使用当前的标签透明度设置
+                        label_colored[mask, 3] = self.label_opacity
                 
                 # 标签叠加也使用相同的extent和aspect
                 if self.image_spacing is not None:

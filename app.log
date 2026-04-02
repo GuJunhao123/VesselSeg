@@ -1,0 +1,4 @@
+/opt/miniconda3/envs/VesselSeg/lib/python3.11/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+DatabaseManager initialized successfully.
+AI模型预加载成功

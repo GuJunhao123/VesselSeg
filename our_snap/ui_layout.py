@@ -17,7 +17,8 @@ from PyQt5.QtWidgets import (
     QGroupBox, QColorDialog, QComboBox, QProgressDialog,
     QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QLineEdit,
     QSizePolicy, QDialog, QFormLayout, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QInputDialog, QTextEdit, QSplitter
+    QAbstractItemView, QInputDialog, QTextEdit, QSplitter, QScrollArea,
+    QFrame
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QFont
@@ -34,6 +35,7 @@ from excel_reader import ExcelDataReader
 # === [新增] 引入数据库管理模块 ===
 try:
     from database import DatabaseManager
+
     DB_AVAILABLE = True
 except ImportError:
     print("Warning: database.py not found. Archiving features will be disabled.")
@@ -44,19 +46,19 @@ class SegmentationWorker(QThread):
     """分割算法工作线程 - 避免界面冻结"""
     finished = pyqtSignal(np.ndarray)
     error = pyqtSignal(str)
-    
+
     def __init__(self, algorithm, image_data, seed_points, params):
         super().__init__()
         self.algorithm = algorithm
         self.image_data = image_data
         self.seed_points = seed_points
         self.params = params
-    
+
     def run(self):
         try:
             self.algorithm.set_image(self.image_data)
             self.algorithm.set_seed_points(self.seed_points)
-            
+
             if self.params['method'] == 'region_competition':
                 mask = self.algorithm.region_competition(
                     iterations=self.params['iterations'],
@@ -69,7 +71,7 @@ class SegmentationWorker(QThread):
                     smoothness=self.params['smoothness'],
                     edge_weight=self.params['edge_weight']
                 )
-            
+
             self.finished.emit(mask)
         except Exception as e:
             self.error.emit(str(e))
@@ -97,7 +99,7 @@ class PatientIndexWorker(QThread):
 
 class CaseHistoryDialog(QDialog):
     """[新增] 病例历史记录搜索弹窗"""
-    case_selected = pyqtSignal(str, str) # signal(original_path, mask_path)
+    case_selected = pyqtSignal(str, str)  # signal(original_path, mask_path)
 
     def __init__(self, db_manager, parent=None):
         super().__init__(parent)
@@ -108,7 +110,7 @@ class CaseHistoryDialog(QDialog):
 
     def _init_ui(self):
         layout = QVBoxLayout()
-        
+
         # 搜索区
         search_layout = QHBoxLayout()
         search_layout.addWidget(QLabel("搜索 (姓名/编号):"))
@@ -116,7 +118,7 @@ class CaseHistoryDialog(QDialog):
         self.search_input.setPlaceholderText("输入关键词回车搜索...")
         self.search_input.returnPressed.connect(self._on_search)
         search_layout.addWidget(self.search_input)
-        
+
         btn_search = QPushButton("搜索")
         btn_search.clicked.connect(self._on_search)
         search_layout.addWidget(btn_search)
@@ -129,7 +131,7 @@ class CaseHistoryDialog(QDialog):
 
         # 提示
         layout.addWidget(QLabel("提示: 双击列表项以加载历史病例"))
-        
+
         self.setLayout(layout)
         # 初始加载所有记录
         self._on_search()
@@ -137,7 +139,7 @@ class CaseHistoryDialog(QDialog):
     def _on_search(self):
         keyword = self.search_input.text().strip()
         self.list_widget.clear()
-        
+
         try:
             # 调用 database.py 中的搜索方法
             if hasattr(self.db, 'get_patient_history'):
@@ -146,7 +148,8 @@ class CaseHistoryDialog(QDialog):
                 # 兼容旧版 database.py 的 get_all_records
                 records = self.db.get_all_records()
                 if keyword:
-                    records = [r for r in records if keyword in str(r.get('patient_name', '')) or keyword in str(r.get('patient_code', ''))]
+                    records = [r for r in records if
+                               keyword in str(r.get('patient_name', '')) or keyword in str(r.get('patient_code', ''))]
 
             if not records:
                 self.list_widget.addItem("未找到相关记录")
@@ -158,7 +161,7 @@ class CaseHistoryDialog(QDialog):
                 p_code = row.get('patient_code') or "N/A"
                 c_date = row.get('created_at')
                 note = row.get('diagnosis_note') or ""
-                
+
                 if isinstance(c_date, str):
                     date_str = c_date
                 elif c_date:
@@ -167,20 +170,20 @@ class CaseHistoryDialog(QDialog):
                     date_str = "未知时间"
 
                 display_text = f"[{date_str}] {p_name} ({p_code}) - {note}"
-                
+
                 item = QListWidgetItem(display_text)
                 # 存储路径数据
                 item.setData(Qt.UserRole, row.get('original_path'))
                 item.setData(Qt.UserRole + 1, row.get('mask_path'))
                 self.list_widget.addItem(item)
-                
+
         except Exception as e:
             self.list_widget.addItem(f"查询出错: {e}")
 
     def _on_item_double_clicked(self, item):
         orig_path = item.data(Qt.UserRole)
         mask_path = item.data(Qt.UserRole + 1)
-        
+
         if orig_path and os.path.exists(orig_path):
             self.case_selected.emit(orig_path, mask_path)
             self.accept()
@@ -190,7 +193,7 @@ class CaseHistoryDialog(QDialog):
 
 class DatabaseDialog(QDialog):
     """数据库对话框 - 用于浏览和选择DICOM序列"""
-    
+
     def __init__(self, db_root: str, parent=None):
         super().__init__(parent)
         self.db_root = db_root
@@ -199,19 +202,19 @@ class DatabaseDialog(QDialog):
         self.setMinimumSize(800, 600)
         self._init_ui()
         self._load_patient_dirs()
-    
+
     def _init_ui(self):
         """初始化UI"""
         layout = QVBoxLayout()
-        
+
         # 顶部信息
         info_label = QLabel(f"数据库路径: {self.db_root}")
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
-        
+
         # 创建分割器
         splitter = QSplitter(Qt.Horizontal)
-        
+
         # 左侧：病人列表
         left_panel = QWidget()
         left_layout = QVBoxLayout()
@@ -221,7 +224,7 @@ class DatabaseDialog(QDialog):
         left_layout.addWidget(self.patient_list)
         left_panel.setLayout(left_layout)
         splitter.addWidget(left_panel)
-        
+
         # 右侧：序列列表
         right_panel = QWidget()
         right_layout = QVBoxLayout()
@@ -231,25 +234,25 @@ class DatabaseDialog(QDialog):
         right_layout.addWidget(self.series_list)
         right_panel.setLayout(right_layout)
         splitter.addWidget(right_panel)
-        
+
         # 设置分割器比例
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter)
-        
+
         # 底部按钮
         button_layout = QHBoxLayout()
         btn_load = QPushButton("加载选中序列")
         btn_load.clicked.connect(self._on_load_clicked)
         button_layout.addWidget(btn_load)
-        
+
         btn_cancel = QPushButton("取消")
         btn_cancel.clicked.connect(self.reject)
         button_layout.addWidget(btn_cancel)
-        
+
         layout.addLayout(button_layout)
         self.setLayout(layout)
-    
+
     def _load_patient_dirs(self):
         """加载病人目录列表"""
         self.patient_list.clear()
@@ -262,12 +265,12 @@ class DatabaseDialog(QDialog):
                 self.patient_list.addItem(item)
         except Exception as e:
             QMessageBox.warning(self, "错误", f"加载病人列表失败:\n{e}")
-    
+
     def _on_patient_selected(self, item):
         """病人选择改变"""
         patient_dir = item.data(Qt.UserRole)
         self._load_series_list(patient_dir)
-    
+
     def _load_series_list(self, patient_dir: str):
         """加载序列列表"""
         self.series_list.clear()
@@ -276,42 +279,42 @@ class DatabaseDialog(QDialog):
             progress = QProgressDialog("正在扫描序列...", "取消", 0, 0, self)
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
-            
+
             # 创建工作线程扫描序列
             worker = PatientIndexWorker(patient_dir)
             worker.finished.connect(self._on_series_scan_finished)
             worker.error.connect(self._on_series_scan_error)
-            
+
             # 保存进度对话框引用
             self._scan_progress = progress
-            
+
             worker.start()
-            
+
         except Exception as e:
             QMessageBox.warning(self, "错误", f"加载序列列表失败:\n{e}")
-    
+
     def _on_series_scan_finished(self, entries):
         """序列扫描完成"""
         if hasattr(self, '_scan_progress'):
             self._scan_progress.close()
-        
+
         for entry in entries:
             item = QListWidgetItem(entry.display_name)
             item.setData(Qt.UserRole, entry)
             item.setToolTip(entry.tooltip_text)
             self.series_list.addItem(item)
-    
+
     def _on_series_scan_error(self, error_msg):
         """序列扫描错误"""
         if hasattr(self, '_scan_progress'):
             self._scan_progress.close()
         QMessageBox.warning(self, "错误", f"序列扫描失败:\n{error_msg}")
-    
+
     def _on_series_double_clicked(self, item):
         """双击序列项"""
         self.selected_entry = item.data(Qt.UserRole)
         self.accept()
-    
+
     def _on_load_clicked(self):
         """加载按钮点击"""
         current_item = self.series_list.currentItem()
@@ -320,7 +323,7 @@ class DatabaseDialog(QDialog):
             self.accept()
         else:
             QMessageBox.warning(self, "提示", "请先选择一个序列")
-    
+
     def get_selected_entry(self):
         """获取选中的序列条目"""
         return self.selected_entry
@@ -328,20 +331,20 @@ class DatabaseDialog(QDialog):
 
 class MainWindow(QMainWindow):
     """主窗口"""
-    
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("医学影像分割软件")
         self.setGeometry(100, 100, 1600, 1000)
-        
+
         # 初始化模块
         self.image_io = ImageIO()
         self.segmentation = ActiveContourSegmentation()
         self.ai_interface = None  # 延迟初始化，加快启动速度
-        
+
         # 后台预加载AI模型
         self._preload_ai_model()
-        
+
         # === [新增] 初始化数据库管理器 ===
         self.db = None
         if DB_AVAILABLE:
@@ -351,7 +354,7 @@ class MainWindow(QMainWindow):
                 print("DatabaseManager initialized successfully.")
             except Exception as e:
                 print(f"Failed to initialize DatabaseManager: {e}")
-        
+
         # 初始化数据服务
         self.data_service = CaseDataService()
 
@@ -375,201 +378,216 @@ class MainWindow(QMainWindow):
         self.undo_history = []  # 撤销历史栈
         self.redo_history = []  # 重做历史栈
         self.max_history_size = 50  # 最大历史记录数
-        
+
         # UI初始化
         self._init_ui()
-    
+
     def _init_ui(self):
         """初始化UI布局"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         main_layout = QHBoxLayout()
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
         central_widget.setLayout(main_layout)
-        
-        # ========== 左侧：工具栏区（4个模块） ==========
+
+        # ========== 左侧：工具栏区（使用滚动区域） ==========
         left_panel = self._create_left_panel()
-        main_layout.addWidget(left_panel, stretch=0)
-        
+        main_layout.addWidget(left_panel, stretch=1)
+
         # ========== 中间：2×2视图区 ==========
         center_panel = self._create_center_panel()
         main_layout.addWidget(center_panel, stretch=4)
-        
-        # ========== 右侧：参数设置区 ==========
+
+        # ========== 右侧：参数设置区（使用滚动区域） ==========
         right_panel = self._create_right_panel()
         main_layout.addWidget(right_panel, stretch=1)
-    
+
     def _create_left_panel(self) -> QWidget:
-        """创建左侧工具栏（4个模块）"""
-        panel = QWidget()
-        # 左侧面板加宽一些，给数据库树和按钮留出可见空间
-        panel.setMinimumWidth(400)
-        panel.setMaximumWidth(500)
-        layout = QVBoxLayout()
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(5)
-        panel.setLayout(layout)
-        
+        """创建左侧工具栏（带滚动区域，解决内容过多问题）"""
+        # 创建一个容器widget
+        container = QWidget()
+        container.setMinimumWidth(280)
+        container.setMaximumWidth(350)
+
+        # 主布局
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # 创建滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # 滚动区域的内容widget
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(5, 5, 5, 5)
+        content_layout.setSpacing(8)
+
         # ===== 1. Main Toolbar =====
         main_toolbar_group = QGroupBox("Main Toolbar")
         main_toolbar_layout = QVBoxLayout()
-        main_toolbar_layout.setSpacing(3)
-        
-        # 左侧面板宽度设置，保持灵活性
-        panel.setMinimumWidth(300)
-        panel.setMaximumWidth(400)
-        
-        # 工具按钮组
-        tools_layout = QHBoxLayout()
-        tools_layout.setSpacing(2)
-        
+        main_toolbar_layout.setSpacing(5)
+
+        # 工具按钮组 - 使用网格布局避免重叠
+        from PyQt5.QtWidgets import QGridLayout
+        tools_grid = QGridLayout()
+        tools_grid.setSpacing(3)
+
         # Pointer（指针工具）
         self.btn_pointer = QPushButton("↖")
         self.btn_pointer.setToolTip("Pointer Tool")
         self.btn_pointer.setCheckable(True)
         self.btn_pointer.setChecked(True)
-        self.btn_pointer.setFixedSize(30, 30)
+        self.btn_pointer.setFixedSize(35, 35)
         self.btn_pointer.clicked.connect(lambda: self._on_tool_selected('pointer'))
-        tools_layout.addWidget(self.btn_pointer)
-        
+        tools_grid.addWidget(self.btn_pointer, 0, 0)
+
         # Zoom（缩放工具）
         self.btn_zoom = QPushButton("🔍")
         self.btn_zoom.setToolTip("Zoom Tool")
         self.btn_zoom.setCheckable(True)
-        self.btn_zoom.setFixedSize(30, 30)
+        self.btn_zoom.setFixedSize(35, 35)
         self.btn_zoom.clicked.connect(lambda: self._on_tool_selected('zoom'))
-        tools_layout.addWidget(self.btn_zoom)
-        
+        tools_grid.addWidget(self.btn_zoom, 0, 1)
+
         # Pan（平移工具）
         self.btn_pan = QPushButton("✋")
         self.btn_pan.setToolTip("Pan Tool")
         self.btn_pan.setCheckable(True)
-        self.btn_pan.setFixedSize(30, 30)
+        self.btn_pan.setFixedSize(35, 35)
         self.btn_pan.clicked.connect(lambda: self._on_tool_selected('pan'))
-        tools_layout.addWidget(self.btn_pan)
-        
+        tools_grid.addWidget(self.btn_pan, 0, 2)
+
         # Brush（画笔工具）
         self.btn_brush = QPushButton("🖌")
         self.btn_brush.setToolTip("Brush Tool")
         self.btn_brush.setCheckable(True)
-        self.btn_brush.setFixedSize(30, 30)
+        self.btn_brush.setFixedSize(35, 35)
         self.btn_brush.clicked.connect(lambda: self._on_tool_selected('brush'))
-        tools_layout.addWidget(self.btn_brush)
-        
+        tools_grid.addWidget(self.btn_brush, 1, 0)
+
         # Eraser（橡皮擦工具）
         self.btn_eraser = QPushButton("🧹")
         self.btn_eraser.setToolTip("Eraser Tool")
         self.btn_eraser.setCheckable(True)
-        self.btn_eraser.setFixedSize(30, 30)
+        self.btn_eraser.setFixedSize(35, 35)
         self.btn_eraser.clicked.connect(lambda: self._on_tool_selected('eraser'))
-        tools_layout.addWidget(self.btn_eraser)
-        
+        tools_grid.addWidget(self.btn_eraser, 1, 1)
+
         # Save Screenshot（保存截图）
         self.btn_screenshot = QPushButton("📷")
         self.btn_screenshot.setToolTip("Save Screenshot")
-        self.btn_screenshot.setFixedSize(30, 30)
+        self.btn_screenshot.setFixedSize(35, 35)
         self.btn_screenshot.clicked.connect(self._on_save_screenshot)
-        tools_layout.addWidget(self.btn_screenshot)
-        
-        main_toolbar_layout.addLayout(tools_layout)
-        
+        tools_grid.addWidget(self.btn_screenshot, 1, 2)
+
+        main_toolbar_layout.addLayout(tools_grid)
+
+        # 撤销/重做按钮
+        undo_redo_layout = QHBoxLayout()
+        undo_redo_layout.setSpacing(5)
+        self.btn_undo = QPushButton("↶ Undo")
+        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
+        self.btn_undo.setFixedHeight(30)
+        self.btn_undo.clicked.connect(self._on_undo)
+        undo_redo_layout.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↷ Redo")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
+        self.btn_redo.setFixedHeight(30)
+        self.btn_redo.clicked.connect(self._on_redo)
+        undo_redo_layout.addWidget(self.btn_redo)
+        main_toolbar_layout.addLayout(undo_redo_layout)
+
         # 画笔大小设置
         brush_size_layout = QHBoxLayout()
-        brush_size_layout.addWidget(QLabel("Brush Size:"))
+        brush_size_layout.setSpacing(5)
+        brush_size_layout.addWidget(QLabel("画笔大小:"))
         self.brush_size_spin = QSpinBox()
         self.brush_size_spin.setMinimum(1)
         self.brush_size_spin.setMaximum(50)
         self.brush_size_spin.setValue(3)
         self.brush_size_spin.valueChanged.connect(self._on_brush_size_changed)
         brush_size_layout.addWidget(self.brush_size_spin)
+        brush_size_layout.addStretch()
         main_toolbar_layout.addLayout(brush_size_layout)
-        
-        # 撤销/重做按钮
-        undo_redo_layout = QHBoxLayout()
-        undo_redo_layout.setSpacing(2)
-        self.btn_undo = QPushButton("↶")
-        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
-        self.btn_undo.setFixedSize(30, 30)
-        self.btn_undo.clicked.connect(self._on_undo)
-        undo_redo_layout.addWidget(self.btn_undo)
-        
-        self.btn_redo = QPushButton("↷")
-        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
-        self.btn_redo.setFixedSize(30, 30)
-        self.btn_redo.clicked.connect(self._on_redo)
-        undo_redo_layout.addWidget(self.btn_redo)
-        main_toolbar_layout.addLayout(undo_redo_layout)
-        
+
         # 文件操作按钮
-        btn_load_image = QPushButton("Load Image")
+        btn_load_image = QPushButton("📂 加载影像")
+        btn_load_image.setFixedHeight(32)
         btn_load_image.clicked.connect(self._on_load_image)
         main_toolbar_layout.addWidget(btn_load_image)
 
-        # 新增：加载DICOM文件夹按钮（支持无后缀DICOM序列）
-        btn_load_dicom_folder = QPushButton("Load DICOM Folder")
+        btn_load_dicom_folder = QPushButton("📁 加载DICOM文件夹")
+        btn_load_dicom_folder.setFixedHeight(32)
         btn_load_dicom_folder.clicked.connect(self._on_load_dicom_folder)
         main_toolbar_layout.addWidget(btn_load_dicom_folder)
-        
-        btn_load_label = QPushButton("Load Label")
+
+        btn_load_label = QPushButton("🏷️ 加载标签")
+        btn_load_label.setFixedHeight(32)
         btn_load_label.clicked.connect(self._on_load_label)
         main_toolbar_layout.addWidget(btn_load_label)
-        
-        btn_save_label = QPushButton("Save Label")
+
+        btn_save_label = QPushButton("💾 保存标签")
+        btn_save_label.setFixedHeight(32)
         btn_save_label.clicked.connect(self._on_save_label)
         main_toolbar_layout.addWidget(btn_save_label)
-        
+
         main_toolbar_group.setLayout(main_toolbar_layout)
-        layout.addWidget(main_toolbar_group)
-        
+        content_layout.addWidget(main_toolbar_group)
+
         # 当前工具模式
         self.current_tool_mode = 'pointer'
-        # 种子点模式标志
         self.seed_mode_enabled = False
-        
+
         # ===== 2. Cursor Inspector =====
-        cursor_group = QGroupBox("Cursor Inspector")
+        cursor_group = QGroupBox("光标信息")
         cursor_layout = QVBoxLayout()
-        cursor_layout.setSpacing(3)
-        
+        cursor_layout.setSpacing(5)
+
         # Cursor position
-        self.cursor_pos_label = QLabel("Cursor position (x,y,z): --")
+        self.cursor_pos_label = QLabel("位置 (x,y,z): --")
+        self.cursor_pos_label.setWordWrap(True)
         cursor_layout.addWidget(self.cursor_pos_label)
-        
+
         # Intensity under cursor
-        self.cursor_intensity_label = QLabel("Intensity under cursor:")
-        self.cursor_layer_label = QLabel("  Layer: --")
-        self.cursor_intensity_value_label = QLabel("  Intensity: --")
+        self.cursor_intensity_label = QLabel("像素值:")
+        self.cursor_layer_label = QLabel("  图层: --")
+        self.cursor_intensity_value_label = QLabel("  强度: --")
         cursor_layout.addWidget(self.cursor_intensity_label)
         cursor_layout.addWidget(self.cursor_layer_label)
         cursor_layout.addWidget(self.cursor_intensity_value_label)
-        
+
         # Label under cursor
-        self.cursor_label_label = QLabel("Label under cursor:")
-        self.cursor_label_value_label = QLabel("  Label: --")
-        self.btn_clear_label = QPushButton("Clear Label")
-        self.btn_clear_label.setMaximumHeight(25)
+        self.cursor_label_label = QLabel("标签值:")
+        self.cursor_label_value_label = QLabel("  标签: --")
+        self.btn_clear_label = QPushButton("清除标签")
+        self.btn_clear_label.setFixedHeight(30)
         self.btn_clear_label.clicked.connect(self._on_clear_label)
         cursor_layout.addWidget(self.cursor_label_label)
         cursor_layout.addWidget(self.cursor_label_value_label)
         cursor_layout.addWidget(self.btn_clear_label)
-        
-        cursor_group.setLayout(cursor_layout)
-        layout.addWidget(cursor_group)
 
-        # ===== 2.5 Patient Info =====
-        patient_group = QGroupBox("Patient Info")
+        cursor_group.setLayout(cursor_layout)
+        content_layout.addWidget(cursor_group)
+
+        # ===== 3. Patient Info =====
+        patient_group = QGroupBox("病人信息")
         patient_layout = QVBoxLayout()
-        patient_layout.setSpacing(2)
+        patient_layout.setSpacing(3)
 
         self.pi_id_label = QLabel("ID: --")
-        self.pi_name_label = QLabel("Name: --")
-        self.pi_sex_label = QLabel("Sex: --")
-        self.pi_birth_label = QLabel("Birth: --")
-        self.pi_study_date_label = QLabel("Study Date: --")
-        self.pi_modality_label = QLabel("Modality: --")
-        self.pi_series_label = QLabel("Series: --")
+        self.pi_name_label = QLabel("姓名: --")
+        self.pi_sex_label = QLabel("性别: --")
+        self.pi_birth_label = QLabel("出生日期: --")
+        self.pi_study_date_label = QLabel("检查日期: --")
+        self.pi_modality_label = QLabel("模态: --")
+        self.pi_series_label = QLabel("序列: --")
 
         for w in [
             self.pi_id_label,
@@ -580,17 +598,17 @@ class MainWindow(QMainWindow):
             self.pi_modality_label,
             self.pi_series_label,
         ]:
-            w.setMinimumWidth(200)
+            w.setWordWrap(True)
             patient_layout.addWidget(w)
 
         patient_group.setLayout(patient_layout)
-        layout.addWidget(patient_group)
-        
-        # ===== 3. Segmentation Labels =====
-        labels_group = QGroupBox("Segmentation Labels")
+        content_layout.addWidget(patient_group)
+
+        # ===== 4. Segmentation Labels =====
+        labels_group = QGroupBox("分割标签")
         labels_layout = QVBoxLayout()
-        labels_layout.setSpacing(3)
-        
+        labels_layout.setSpacing(5)
+
         # Active label（活动标签）
         active_label_layout = QHBoxLayout()
         active_label_layout.setSpacing(5)
@@ -598,217 +616,236 @@ class MainWindow(QMainWindow):
         self.active_label_color_widget.setFixedSize(20, 20)
         self.active_label_color_widget.setStyleSheet("background-color: red; border: 1px solid black;")
         active_label_layout.addWidget(self.active_label_color_widget)
-        self.active_label_name_label = QLabel("Active label: Label 1")
+        self.active_label_name_label = QLabel("活动标签: Label 1")
         active_label_layout.addWidget(self.active_label_name_label)
         active_label_layout.addStretch()
         labels_layout.addLayout(active_label_layout)
-        
+
         # Paint over（绘制覆盖标签）
-        self.paint_over_label = QLabel("Paint over: Label 1")
+        self.paint_over_label = QLabel("绘制覆盖: Label 1")
         labels_layout.addWidget(self.paint_over_label)
-        
+
         # Overall label opacity（标签透明度滑块）
         opacity_layout = QHBoxLayout()
         opacity_layout.setSpacing(5)
-        opacity_layout.addWidget(QLabel("Overall label opacity:"))
+        opacity_layout.addWidget(QLabel("标签透明度:"))
         self.label_opacity_slider = QSlider(Qt.Horizontal)
         self.label_opacity_slider.setMinimum(0)
         self.label_opacity_slider.setMaximum(100)
         self.label_opacity_slider.setValue(50)
         self.label_opacity_slider.valueChanged.connect(self._on_label_opacity_changed)
         opacity_layout.addWidget(self.label_opacity_slider)
-        self.label_opacity_value_label = QLabel("50")
-        self.label_opacity_value_label.setMinimumWidth(30)
+        self.label_opacity_value_label = QLabel("50%")
+        self.label_opacity_value_label.setMinimumWidth(40)
         opacity_layout.addWidget(self.label_opacity_value_label)
         labels_layout.addLayout(opacity_layout)
-        
+
         # 标签列表
         self.label_list_widget = QListWidget()
         self.label_list_widget.setMaximumHeight(100)
         self.label_list_widget.itemSelectionChanged.connect(self._on_label_selection_changed)
         labels_layout.addWidget(self.label_list_widget)
-        
-        # 添加标签按钮
-        btn_add_label = QPushButton("Add Label")
+
+        # 标签操作按钮 - 水平布局
+        label_buttons_layout = QHBoxLayout()
+        label_buttons_layout.setSpacing(5)
+
+        btn_add_label = QPushButton("添加标签")
+        btn_add_label.setFixedHeight(30)
         btn_add_label.clicked.connect(self._on_add_label)
-        labels_layout.addWidget(btn_add_label)
-        
-        # 删除标签按钮
-        btn_delete_label = QPushButton("Delete Label")
+        label_buttons_layout.addWidget(btn_add_label)
+
+        btn_delete_label = QPushButton("删除标签")
+        btn_delete_label.setFixedHeight(30)
         btn_delete_label.clicked.connect(self._on_delete_label)
-        labels_layout.addWidget(btn_delete_label)
-        
-        # 标签颜色按钮
-        btn_label_color = QPushButton("Label Color")
+        label_buttons_layout.addWidget(btn_delete_label)
+
+        btn_label_color = QPushButton("标签颜色")
+        btn_label_color.setFixedHeight(30)
         btn_label_color.clicked.connect(self._on_label_color)
-        labels_layout.addWidget(btn_label_color)
-        
+        label_buttons_layout.addWidget(btn_label_color)
+
+        labels_layout.addLayout(label_buttons_layout)
+
         labels_group.setLayout(labels_layout)
-        layout.addWidget(labels_group)
-        
+        content_layout.addWidget(labels_group)
+
         # 初始化活动标签
         self.active_label_id = 1
-        
-        # ===== 4. 3D操作按钮 =====
+
+        # ===== 5. 3D操作按钮 =====
         toolbar_3d_group = QGroupBox("3D操作")
         toolbar_3d_layout = QVBoxLayout()
-        toolbar_3d_layout.setSpacing(3)
-        
+        toolbar_3d_layout.setSpacing(5)
+
         # Update（更新3D视图）
-        btn_update_3d = QPushButton("🔄 Update")
-        btn_update_3d.setToolTip("Update 3D View")
-        btn_update_3d.setFixedSize(120, 30)
+        btn_update_3d = QPushButton("🔄 更新3D视图")
+        btn_update_3d.setFixedHeight(32)
         btn_update_3d.clicked.connect(self._on_update_3d_view_clicked)
         toolbar_3d_layout.addWidget(btn_update_3d)
-        
-        # 种子点相关按钮
+
+        # 种子点相关按钮 - 水平布局
         seed_layout = QHBoxLayout()
-        self.btn_add_seed = QPushButton("Add Seed")
-        self.btn_add_seed.setFixedSize(120, 30)
+        seed_layout.setSpacing(5)
+        self.btn_add_seed = QPushButton("➕ 添加种子点")
+        self.btn_add_seed.setFixedHeight(32)
         self.btn_add_seed.setCheckable(True)
-        self.btn_add_seed.setToolTip("Click then add seeds by clicking in views")
         self.btn_add_seed.clicked.connect(self._on_toggle_seed_mode)
         seed_layout.addWidget(self.btn_add_seed)
-        
-        self.btn_clear_seeds = QPushButton("Clear Seeds")
-        self.btn_clear_seeds.setFixedSize(120, 30)
-        self.btn_clear_seeds.setToolTip("Clear all seed points")
+
+        self.btn_clear_seeds = QPushButton("🗑️ 清除种子点")
+        self.btn_clear_seeds.setFixedHeight(32)
         self.btn_clear_seeds.clicked.connect(self._on_clear_seeds)
         seed_layout.addWidget(self.btn_clear_seeds)
         toolbar_3d_layout.addLayout(seed_layout)
-        
+
         # 种子点数量显示
-        self.seed_count_label = QLabel("Seeds: 0")
-        self.seed_count_label.setToolTip("Current seed count")
+        self.seed_count_label = QLabel("种子点数量: 0")
         toolbar_3d_layout.addWidget(self.seed_count_label)
-        
-        # 标签统计按钮
-        btn_label_stats = QPushButton("标签统计")
-        btn_label_stats.setFixedSize(120, 30)
-        btn_label_stats.setToolTip("计算标签的统计信息")
+
+        # 分割相关按钮
+        btn_label_stats = QPushButton("📊 标签统计")
+        btn_label_stats.setFixedHeight(32)
         btn_label_stats.clicked.connect(self._on_label_statistics)
         toolbar_3d_layout.addWidget(btn_label_stats)
-        
-        # 分割相关按钮
-        btn_segment_3d = QPushButton("Segment 3D")
+
+        btn_segment_3d = QPushButton("✂️ 3D分割")
+        btn_segment_3d.setFixedHeight(32)
         btn_segment_3d.clicked.connect(self._on_segment_3d)
         toolbar_3d_layout.addWidget(btn_segment_3d)
-        
-        # AI自动分割按钮
-        btn_ai_seg = QPushButton("AI自动分割")
-        btn_ai_seg.setFixedSize(120, 30)
+
+        btn_ai_seg = QPushButton("🤖 AI自动分割")
+        btn_ai_seg.setFixedHeight(32)
         btn_ai_seg.clicked.connect(self._on_ai_segmentation)
         toolbar_3d_layout.addWidget(btn_ai_seg)
-        
+
         toolbar_3d_group.setLayout(toolbar_3d_layout)
-        layout.addWidget(toolbar_3d_group)
-        
-        # ===== 5. 量化分析 =====
+        content_layout.addWidget(toolbar_3d_group)
+
+        # ===== 6. 量化分析 =====
         quant_analysis_group = QGroupBox("量化分析")
         quant_analysis_layout = QVBoxLayout()
-        quant_analysis_layout.setSpacing(3)
-        
-        btn_quant_analysis = QPushButton("运行量化分析")
-        btn_quant_analysis.setFixedSize(150, 30)
-        btn_quant_analysis.setToolTip("基于门静脉供血区自动划分肝脏8个功能区段，计算各段体积")
+        quant_analysis_layout.setSpacing(5)
+
+        btn_quant_analysis = QPushButton("📈 运行量化分析")
+        btn_quant_analysis.setFixedHeight(32)
         btn_quant_analysis.clicked.connect(self._on_quantitative_analysis)
         quant_analysis_layout.addWidget(btn_quant_analysis)
-        
+
         quant_analysis_group.setLayout(quant_analysis_layout)
-        layout.addWidget(quant_analysis_group)
-        
-        # ===== 6. 3D可视化 =====
+        content_layout.addWidget(quant_analysis_group)
+
+        # ===== 7. 3D可视化 =====
         three_d_visualization_group = QGroupBox("3D可视化")
         three_d_visualization_layout = QVBoxLayout()
-        three_d_visualization_layout.setSpacing(3)
-        
-        btn_3d_visualization = QPushButton("显示3D血管树")
-        btn_3d_visualization.setFixedSize(150, 30)
-        btn_3d_visualization.setToolTip("显示红蓝双色区分的3D血管树")
+        three_d_visualization_layout.setSpacing(5)
+
+        btn_3d_visualization = QPushButton("🎨 显示3D血管树")
+        btn_3d_visualization.setFixedHeight(32)
         btn_3d_visualization.clicked.connect(self._on_3d_visualization)
         three_d_visualization_layout.addWidget(btn_3d_visualization)
-        
-        btn_cutting_plane = QPushButton("添加切割平面")
-        btn_cutting_plane.setFixedSize(150, 30)
-        btn_cutting_plane.setToolTip("手动放置虚拟切割平面")
+
+        btn_cutting_plane = QPushButton("✂️ 添加切割平面")
+        btn_cutting_plane.setFixedHeight(32)
         btn_cutting_plane.clicked.connect(self._on_add_cutting_plane)
         three_d_visualization_layout.addWidget(btn_cutting_plane)
-        
+
         three_d_visualization_group.setLayout(three_d_visualization_layout)
-        layout.addWidget(three_d_visualization_group)
-        
-        # ===== 7. 报告生成 =====
+        content_layout.addWidget(three_d_visualization_group)
+
+        # ===== 8. 报告生成 =====
         report_group = QGroupBox("报告生成")
         report_layout = QVBoxLayout()
-        report_layout.setSpacing(3)
-        
-        btn_generate_report = QPushButton("生成PDF报告")
-        btn_generate_report.setFixedSize(150, 30)
-        btn_generate_report.setToolTip("一键导出包含图文数据与风险评估的PDF手术规划报告")
+        report_layout.setSpacing(5)
+
+        btn_generate_report = QPushButton("📄 生成PDF报告")
+        btn_generate_report.setFixedHeight(32)
         btn_generate_report.clicked.connect(self._on_generate_report)
         report_layout.addWidget(btn_generate_report)
-        
-        report_group.setLayout(report_layout)
-        layout.addWidget(report_group)
 
-        # ===== 5. 数据库对接（522范式） - 现在以弹窗形式打开 =====
-        btn_open_db_dialog = QPushButton("打开数据库 (522)")
-        btn_open_db_dialog.setToolTip("打开数据库选择弹窗以浏览和加载序列")
+        report_group.setLayout(report_layout)
+        content_layout.addWidget(report_group)
+
+        # ===== 9. 数据库对接（522范式） =====
+        btn_open_db_dialog = QPushButton("🗄️ 打开数据库 (522)")
+        btn_open_db_dialog.setFixedHeight(32)
         btn_open_db_dialog.clicked.connect(self._on_open_db_dialog)
-        layout.addWidget(btn_open_db_dialog)
-        
-        # ===== 6. [新增] 病例归档/PACS系统 =====
-        archive_group = QGroupBox("病例归档 (日志文件)")
+        content_layout.addWidget(btn_open_db_dialog)
+
+        # ===== 10. 病例归档/PACS系统 =====
+        archive_group = QGroupBox("病例归档")
         archive_layout = QVBoxLayout()
-        
-        self.btn_save_case_db = QPushButton("保存病例到库")
-        self.btn_save_case_db.setToolTip("将当前影像及分割结果归档到日志文件")
+        archive_layout.setSpacing(5)
+
+        self.btn_save_case_db = QPushButton("💾 保存病例到库")
+        self.btn_save_case_db.setFixedHeight(32)
         self.btn_save_case_db.clicked.connect(self._on_save_case_to_db)
         archive_layout.addWidget(self.btn_save_case_db)
-        
-        self.btn_search_case_db = QPushButton("搜索历史病例")
-        self.btn_search_case_db.setToolTip("搜索日志文件中的历史分割记录并回溯")
+
+        self.btn_search_case_db = QPushButton("🔍 搜索历史病例")
+        self.btn_search_case_db.setFixedHeight(32)
         self.btn_search_case_db.clicked.connect(self._on_search_case_history)
         archive_layout.addWidget(self.btn_search_case_db)
-        
+
         archive_group.setLayout(archive_layout)
-        layout.addWidget(archive_group)
-        
-        layout.addStretch()
-        
-        return panel
-    
+        content_layout.addWidget(archive_group)
+
+        # 添加弹性空间，让内容可以滚动到底部
+        content_layout.addStretch()
+
+        # 设置滚动区域的内容
+        scroll_area.setWidget(content_widget)
+
+        # 将滚动区域添加到主布局
+        main_layout.addWidget(scroll_area)
+
+        return container
+
     def _create_center_panel(self) -> QWidget:
         """创建中间2×2视图区"""
         panel = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(2, 2, 2, 2)
         panel.setLayout(layout)
-        
+
         # 创建2×2视图组件
         self.four_view = FourViewWidget()
         self.four_view.crosshair_changed.connect(self._on_crosshair_changed)
         self.four_view.slice_changed.connect(self._on_slice_changed)
         layout.addWidget(self.four_view)
-        
+
         return panel
-    
+
     def _create_right_panel(self) -> QWidget:
         """创建右侧参数设置区（分割算法参数 + 窗宽窗位）"""
-        panel = QWidget()
-        panel.setMaximumWidth(220)
-        layout = QVBoxLayout()
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(5)
-        panel.setLayout(layout)
-        
+        container = QWidget()
+        container.setMaximumWidth(250)
+        container.setMinimumWidth(220)
+
+        # 主布局
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # 创建滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # 滚动区域的内容widget
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(5, 5, 5, 5)
+        content_layout.setSpacing(8)
+
         # 窗宽窗位参数组
         window_group = QGroupBox("窗宽窗位")
         window_layout = QVBoxLayout()
         window_layout.setSpacing(5)
-        
+
         # 窗宽
-        window_layout.addWidget(QLabel("窗宽 (Window Width):"))
+        window_layout.addWidget(QLabel("窗宽:"))
         self.window_width_spin = QDoubleSpinBox()
         self.window_width_spin.setMinimum(1.0)
         self.window_width_spin.setMaximum(4000.0)
@@ -816,9 +853,9 @@ class MainWindow(QMainWindow):
         self.window_width_spin.setSingleStep(10.0)
         self.window_width_spin.valueChanged.connect(self._on_window_width_changed)
         window_layout.addWidget(self.window_width_spin)
-        
+
         # 窗位
-        window_layout.addWidget(QLabel("窗位 (Window Level):"))
+        window_layout.addWidget(QLabel("窗位:"))
         self.window_level_spin = QDoubleSpinBox()
         self.window_level_spin.setMinimum(-2000.0)
         self.window_level_spin.setMaximum(2000.0)
@@ -826,31 +863,33 @@ class MainWindow(QMainWindow):
         self.window_level_spin.setSingleStep(10.0)
         self.window_level_spin.valueChanged.connect(self._on_window_level_changed)
         window_layout.addWidget(self.window_level_spin)
-        
+
         # 自动窗宽窗位按钮
-        btn_auto_window = QPushButton("自动窗宽窗位")
+        btn_auto_window = QPushButton("自动")
+        btn_auto_window.setFixedHeight(30)
         btn_auto_window.clicked.connect(self._on_auto_window)
         window_layout.addWidget(btn_auto_window)
-        
+
         # 默认窗宽窗位按钮
-        btn_default_window = QPushButton("默认窗宽窗位")
+        btn_default_window = QPushButton("默认")
+        btn_default_window.setFixedHeight(30)
         btn_default_window.clicked.connect(self._on_default_window)
         window_layout.addWidget(btn_default_window)
-        
+
         window_group.setLayout(window_layout)
-        layout.addWidget(window_group)
-        
+        content_layout.addWidget(window_group)
+
         # 分割算法参数组
         algo_group = QGroupBox("分割算法参数")
         algo_layout = QVBoxLayout()
         algo_layout.setSpacing(5)
-        
+
         # 算法选择
         algo_layout.addWidget(QLabel("算法类型:"))
         self.algo_combo = QComboBox()
         self.algo_combo.addItems(["Region Competition", "Edge-Based"])
         algo_layout.addWidget(self.algo_combo)
-        
+
         # 迭代次数
         algo_layout.addWidget(QLabel("迭代次数:"))
         self.iterations_spin = QSpinBox()
@@ -858,7 +897,7 @@ class MainWindow(QMainWindow):
         self.iterations_spin.setMaximum(1000)
         self.iterations_spin.setValue(100)
         algo_layout.addWidget(self.iterations_spin)
-        
+
         # 平滑度
         algo_layout.addWidget(QLabel("平滑度:"))
         self.smoothness_spin = QDoubleSpinBox()
@@ -867,7 +906,7 @@ class MainWindow(QMainWindow):
         self.smoothness_spin.setValue(1.0)
         self.smoothness_spin.setSingleStep(0.1)
         algo_layout.addWidget(self.smoothness_spin)
-        
+
         # 扩张力（仅Region Competition）
         algo_layout.addWidget(QLabel("扩张力:"))
         self.expansion_spin = QDoubleSpinBox()
@@ -876,16 +915,22 @@ class MainWindow(QMainWindow):
         self.expansion_spin.setValue(1.0)
         self.expansion_spin.setSingleStep(0.1)
         algo_layout.addWidget(self.expansion_spin)
-        
+
         algo_group.setLayout(algo_layout)
-        layout.addWidget(algo_group)
-        
-        layout.addStretch()
-        
-        return panel
-    
+        content_layout.addWidget(algo_group)
+
+        content_layout.addStretch()
+
+        # 设置滚动区域的内容
+        scroll_area.setWidget(content_widget)
+
+        # 将滚动区域添加到主布局
+        main_layout.addWidget(scroll_area)
+
+        return container
+
     # ========== 文件操作槽函数 ==========
-    
+
     def _on_save_screenshot(self):
         """保存截图"""
         try:
@@ -918,7 +963,7 @@ class MainWindow(QMainWindow):
                 # 限制重做栈大小
                 if len(self.redo_history) > self.max_history_size:
                     self.redo_history.pop(0)
-            
+
             # 从撤销栈恢复
             self.current_label_data = self.undo_history.pop()
             self.four_view.set_label_data(self.current_label_data)
@@ -932,7 +977,7 @@ class MainWindow(QMainWindow):
                 # 限制撤销栈大小
                 if len(self.undo_history) > self.max_history_size:
                     self.undo_history.pop(0)
-            
+
             # 从重做栈恢复
             self.current_label_data = self.redo_history.pop()
             self.four_view.set_label_data(self.current_label_data)
@@ -942,12 +987,12 @@ class MainWindow(QMainWindow):
         if self.current_image_data is None:
             QMessageBox.warning(self, "提示", "请先加载一张影像")
             return
-        
+
         filepath, _ = QFileDialog.getOpenFileName(
             self, "加载标签", "",
             "NIfTI文件 (*.nii *.nii.gz);;NRRD文件 (*.nrrd);;所有文件 (*.*)"
         )
-        
+
         if filepath:
             try:
                 label_data = self.image_io.load_label_map(filepath)
@@ -960,7 +1005,7 @@ class MainWindow(QMainWindow):
                             # 限制撤销栈大小
                             if len(self.undo_history) > self.max_history_size:
                                 self.undo_history.pop(0)
-                        
+
                         # 更新标签数据
                         self.current_label_data = label_data
                         self.four_view.set_label_data(label_data)
@@ -968,7 +1013,8 @@ class MainWindow(QMainWindow):
                         self.redo_history.clear()
                         QMessageBox.information(self, "成功", "标签加载成功")
                     else:
-                        QMessageBox.warning(self, "错误", f"标签尺寸与影像不匹配\n影像尺寸: {self.current_image_data.shape}\n标签尺寸: {label_data.shape}")
+                        QMessageBox.warning(self, "错误",
+                                            f"标签尺寸与影像不匹配\n影像尺寸: {self.current_image_data.shape}\n标签尺寸: {label_data.shape}")
                 else:
                     QMessageBox.warning(self, "错误", "标签加载失败")
             except Exception as e:
@@ -979,12 +1025,12 @@ class MainWindow(QMainWindow):
         if self.current_label_data is None:
             QMessageBox.warning(self, "提示", "没有标签数据可保存")
             return
-        
+
         filepath, _ = QFileDialog.getSaveFileName(
             self, "保存标签", "",
             "NIfTI文件 (*.nii.gz);;NRRD文件 (*.nrrd);;所有文件 (*.*)"
         )
-        
+
         if filepath:
             try:
                 self.image_io.save_label_map(self.current_label_data, filepath, self.current_metadata)
@@ -1000,7 +1046,7 @@ class MainWindow(QMainWindow):
             # 限制撤销栈大小
             if len(self.undo_history) > self.max_history_size:
                 self.undo_history.pop(0)
-            
+
             # 清空标签
             self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
@@ -1011,8 +1057,8 @@ class MainWindow(QMainWindow):
     def _on_label_opacity_changed(self, value):
         """标签透明度改变"""
         opacity = value / 100.0
-        self.label_opacity_value_label.setText(str(value))
-        
+        self.label_opacity_value_label.setText(f"{value}%")
+
         # 更新所有视图的标签透明度
         if hasattr(self.four_view, 'axial_view'):
             try:
@@ -1049,7 +1095,7 @@ class MainWindow(QMainWindow):
         if self.current_image_data is None:
             QMessageBox.warning(self, "提示", "请先加载一张影像")
             return
-        
+
         try:
             # 计算图像的统计信息
             img_data = self.current_image_data
@@ -1057,22 +1103,23 @@ class MainWindow(QMainWindow):
             max_val = np.max(img_data)
             mean_val = np.mean(img_data)
             std_val = np.std(img_data)
-            
+
             # 自动计算窗宽窗位
             window_width = std_val * 4  # 4倍标准差
             window_level = mean_val
-            
+
             # 更新界面
             self.window_width_spin.setValue(window_width)
             self.window_level_spin.setValue(window_level)
-            
+
             # 应用到视图
             if hasattr(self.four_view, 'axial_view'):
                 self.four_view.axial_view.set_window(window_width, window_level)
                 self.four_view.coronal_view.set_window(window_width, window_level)
                 self.four_view.sagittal_view.set_window(window_width, window_level)
-            
-            QMessageBox.information(self, "成功", f"自动窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
+
+            QMessageBox.information(self, "成功",
+                                    f"自动窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"自动计算窗宽窗位时发生错误:\n{e}")
 
@@ -1081,23 +1128,24 @@ class MainWindow(QMainWindow):
         if self.current_image_data is None:
             QMessageBox.warning(self, "提示", "请先加载一张影像")
             return
-        
+
         try:
             # 设置默认窗宽窗位
             window_width = 400.0  # 默认窗宽
-            window_level = 0.0    # 默认窗位
-            
+            window_level = 0.0  # 默认窗位
+
             # 更新界面
             self.window_width_spin.setValue(window_width)
             self.window_level_spin.setValue(window_level)
-            
+
             # 应用到视图
             if hasattr(self.four_view, 'axial_view'):
                 self.four_view.axial_view.set_window(window_width, window_level)
                 self.four_view.coronal_view.set_window(window_width, window_level)
                 self.four_view.sagittal_view.set_window(window_width, window_level)
-            
-            QMessageBox.information(self, "成功", f"默认窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
+
+            QMessageBox.information(self, "成功",
+                                    f"默认窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"设置默认窗宽窗位时发生错误:\n{e}")
 
@@ -1106,22 +1154,22 @@ class MainWindow(QMainWindow):
         if self.current_label_data is None:
             QMessageBox.warning(self, "提示", "请先加载或创建标签")
             return
-        
+
         try:
             # 计算所有标签的统计信息
             unique_labels = np.unique(self.current_label_data)
             unique_labels = unique_labels[unique_labels > 0]  # 排除背景(0)
-            
+
             if len(unique_labels) == 0:
                 QMessageBox.information(self, "提示", "当前没有标签数据")
                 return
-            
+
             stats_text = "标签统计信息:\n\n"
-            
+
             for label_id in unique_labels:
                 label_mask = (self.current_label_data == label_id)
                 voxel_count = np.sum(label_mask)
-                
+
                 # 计算物理体积
                 if self.current_metadata and 'spacing' in self.current_metadata:
                     spacing = self.current_metadata['spacing']
@@ -1131,13 +1179,13 @@ class MainWindow(QMainWindow):
                     volume_text = f"{volume_cm3:.2f} cm³ ({volume_mm3:.2f} mm³)"
                 else:
                     volume_text = f"{voxel_count} 体素"
-                
+
                 # 计算表面积（近似）
                 from scipy import ndimage
                 # 使用形态学梯度计算表面积
                 edges = ndimage.binary_dilation(label_mask) ^ label_mask
                 surface_pixels = np.sum(edges)
-                
+
                 if self.current_metadata and 'spacing' in self.current_metadata:
                     spacing = self.current_metadata['spacing']
                     pixel_area = spacing[0] * spacing[1]  # mm²
@@ -1146,12 +1194,12 @@ class MainWindow(QMainWindow):
                     area_text = f"{surface_area_cm2:.2f} cm² ({surface_area_mm2:.2f} mm²)"
                 else:
                     area_text = f"{surface_pixels} 像素"
-                
+
                 stats_text += f"标签 {label_id}:\n"
                 stats_text += f"  体积: {volume_text}\n"
                 stats_text += f"  表面积: {area_text}\n"
                 stats_text += f"  体素数: {voxel_count}\n\n"
-            
+
             QMessageBox.information(self, "标签统计", stats_text)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"计算标签统计时发生错误:\n{e}")
@@ -1163,8 +1211,8 @@ class MainWindow(QMainWindow):
             item = selected_items[0]
             label_id = int(item.data(Qt.UserRole))
             self.active_label_id = label_id
-            self.active_label_name_label.setText(f"Active label: Label {label_id}")
-            self.paint_over_label.setText(f"Paint over: Label {label_id}")
+            self.active_label_name_label.setText(f"活动标签: Label {label_id}")
+            self.paint_over_label.setText(f"绘制覆盖: Label {label_id}")
             # 更新视图中的活动标签
             if hasattr(self.four_view, 'axial_view'):
                 self.four_view.axial_view.set_active_label_id(label_id)
@@ -1185,8 +1233,8 @@ class MainWindow(QMainWindow):
         self.label_list_widget.setCurrentItem(item)
         # 更新活动标签
         self.active_label_id = new_label_id
-        self.active_label_name_label.setText(f"Active label: Label {new_label_id}")
-        self.paint_over_label.setText(f"Paint over: Label {new_label_id}")
+        self.active_label_name_label.setText(f"活动标签: Label {new_label_id}")
+        self.paint_over_label.setText(f"绘制覆盖: Label {new_label_id}")
         # 更新视图中的活动标签
         if hasattr(self.four_view, 'axial_view'):
             self.four_view.axial_view.set_active_label_id(new_label_id)
@@ -1209,8 +1257,8 @@ class MainWindow(QMainWindow):
                 if self.label_list:
                     new_label_id = self.label_list[0]
                     self.active_label_id = new_label_id
-                    self.active_label_name_label.setText(f"Active label: Label {new_label_id}")
-                    self.paint_over_label.setText(f"Paint over: Label {new_label_id}")
+                    self.active_label_name_label.setText(f"活动标签: Label {new_label_id}")
+                    self.paint_over_label.setText(f"绘制覆盖: Label {new_label_id}")
                     # 更新视图中的活动标签
                     if hasattr(self.four_view, 'axial_view'):
                         self.four_view.axial_view.set_active_label_id(new_label_id)
@@ -1219,8 +1267,8 @@ class MainWindow(QMainWindow):
                 else:
                     # 如果没有标签了，设置为默认值
                     self.active_label_id = 1
-                    self.active_label_name_label.setText("Active label: Label 1")
-                    self.paint_over_label.setText("Paint over: Label 1")
+                    self.active_label_name_label.setText("活动标签: Label 1")
+                    self.paint_over_label.setText("绘制覆盖: Label 1")
 
     def _on_label_color(self):
         """标签颜色选择"""
@@ -1240,18 +1288,24 @@ class MainWindow(QMainWindow):
         if self.current_image_data is None:
             QMessageBox.warning(self, "提示", "请先加载一张影像")
             return
-        
+
         # 检查是否有3D视图组件
-        if hasattr(self, 'three_d_view') and self.three_d_view:
+        if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
             # 更新3D视图
             try:
-                self.three_d_view.update_view(self.current_image_data, self.current_label_data)
+                # 传递spacing信息给3D视图
+                spacing = getattr(self, 'current_image_spacing', None)
+                self.four_view.view_3d.set_image_data(self.current_image_data, spacing)
+                self.four_view.view_3d.set_label_data(self.current_label_data)
+                # 刷新3D视图
+                self.four_view.view_3d.refresh_view()
                 QMessageBox.information(self, "成功", "3D视图已更新")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"更新3D视图时发生错误:\n{e}")
         else:
             # 提示用户3D视图功能需要额外配置
-            QMessageBox.information(self, "提示", "3D视图功能已触发\n\n注意：完整的3D视图功能需要额外的可视化库支持（如VTK或Mayavi）。\n当前版本仅提供基本触发功能。")
+            QMessageBox.information(self, "提示",
+                                    "3D视图功能已触发\n\n注意：完整的3D视图功能需要额外的可视化库支持（如VTK或Mayavi）。\n当前版本仅提供基本触发功能。")
             # 实际项目中，这里应该初始化3D视图组件并调用其更新方法
 
     def _on_toggle_seed_mode(self):
@@ -1278,7 +1332,7 @@ class MainWindow(QMainWindow):
 
         # 显示状态栏提示
         self.statusBar().showMessage("正在初始化AI分割...")
-        
+
         # 确保AI接口已初始化
         if not self.ai_interface:
             self.statusBar().showMessage("正在加载AI模型，请稍候...")
@@ -1290,12 +1344,12 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("AI分割初始化失败")
                 QMessageBox.critical(self, "错误", f"AI分割初始化失败:\n{e}")
                 return
-        
+
         # 重新加载模型（使用新选择的参数）
         try:
             self.statusBar().showMessage("正在加载AI模型，请稍候...")
             model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
-            
+
             # 加载模型
             if not self.ai_interface.load_model(model_path):
                 self.statusBar().showMessage("AI分割失败")
@@ -1312,7 +1366,7 @@ class MainWindow(QMainWindow):
             # 清除现有标签
             self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
-            
+
             # 执行分割
             mask = self.ai_interface.segment(self.current_image_data)
 
@@ -1332,24 +1386,25 @@ class MainWindow(QMainWindow):
 
     def _show_ai_segmentation_dialog(self):
         """显示AI分割参数选择对话框"""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QHBoxLayout, QGroupBox, QFormLayout
-        
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QHBoxLayout, QGroupBox, \
+            QFormLayout
+
         dialog = QDialog(self)
         dialog.setWindowTitle("AI分割参数设置")
         dialog.setMinimumSize(400, 250)
-        
+
         layout = QVBoxLayout()
-        
+
         # 模型参数组
         model_group = QGroupBox("模型参数")
         model_layout = QFormLayout()
-        
+
         # 模型变体选择
         model_variant_combo = QComboBox()
         model_variant_combo.addItems(['mobileuvit_l (大型模型 - 高精度)', 'mobileuvit (小型模型 - 高速度)'])
         model_variant_combo.setCurrentIndex(0)
         model_layout.addRow("模型变体:", model_variant_combo)
-        
+
         # 血管分解方法选择
         decomposition_combo = QComboBox()
         decomposition_combo.addItems([
@@ -1365,10 +1420,10 @@ class MainWindow(QMainWindow):
         ])
         decomposition_combo.setCurrentIndex(0)
         model_layout.addRow("血管分解方法:", decomposition_combo)
-        
+
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
-        
+
         # 添加说明
         info_label = QLabel(
             "说明:\n"
@@ -1379,7 +1434,7 @@ class MainWindow(QMainWindow):
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
-        
+
         # 按钮布局
         button_layout = QHBoxLayout()
         btn_ok = QPushButton("开始分割")
@@ -1389,19 +1444,19 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(btn_ok)
         button_layout.addWidget(btn_cancel)
         layout.addLayout(button_layout)
-        
+
         dialog.setLayout(layout)
-        
+
         # 显示对话框
         if dialog.exec_() == QDialog.Accepted:
             # 获取用户选择的参数
             model_variant = model_variant_combo.currentText().split()[0]
             decomposition_method = decomposition_combo.currentText().split()[0]
-            
+
             # 设置AI接口参数
             self.ai_interface.set_model_variant(model_variant)
             self.ai_interface.set_decomposition_method(decomposition_method)
-            
+
             return True
         else:
             return False
@@ -1415,43 +1470,43 @@ class MainWindow(QMainWindow):
             else:
                 # 回退到直接加载目录
                 data, metadata = self.image_io.load_image(entry.series_dir)
-            
+
             if data is not None:
                 self.current_image_data = data
                 self.current_metadata = metadata
                 self.current_entry = entry
                 self.current_image_path = entry.series_dir
-                
+
                 # 传递spacing信息（如果可用）
                 spacing = metadata.get('spacing') if metadata else None
                 self.four_view.set_image_data(data, spacing)
-                
+
                 # 初始化标签数据
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                 self.four_view.set_label_data(self.current_label_data)
-                
+
                 # 设置活动标签ID
                 self.four_view.axial_view.set_active_label_id(self.active_label_id)
                 self.four_view.coronal_view.set_active_label_id(self.active_label_id)
                 self.four_view.sagittal_view.set_active_label_id(self.active_label_id)
-                
+
                 # 清空历史记录
                 self.undo_history.clear()
                 self.redo_history.clear()
-                
+
                 # 清空种子点
                 self.seed_points = []
                 self._update_seed_count()
-                
+
                 # 关闭种子点模式
                 self.seed_mode_enabled = False
                 self.btn_add_seed.setChecked(False)
-                self.btn_add_seed.setText("Add Seed")
+                self.btn_add_seed.setText("➕ 添加种子点")
                 self.btn_add_seed.setStyleSheet("")
-                
+
                 # 更新病人信息显示
                 self._update_patient_info_from_entry(entry, metadata)
-                
+
                 QMessageBox.information(self, "成功", f"序列加载成功\n尺寸: {data.shape}")
             else:
                 QMessageBox.warning(self, "错误", "序列加载失败")
@@ -1462,13 +1517,13 @@ class MainWindow(QMainWindow):
         """从数据库条目更新病人信息"""
         # 使用entry中的信息
         self.pi_id_label.setText(f"ID: {entry.patient_id}")
-        self.pi_name_label.setText(f"Name: {entry.patient_name or '--'}")
-        self.pi_sex_label.setText("Sex: --")
-        self.pi_birth_label.setText("Birth: --")
-        self.pi_study_date_label.setText(f"Study Date: {entry.study_date or '--'}")
-        self.pi_modality_label.setText(f"Modality: {entry.modality or '--'}")
-        self.pi_series_label.setText(f"Series: {entry.series_id}")
-        
+        self.pi_name_label.setText(f"姓名: {entry.patient_name or '--'}")
+        self.pi_sex_label.setText("性别: --")
+        self.pi_birth_label.setText("出生日期: --")
+        self.pi_study_date_label.setText(f"检查日期: {entry.study_date or '--'}")
+        self.pi_modality_label.setText(f"模态: {entry.modality or '--'}")
+        self.pi_series_label.setText(f"序列: {entry.series_id}")
+
         # 保存当前病人信息
         self.current_patient_info = {
             "PatientID": entry.patient_id,
@@ -1477,19 +1532,19 @@ class MainWindow(QMainWindow):
             "Modality": entry.modality,
             "SeriesID": entry.series_id
         }
-    
+
     def _update_patient_info_from_metadata(self, metadata):
         """从元数据更新病人信息"""
         dicom_info = metadata.get('dicom_info', {})
-        
+
         self.pi_id_label.setText(f"ID: {dicom_info.get('PatientID', '--')}")
-        self.pi_name_label.setText(f"Name: {dicom_info.get('PatientName', '--')}")
-        self.pi_sex_label.setText(f"Sex: {dicom_info.get('PatientSex', '--')}")
-        self.pi_birth_label.setText(f"Birth: {dicom_info.get('PatientBirthDate', '--')}")
-        self.pi_study_date_label.setText(f"Study Date: {dicom_info.get('StudyDate', '--')}")
-        self.pi_modality_label.setText(f"Modality: {dicom_info.get('Modality', '--')}")
-        self.pi_series_label.setText(f"Series: {dicom_info.get('SeriesNumber', '--')}")
-        
+        self.pi_name_label.setText(f"姓名: {dicom_info.get('PatientName', '--')}")
+        self.pi_sex_label.setText(f"性别: {dicom_info.get('PatientSex', '--')}")
+        self.pi_birth_label.setText(f"出生日期: {dicom_info.get('PatientBirthDate', '--')}")
+        self.pi_study_date_label.setText(f"检查日期: {dicom_info.get('StudyDate', '--')}")
+        self.pi_modality_label.setText(f"模态: {dicom_info.get('Modality', '--')}")
+        self.pi_series_label.setText(f"序列: {dicom_info.get('SeriesNumber', '--')}")
+
         # 保存当前病人信息
         self.current_patient_info = {
             "PatientID": dicom_info.get('PatientID', "Unknown"),
@@ -1505,16 +1560,16 @@ class MainWindow(QMainWindow):
         """打开数据库对话框"""
         # 选择数据库根目录
         db_root = QFileDialog.getExistingDirectory(
-            self, "选择数据库根目录", 
+            self, "选择数据库根目录",
             self.last_db_root if self.last_db_root else ""
         )
-        
+
         if not db_root:
             return
-        
+
         # 保存选择的路径
         self.last_db_root = db_root
-        
+
         # 创建并显示数据库对话框
         dialog = DatabaseDialog(db_root, self)
         if dialog.exec_() == QDialog.Accepted:
@@ -1531,10 +1586,10 @@ class MainWindow(QMainWindow):
         self.btn_pan.setChecked(False)
         self.btn_brush.setChecked(False)
         self.btn_eraser.setChecked(False)
-        
+
         # 设置当前工具
         self.current_tool_mode = tool
-        
+
         # 激活选中的工具按钮
         if tool == 'pointer':
             self.btn_pointer.setChecked(True)
@@ -1546,60 +1601,60 @@ class MainWindow(QMainWindow):
             self.btn_brush.setChecked(True)
         elif tool == 'eraser':
             self.btn_eraser.setChecked(True)
-        
+
         # 更新视图中的工具模式
         if hasattr(self.four_view, 'axial_view'):
             self.four_view.axial_view.set_tool_mode(tool)
             self.four_view.coronal_view.set_tool_mode(tool)
             self.four_view.sagittal_view.set_tool_mode(tool)
-    
+
     def _on_quantitative_analysis(self):
         """运行量化分析"""
         if self.current_image_data is None or self.current_label_data is None:
             QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
             return
-        
+
         try:
             # 延迟导入，减少启动时的模块加载
             from quantitative_analysis import QuantitativeAnalyzer
-            
+
             # 显示状态栏提示
             self.statusBar().showMessage("正在进行量化分析...")
-            
+
             # 初始化量化分析器
             analyzer = QuantitativeAnalyzer()
-            
+
             # 提取门静脉和肝静脉掩码
             portal_vein_mask = (self.current_label_data == 1)
             hepatic_vein_mask = (self.current_label_data == 2)
-            
+
             # 计算肝脏分段
             segmentation = analyzer.couinaud_segmentation(
                 np.ones_like(self.current_label_data),  # 假设整个区域都是肝脏
                 portal_vein_mask,
                 hepatic_vein_mask
             )
-            
+
             # 计算体积
             volumes = analyzer.calculate_volumes(segmentation)
-            
+
             # 提取血管量化指标
             vascular_metrics = analyzer.extract_vascular_metrics(portal_vein_mask, hepatic_vein_mask)
-            
+
             # 模拟肿瘤-血管距离评估
             tumor_vessel_assessment = analyzer.assess_tumor_vessel_distance(
                 np.zeros_like(self.current_label_data),  # 假设没有肿瘤
-                portal_vein_mask, 
+                portal_vein_mask,
                 hepatic_vein_mask
             )
-            
+
             # 手术风险评估
             risk_assessment = analyzer.assess_surgical_risk(
-                volumes, 
-                vascular_metrics, 
+                volumes,
+                vascular_metrics,
                 tumor_vessel_assessment
             )
-            
+
             # 显示分析结果
             result_text = "量化分析结果:\n\n"
             result_text += "肝脏体积分析:\n"
@@ -1607,16 +1662,16 @@ class MainWindow(QMainWindow):
                 if key != 'total_liver':
                     result_text += f"{key.replace('segment_', '段 ')}: {value:.2f} ml\n"
             result_text += f"总体积: {volumes.get('total_liver', 0):.2f} ml\n\n"
-            
+
             result_text += "血管量化指标:\n"
             for key, value in vascular_metrics.items():
                 if isinstance(value, float):
                     result_text += f"{key}: {value:.2f}\n"
                 else:
                     result_text += f"{key}: {value}\n"
-            
+
             QMessageBox.information(self, "量化分析结果", result_text)
-            
+
             # 保存分析结果
             self.quantitative_results = {
                 'volumes': volumes,
@@ -1624,73 +1679,75 @@ class MainWindow(QMainWindow):
                 'tumor_vessel_assessment': tumor_vessel_assessment,
                 'risk_assessment': risk_assessment
             }
-            
+
             # 显示状态栏提示
             self.statusBar().showMessage("量化分析完成")
-            
+
         except Exception as e:
             self.statusBar().showMessage("量化分析失败")
             QMessageBox.critical(self, "错误", f"量化分析失败:\n{e}")
-    
+
     def _on_3d_visualization(self):
         """显示3D血管树"""
         if self.current_image_data is None or self.current_label_data is None:
             QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
             return
-        
+
         try:
             # 延迟导入，减少启动时的模块加载
             from visualization import SliceViewer
-            
+
             # 创建3D视图窗口
             from PyQt5.QtWidgets import QDialog
-            
+
             dialog = QDialog(self)
             dialog.setWindowTitle("3D血管树可视化")
             dialog.setGeometry(100, 100, 800, 600)
-            
+
             layout = QVBoxLayout()
-            
+
             # 创建3D视图
             viewer = SliceViewer('3d')
-            spacing = self.current_metadata['spacing'] if (self.current_metadata and 'spacing' in self.current_metadata) else None
+            spacing = self.current_metadata['spacing'] if (
+                        self.current_metadata and 'spacing' in self.current_metadata) else None
             viewer.set_image_data(self.current_image_data, spacing)
             viewer.set_label_data(self.current_label_data)
             viewer._update_display()
-            
+
             layout.addWidget(viewer)
             dialog.setLayout(layout)
-            
+
             dialog.exec_()
-            
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"3D可视化失败:\n{e}")
-    
+
     def _on_add_cutting_plane(self):
         """添加切割平面"""
         if self.current_image_data is None or self.current_label_data is None:
             QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
             return
-        
-        QMessageBox.information(self, "提示", "请先打开3D血管树可视化，然后在3D视图中添加切割平面。\n\n操作步骤：\n1. 点击'显示3D血管树'按钮\n2. 在3D视图中，切割平面会自动显示")
-    
+
+        QMessageBox.information(self, "提示",
+                                "请先打开3D血管树可视化，然后在3D视图中添加切割平面。\n\n操作步骤：\n1. 点击'显示3D血管树'按钮\n2. 在3D视图中，切割平面会自动显示")
+
     def _on_generate_report(self):
         """生成PDF报告"""
         if self.current_image_data is None or self.current_label_data is None:
             QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
             return
-        
+
         try:
             # 延迟导入，减少启动时的模块加载
             import sys
             import os
             import subprocess
-            
+
             # 确保当前目录在Python路径中
             current_dir = os.path.dirname(os.path.abspath(__file__))
             if current_dir not in sys.path:
                 sys.path.insert(0, current_dir)
-            
+
             # 尝试安装reportlab库
             print("尝试安装reportlab库...")
             try:
@@ -1698,19 +1755,19 @@ class MainWindow(QMainWindow):
                 print("reportlab库安装成功")
             except subprocess.CalledProcessError as e:
                 print(f"reportlab库安装失败: {e}")
-            
+
             # 直接导入reportlab库，确保它可用
             import reportlab
             print(f"reportlab版本: {reportlab.__version__}")
-            
+
             from report_generator import ReportGenerator
-            
+
             # 创建ReportGenerator实例
             generator = ReportGenerator()
-            
+
             # 显示状态栏提示
             self.statusBar().showMessage("正在生成PDF报告...")
-            
+
             # 准备报告数据
             report_data = {
                 'patient_id': self.current_patient_info.get('id', 'N/A'),
@@ -1718,11 +1775,11 @@ class MainWindow(QMainWindow):
                 'segmentation_method': 'AI自动分割',
                 'model_variant': getattr(self, 'ai_model_variant', 'mobileuvit_l')
             }
-            
+
             # 添加量化分析结果
             if hasattr(self, 'quantitative_results'):
                 report_data.update(self.quantitative_results)
-            
+
             # 添加图像
             if self.current_image_data is not None:
                 # 提取中间切片作为示例
@@ -1731,16 +1788,16 @@ class MainWindow(QMainWindow):
                 report_data['images'] = {
                     '肝脏影像 (中间切片)': slice_data
                 }
-            
+
             # 生成报告
             generator = ReportGenerator()
-            
+
             # 选择保存路径
             from PyQt5.QtWidgets import QFileDialog
             filepath, _ = QFileDialog.getSaveFileName(
                 self, "保存PDF报告", "", "PDF文件 (*.pdf)"
             )
-            
+
             if filepath:
                 success = generator.generate_report(report_data, filepath)
                 if success:
@@ -1749,7 +1806,7 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.critical(self, "错误", "PDF报告生成失败")
                     self.statusBar().showMessage("PDF报告生成失败")
-            
+
         except Exception as e:
             self.statusBar().showMessage("PDF报告生成失败")
             QMessageBox.critical(self, "错误", f"PDF报告生成失败:\n{e}")
@@ -1758,7 +1815,7 @@ class MainWindow(QMainWindow):
         """十字准线变化"""
         if self.current_image_data is None:
             return
-        
+
         try:
             # 计算z坐标
             z = 0
@@ -1771,24 +1828,24 @@ class MainWindow(QMainWindow):
             elif view_type == 'sagittal':
                 if hasattr(self.four_view, 'sagittal_view'):
                     z = self.four_view.sagittal_view.current_slice
-            
+
             # 更新光标位置标签
-            self.cursor_pos_label.setText(f"Cursor position (x,y,z): ({int(x)}, {int(y)}, {int(z)})")
-            
+            self.cursor_pos_label.setText(f"位置 (x,y,z): ({int(x)}, {int(y)}, {int(z)})")
+
             # 更新光标下的强度值
-            if (0 <= x < self.current_image_data.shape[0] and 
-                0 <= y < self.current_image_data.shape[1] and 
-                0 <= z < self.current_image_data.shape[2]):
+            if (0 <= x < self.current_image_data.shape[0] and
+                    0 <= y < self.current_image_data.shape[1] and
+                    0 <= z < self.current_image_data.shape[2]):
                 intensity = self.current_image_data[int(x), int(y), int(z)]
-                self.cursor_intensity_value_label.setText(f"  Intensity: {intensity:.1f}")
-                self.cursor_layer_label.setText(f"  Layer: Image")
-                
+                self.cursor_intensity_value_label.setText(f"  强度: {intensity:.1f}")
+                self.cursor_layer_label.setText(f"  图层: 影像")
+
                 # 更新光标下的标签值
                 if self.current_label_data is not None:
                     label_value = self.current_label_data[int(x), int(y), int(z)]
-                    self.cursor_label_value_label.setText(f"  Label: {label_value}")
+                    self.cursor_label_value_label.setText(f"  标签: {label_value}")
                 else:
-                    self.cursor_label_value_label.setText("  Label: --")
+                    self.cursor_label_value_label.setText("  标签: --")
         except Exception as e:
             print(f"更新十字准线时发生错误: {e}")
 
@@ -1796,14 +1853,14 @@ class MainWindow(QMainWindow):
         """切片变化"""
         if self.current_image_data is None:
             return
-        
+
         try:
             # 获取当前十字准线位置
             if hasattr(self.four_view, 'axial_view'):
                 axial_slice = self.four_view.axial_view.current_slice
                 coronal_slice = self.four_view.coronal_view.current_slice
                 sagittal_slice = self.four_view.sagittal_view.current_slice
-                
+
                 # 根据变化的视图更新其他视图
                 if view == 'axial':
                     # 轴位切片变化，更新冠状位和矢状位的十字准线
@@ -1823,43 +1880,44 @@ class MainWindow(QMainWindow):
     def _update_seed_count(self):
         """更新种子点数量"""
         pass
-    
+
     def _preload_ai_model(self):
         """后台预加载AI模型"""
+
         class ModelPreloadWorker(QThread):
             finished = pyqtSignal(bool)
-            
+
             def __init__(self, parent):
                 super().__init__(parent)
                 self.parent = parent
-            
+
             def run(self):
                 try:
                     # 延迟导入，减少启动时的模块加载
                     from ai_interface import AISegmentationInterface
-                    
+
                     # 初始化AI接口
                     ai_interface = AISegmentationInterface()
-                    
+
                     # 模型路径
                     model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
-                    
+
                     # 尝试加载模型
                     if os.path.exists(model_path):
                         ai_interface.load_model(model_path)
-                    
+
                     # 保存到父对象
                     self.parent.ai_interface = ai_interface
                     self.finished.emit(True)
                 except Exception as e:
                     print(f"模型预加载失败: {e}")
                     self.finished.emit(False)
-        
+
         # 创建并启动预加载线程
         self.preload_worker = ModelPreloadWorker(self)
         self.preload_worker.finished.connect(self._on_model_preloaded)
         self.preload_worker.start()
-    
+
     def _on_model_preloaded(self, success):
         """模型预加载完成回调"""
         if success:
@@ -1889,7 +1947,7 @@ class MainWindow(QMainWindow):
             self, "加载影像", "",
             "NIfTI文件 (*.nii *.nii.gz);;DICOM文件 (*.dcm);;NRRD文件 (*.nrrd);;所有文件 (*.*)"
         )
-        
+
         if filepath:
             try:
                 data, metadata = self.image_io.load_image(filepath)
@@ -1899,11 +1957,11 @@ class MainWindow(QMainWindow):
                     self.current_image_path = filepath  # 保存文件路径
                     # 尝试从metadata构建entry（用于后续自动定位）
                     self.current_entry = self._build_entry_from_metadata(metadata, filepath)
-                    
+
                     # 传递spacing信息（如果可用）
                     spacing = metadata.get('spacing') if metadata else None
                     self.four_view.set_image_data(data, spacing)
-                    
+
                     # 初始化标签数据
                     self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                     self.four_view.set_label_data(self.current_label_data)
@@ -1920,7 +1978,7 @@ class MainWindow(QMainWindow):
                     # 关闭种子点模式
                     self.seed_mode_enabled = False
                     self.btn_add_seed.setChecked(False)
-                    self.btn_add_seed.setText("Add Seed")
+                    self.btn_add_seed.setText("➕ 添加种子点")
                     self.btn_add_seed.setStyleSheet("")
 
                     # 更新病人信息显示（若有DICOM信息则展示）
@@ -1929,7 +1987,7 @@ class MainWindow(QMainWindow):
                         self._update_patient_info_from_entry(self.current_entry, metadata)
                     else:
                         self._update_patient_info_from_metadata(metadata)
-                    
+
                     QMessageBox.information(self, "成功", f"影像加载成功\n尺寸: {data.shape}")
                 else:
                     QMessageBox.warning(self, "错误", "影像加载失败")
@@ -1951,15 +2009,15 @@ class MainWindow(QMainWindow):
         # 1. 确认病人ID和姓名
         p_id = self.current_patient_info.get("PatientID", "")
         p_name = self.current_patient_info.get("PatientName", "")
-        
+
         # 如果自动提取为空，让用户输入
         if not p_id or p_id == "--" or p_id == "Unknown":
             text, ok = QInputDialog.getText(self, "输入病人编号", "无法自动识别病人编号，请输入:")
             if ok and text:
                 p_id = text
             else:
-                return # 用户取消
-        
+                return  # 用户取消
+
         if not p_name or p_name == "--" or p_name == "Unknown":
             text, ok = QInputDialog.getText(self, "输入病人姓名", f"请输入病人 {p_id} 的姓名:")
             if ok and text:
@@ -1976,21 +2034,23 @@ class MainWindow(QMainWindow):
         try:
             temp_dir = tempfile.gettempdir()
             temp_mask_path = os.path.join(temp_dir, f"temp_mask_{datetime.now().strftime('%H%M%S')}.nii.gz")
-            
+
             # 使用 ImageIO 保存 mask
-            mask_data = self.current_label_data.astype(np.uint8) if self.current_label_data is not None else np.zeros_like(self.current_image_data, dtype=np.uint8)
-            
+            mask_data = self.current_label_data.astype(
+                np.uint8) if self.current_label_data is not None else np.zeros_like(self.current_image_data,
+                                                                                    dtype=np.uint8)
+
             self.image_io.save_label_map(mask_data, temp_mask_path, self.current_metadata)
-            
+
             # 4. 调用日志文件保存
             img_path_to_save = self.current_image_path
             is_folder = os.path.isdir(img_path_to_save)
-            
+
             if is_folder:
                 pass
 
             print(f"Archiving: {p_id}, {p_name}")
-            
+
             success = self.db.save_record(
                 p_code=p_id,
                 p_name=p_name,
@@ -1998,16 +2058,16 @@ class MainWindow(QMainWindow):
                 mask_save_path=temp_mask_path,
                 note=note
             )
-            
+
             if success:
                 QMessageBox.information(self, "成功", f"病例 {p_name} 已成功归档！")
             else:
                 QMessageBox.warning(self, "失败", "归档失败，请检查日志或文件权限。")
-                
+
             # 清理临时文件
             if os.path.exists(temp_mask_path):
                 os.remove(temp_mask_path)
-                
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存过程中发生错误:\n{e}")
 
@@ -2016,7 +2076,7 @@ class MainWindow(QMainWindow):
         if not self.db:
             QMessageBox.warning(self, "错误", "日志文件管理器未初始化。")
             return
-            
+
         dialog = CaseHistoryDialog(self.db, self)
         dialog.case_selected.connect(self._on_history_case_loaded)
         dialog.exec_()
@@ -2024,7 +2084,7 @@ class MainWindow(QMainWindow):
     def _on_history_case_loaded(self, original_path, mask_path):
         """从历史记录加载病例的回调"""
         print(f"Loading history case: {original_path}, {mask_path}")
-        
+
         try:
             # 1. 加载原图
             # 判断原图是文件还是文件夹 (DICOM)
@@ -2034,19 +2094,19 @@ class MainWindow(QMainWindow):
             else:
                 # 是单个文件 (nii.gz)
                 data, metadata = self.image_io.load_image(original_path)
-            
+
             if data is None:
                 QMessageBox.warning(self, "错误", "无法加载原始影像文件")
                 return
-                
+
             self.current_image_data = data
             self.current_metadata = metadata
             self.current_image_path = original_path
-            
+
             # 传递 spacing
             spacing = metadata.get('spacing') if metadata else None
             self.four_view.set_image_data(data, spacing)
-            
+
             # 2. 加载 Mask
             if os.path.exists(mask_path):
                 mask_data = self.image_io.load_label_map(mask_path)
@@ -2061,20 +2121,20 @@ class MainWindow(QMainWindow):
                     self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
             else:
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
-            
+
             self.four_view.set_label_data(self.current_label_data)
-            
+
             # 更新信息显示
             self._update_patient_info_from_metadata(metadata)
-            
+
             # 从路径中获取 p_code，或者从搜索结果中获取
-            p_code = self.get_current_patient_code() 
-            
+            p_code = self.get_current_patient_code()
+
             # 触发数据库联动展示
             self.refresh_patient_tables(p_code)
-            
+
             QMessageBox.information(self, "成功", "历史病例加载完成")
-            
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载历史病例失败:\n{e}")
 
@@ -2189,7 +2249,7 @@ class MainWindow(QMainWindow):
     def _on_load_dicom_folder(self):
         """
         加载DICOM文件夹
-        
+
         说明：
         - 用于处理类似 522/data/.../ST*/SE*/IM* 这种「无后缀」DICOM 文件结构
         - 现在支持选择上层目录（病人/Study），会自动向下递归找到第一个可加载的 SE 目录
@@ -2253,7 +2313,7 @@ class MainWindow(QMainWindow):
             self._update_seed_count()
             self.seed_mode_enabled = False
             self.btn_add_seed.setChecked(False)
-            self.btn_add_seed.setText("Add Seed")
+            self.btn_add_seed.setText("➕ 添加种子点")
             self.btn_add_seed.setStyleSheet("")
             # 更新病人信息显示
             # 如果构建了entry，使用entry信息（更完整）；否则只使用metadata
@@ -2262,7 +2322,8 @@ class MainWindow(QMainWindow):
             else:
                 self._update_patient_info_from_metadata(metadata)
 
-            QMessageBox.information(self, "成功", f"DICOM文件夹加载成功\n实际加载目录: {target_dir}\n尺寸: {data.shape}")
+            QMessageBox.information(self, "成功",
+                                    f"DICOM文件夹加载成功\n实际加载目录: {target_dir}\n尺寸: {data.shape}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载DICOM文件夹时发生错误:\n{e}")
 
@@ -2306,7 +2367,7 @@ class MainWindow(QMainWindow):
                 self._update_seed_count()
                 self.seed_mode_enabled = False
                 self.btn_add_seed.setChecked(False)
-                self.btn_add_seed.setText("Add Seed")
+                self.btn_add_seed.setText("➕ 添加种子点")
                 self.btn_add_seed.setStyleSheet("")
 
                 # 使用数据库中的entry信息（优先）更新病人显示
@@ -2323,7 +2384,7 @@ class MainWindow(QMainWindow):
         info = {}
         if metadata and isinstance(metadata, dict):
             info = metadata.get("dicom_info") or {}
-        
+
         # 如果dicom_info为空或信息不完整，尝试从当前图像路径中提取基本信息
         if self.current_image_path:
             path_parts = os.path.normpath(self.current_image_path).split(os.sep)
@@ -2334,7 +2395,7 @@ class MainWindow(QMainWindow):
                     if part.isdigit() and 1 <= len(part) <= 4:
                         info["PatientID"] = part
                         break
-            
+
             # 尝试从路径中提取Series信息（如果还没有）
             if not info.get("SeriesDescription"):
                 # 查找SE*目录
@@ -2349,7 +2410,7 @@ class MainWindow(QMainWindow):
                         elif not suffix:
                             info["SeriesDescription"] = part
                             break
-            
+
             # 尝试从路径中提取Study信息（如果还没有）
             if not info.get("StudyID"):
                 # 查找ST*目录
@@ -2364,7 +2425,7 @@ class MainWindow(QMainWindow):
                         elif not suffix:
                             info["StudyID"] = part
                             break
-        
+
         # 确保至少有一些信息被提取
         self._apply_patient_info(info)
 
@@ -2385,6 +2446,52 @@ class MainWindow(QMainWindow):
                 info["PatientName"] = entry.patient_name
             if entry.study_date:
                 info["StudyDate"] = entry.study_date
-        
+
         # 应用病人信息
         self._apply_patient_info(info)
+
+
+class PatientInfoDialog(QDialog):
+    """病人信息查看对话框"""
+
+    def __init__(self, info: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("病人信息")
+        self.setMinimumSize(400, 300)
+
+        layout = QVBoxLayout()
+
+        # 创建表格显示信息
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["字段", "值"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        # 填充数据
+        items = [
+            ("病人ID", info.get("PatientID", "--")),
+            ("病人姓名", info.get("PatientName", "--")),
+            ("性别", info.get("PatientSex", "--")),
+            ("出生日期", info.get("PatientBirthDate", "--")),
+            ("检查日期", info.get("StudyDate", "--")),
+            ("模态", info.get("Modality", "--")),
+            ("序列号", info.get("SeriesNumber", "--")),
+            ("序列描述", info.get("SeriesDescription", "--")),
+            ("机构", info.get("InstitutionName", "--")),
+            ("医生", info.get("ReferringPhysicianName", "--")),
+        ]
+
+        table.setRowCount(len(items))
+        for i, (key, value) in enumerate(items):
+            table.setItem(i, 0, QTableWidgetItem(key))
+            table.setItem(i, 1, QTableWidgetItem(str(value)))
+
+        layout.addWidget(table)
+
+        # 关闭按钮
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+        self.setLayout(layout)

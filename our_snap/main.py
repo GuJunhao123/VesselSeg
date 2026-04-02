@@ -15,7 +15,7 @@ def main():
     # 设置高DPI支持（必须在QApplication创建之前设置）
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
+
     # 创建应用程序
     app = QApplication(sys.argv)
     app.setApplicationName("医学影像分割软件")
