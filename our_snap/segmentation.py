@@ -72,22 +72,39 @@ class ActiveContourSegmentation:
             return None
         
         mask = self.current_mask.copy().astype(np.float32)
+        if not np.any(mask > 0.5):
+            self._initialize_mask_from_seeds()
+            mask = self.current_mask.copy().astype(np.float32)
+            if not np.any(mask > 0.5):
+                return np.zeros_like(self.image_data, dtype=np.uint8)
+
+        image = self.image_data.astype(np.float32)
+        # 图像梯度对固定图像是恒定的，提前计算可减少耗时
+        grad_x = np.gradient(image, axis=0)
+        grad_y = np.gradient(image, axis=1)
+        grad_z = np.gradient(image, axis=2)
+        grad_magnitude = np.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
+        global_mean = float(np.mean(image))
         
         for i in range(iterations):
-            # 计算图像梯度
-            grad_x = np.gradient(self.image_data.astype(np.float32), axis=0)
-            grad_y = np.gradient(self.image_data.astype(np.float32), axis=1)
-            grad_z = np.gradient(self.image_data.astype(np.float32), axis=2)
-            grad_magnitude = np.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
-            
             # 计算区域内的平均灰度值
-            inside_mean = np.mean(self.image_data[mask > 0.5])
-            outside_mean = np.mean(self.image_data[mask <= 0.5])
+            inside_region = mask > 0.5
+            outside_region = ~inside_region
+            if not np.any(inside_region):
+                # 避免空区域导致NaN，回退到初始化并停止
+                self._initialize_mask_from_seeds()
+                mask = self.current_mask.copy().astype(np.float32)
+                break
+            if not np.any(outside_region):
+                outside_mean = global_mean
+            else:
+                outside_mean = float(np.mean(image[outside_region]))
+            inside_mean = float(np.mean(image[inside_region]))
             
             # 计算区域竞争力
             region_force = np.zeros_like(mask)
-            region_force[mask > 0.5] = (self.image_data[mask > 0.5] - inside_mean) * expansion_force
-            region_force[mask <= 0.5] = (outside_mean - self.image_data[mask <= 0.5]) * expansion_force
+            region_force[inside_region] = (image[inside_region] - inside_mean) * expansion_force
+            region_force[outside_region] = (outside_mean - image[outside_region]) * expansion_force
             
             # 平滑项（拉普拉斯算子）
             laplacian = ndimage.laplace(mask)
@@ -109,6 +126,10 @@ class ActiveContourSegmentation:
             # 形态学操作保持连通性
             mask_binary = ndimage.binary_closing(mask_binary, structure=np.ones((3, 3, 3)))
             mask_binary = ndimage.binary_opening(mask_binary, structure=np.ones((3, 3, 3)))
+            if not np.any(mask_binary):
+                # 若演化到全空，回退到初始种子区域，避免“有种子但无结果”
+                self._initialize_mask_from_seeds()
+                mask_binary = self.current_mask > 0
             
             mask = mask_binary.astype(np.float32)
         
@@ -135,6 +156,11 @@ class ActiveContourSegmentation:
             return None
         
         mask = self.current_mask.copy().astype(np.float32)
+        if not np.any(mask > 0.5):
+            self._initialize_mask_from_seeds()
+            mask = self.current_mask.copy().astype(np.float32)
+            if not np.any(mask > 0.5):
+                return np.zeros_like(self.image_data, dtype=np.uint8)
         
         # 计算边缘图（使用Sobel算子）
         edges = np.zeros_like(self.image_data, dtype=np.float32)
@@ -168,6 +194,9 @@ class ActiveContourSegmentation:
             # 形态学操作
             mask_binary = ndimage.binary_closing(mask_binary, structure=np.ones((3, 3, 3)))
             mask_binary = ndimage.binary_opening(mask_binary, structure=np.ones((3, 3, 3)))
+            if not np.any(mask_binary):
+                self._initialize_mask_from_seeds()
+                mask_binary = self.current_mask > 0
             
             mask = mask_binary.astype(np.float32)
         

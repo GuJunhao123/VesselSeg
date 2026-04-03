@@ -7,7 +7,7 @@ AI自动分割接口模块
 
 import numpy as np
 import onnxruntime as ort
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import os
 import sys
 
@@ -50,6 +50,8 @@ class AISegmentationInterface:
         # MobileUViT 模型参数
         self.model_variant = 'mobileuvit_l'  # 'mobileuvit' 或 'mobileuvit_l'
         self.decomposition_method = 'percentile_50'  # 血管分解方法
+        # 保存最近一次血管结构分析结果
+        self.last_vessel_analysis: Dict[str, Any] = {}
     
     def load_model(self, model_path: str) -> bool:
         """
@@ -72,7 +74,7 @@ class AISegmentationInterface:
                 # 加载 ONNX 模型
                 self.model_session = ort.InferenceSession(
                     model_path,
-                    providers=['CPUExecutionProvider', 'CUDAExecutionProvider']  # 优先使用GPU
+                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider']  # 优先使用GPU
                 )
                 
                 # 获取输入输出信息
@@ -219,6 +221,167 @@ class AISegmentationInterface:
             'percentile_50',
             'percentile_75'
         ]
+
+    def _skeletonize_3d_mask(self, vessel_mask: np.ndarray) -> np.ndarray:
+        """3D骨架化，兼容不同scikit-image版本。"""
+        from skimage import morphology
+
+        try:
+            # 新版本优先
+            skeleton = morphology.skeletonize_3d(vessel_mask)
+            return skeleton.astype(bool)
+        except Exception:
+            # 兼容回退
+            skeleton = morphology.skeletonize(vessel_mask)
+            return skeleton.astype(bool)
+
+    def _compute_level_maps(
+        self,
+        vessel_mask: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> Dict[str, np.ndarray]:
+        """
+        基于距离变换计算血管分级、主干/细分支、分叉点。
+        返回:
+            level_map: 0背景, 1~5分别对应5个等级
+            trunk_map: 主干区域
+            small_map: 细分支区域
+            junction_map: 分叉点邻域
+            skeleton: 骨架
+            radius_mm_map: 半径(mm)估计
+        """
+        from scipy import ndimage
+
+        vessel = vessel_mask.astype(bool)
+        if not np.any(vessel):
+            zero = np.zeros_like(vessel, dtype=bool)
+            return {
+                "level_map": np.zeros_like(vessel, dtype=np.uint8),
+                "trunk_map": zero,
+                "small_map": zero,
+                "junction_map": zero,
+                "skeleton": zero,
+                "radius_mm_map": np.zeros_like(vessel, dtype=np.float32),
+            }
+
+        sx, sy, sz = spacing
+        edt_mm = ndimage.distance_transform_edt(vessel, sampling=(sx, sy, sz))
+        skeleton = self._skeletonize_3d_mask(vessel)
+
+        if not np.any(skeleton):
+            # 没有骨架时兜底：全部视作small
+            return {
+                "level_map": np.where(vessel, 5, 0).astype(np.uint8),
+                "trunk_map": np.zeros_like(vessel, dtype=bool),
+                "small_map": vessel,
+                "junction_map": np.zeros_like(vessel, dtype=bool),
+                "skeleton": skeleton,
+                "radius_mm_map": edt_mm.astype(np.float32),
+            }
+
+        # 把骨架半径传播到管腔体素
+        _, idx = ndimage.distance_transform_edt(~skeleton, return_indices=True)
+        propagated_r = edt_mm[tuple(idx)]
+
+        # 5级分层（按直径）
+        # 1级: 直径 > 3.0mm   => r >= 1.5
+        # 2级: 2.0~3.0mm      => 1.0 <= r < 1.5
+        # 3级: 1.0~2.0mm      => 0.5 <= r < 1.0
+        # 4级: 0.5~1.0mm      => 0.25 <= r < 0.5
+        # 5级: <0.5mm         => r < 0.25
+        level1 = (propagated_r >= 1.5) & vessel
+        level2 = (propagated_r >= 1.0) & (propagated_r < 1.5) & vessel
+        level3 = (propagated_r >= 0.5) & (propagated_r < 1.0) & vessel
+        level4 = (propagated_r >= 0.25) & (propagated_r < 0.5) & vessel
+        level5 = (propagated_r < 0.25) & vessel
+
+        level_map = np.zeros_like(vessel, dtype=np.uint8)
+        level_map[level1] = 1
+        level_map[level2] = 2
+        level_map[level3] = 3
+        level_map[level4] = 4
+        level_map[level5] = 5
+
+        # 分叉点检测：骨架邻居>=3
+        structure = ndimage.generate_binary_structure(3, 2)  # 26连通
+        neighbors = ndimage.convolve(skeleton.astype(np.uint8), structure, mode='constant')
+        # neighbors包含中心点自身，因此阈值>=4等价于至少3个邻居
+        junction_points = skeleton & (neighbors >= 4)
+        junction_map = ndimage.binary_dilation(junction_points, iterations=1) & vessel
+
+        # 主干定义：1级+2级；细分支定义：其余血管
+        trunk_map = (level1 | level2) & vessel
+        small_map = vessel & (~trunk_map)
+
+        return {
+            "level_map": level_map,
+            "trunk_map": trunk_map,
+            "small_map": small_map,
+            "junction_map": junction_map,
+            "skeleton": skeleton,
+            "radius_mm_map": propagated_r.astype(np.float32),
+        }
+
+    def analyze_vessel_structure(
+        self,
+        mask: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> Dict[str, Any]:
+        """
+        对PV/HV做结构识别（主干/细支/分叉点/5级分层）并缓存结果。
+        """
+        result: Dict[str, Any] = {
+            "spacing": spacing,
+            "pv": {},
+            "hv": {},
+            "structure_map": np.zeros_like(mask, dtype=np.uint8),  # 0背景 1主干 2细支 3分叉
+            "level_map": np.zeros_like(mask, dtype=np.uint8),      # 0背景 1..5分级
+        }
+
+        vessel_defs = {1: "pv", 2: "hv"}
+        for label_id, name in vessel_defs.items():
+            vessel_mask = (mask == label_id)
+            info = self._compute_level_maps(vessel_mask, spacing=spacing)
+
+            # 统计
+            level_map = info["level_map"]
+            level_counts = {
+                "level_1": int(np.sum(level_map == 1)),
+                "level_2": int(np.sum(level_map == 2)),
+                "level_3": int(np.sum(level_map == 3)),
+                "level_4": int(np.sum(level_map == 4)),
+                "level_5_plus": int(np.sum(level_map == 5)),
+            }
+
+            result[name] = {
+                "mask": vessel_mask.astype(np.uint8),
+                "trunk_map": info["trunk_map"].astype(np.uint8),
+                "small_map": info["small_map"].astype(np.uint8),
+                "junction_map": info["junction_map"].astype(np.uint8),
+                "skeleton": info["skeleton"].astype(np.uint8),
+                "level_map": level_map.astype(np.uint8),
+                "radius_mm_map": info["radius_mm_map"],
+                "voxel_count": int(np.sum(vessel_mask)),
+                "trunk_voxel_count": int(np.sum(info["trunk_map"])),
+                "small_voxel_count": int(np.sum(info["small_map"])),
+                "junction_voxel_count": int(np.sum(info["junction_map"])),
+                "level_counts": level_counts,
+            }
+
+            # 融合到全局图（若重叠，分叉优先）
+            result["level_map"] = np.maximum(result["level_map"], level_map.astype(np.uint8))
+            result["structure_map"][info["trunk_map"]] = 1
+            result["structure_map"][info["small_map"]] = np.maximum(
+                result["structure_map"][info["small_map"]], 2
+            )
+            result["structure_map"][info["junction_map"]] = 3
+
+        self.last_vessel_analysis = result
+        return result
+
+    def get_last_vessel_analysis(self) -> Dict[str, Any]:
+        """获取最近一次血管结构分析结果。"""
+        return self.last_vessel_analysis if self.last_vessel_analysis else {}
     
     def preprocess_image(self, image_data: np.ndarray) -> np.ndarray:
         """
@@ -255,7 +418,12 @@ class AISegmentationInterface:
         
         return img_processed
     
-    def postprocess_mask(self, model_output: np.ndarray, original_shape: Tuple[int, int, int]) -> np.ndarray:
+    def postprocess_mask(
+        self,
+        model_output: np.ndarray,
+        original_shape: Tuple[int, int, int],
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> np.ndarray:
         """
         后处理模型输出
         
@@ -275,199 +443,98 @@ class AISegmentationInterface:
             output_data = model_output[0]
         else:
             output_data = model_output
-        
-        # 处理多通道输出（3通道：背景、门静脉、肝静脉）
-        if output_data.shape[0] == 3:
-            # 多通道输出，选择每个体素的最大概率通道
-            output_data = np.argmax(output_data, axis=0)
-        
-        # 移除batch维度
-        while len(output_data.shape) > 3:
+
+        # 移除batch维度（仅当首维为1时）
+        while output_data.ndim > 3 and output_data.shape[0] == 1:
             output_data = np.squeeze(output_data, axis=0)
-        
+
+        # 处理多通道输出（3通道：背景、门静脉、肝静脉）
+        if output_data.ndim == 4:
+            if output_data.shape[0] == 3:
+                # C,H,W,D -> H,W,D
+                output_data = np.argmax(output_data, axis=0)
+            elif output_data.shape[-1] == 3:
+                # H,W,D,C -> H,W,D
+                output_data = np.argmax(output_data, axis=-1)
+
         # 确保是uint8类型
         mask = output_data.astype(np.uint8)
-        
-        # 应用血管分解方法进行后处理
-        if self.decomposition_method and mask.max() > 0:
-            try:
-                # 导入必要的库
-                from skimage import morphology
-                from scipy import ndimage
-                from skimage.filters import threshold_otsu
-                
-                print(f"开始应用血管分解方法: {self.decomposition_method}")
-                
-                # 对每个标签进行分解处理
-                processed_mask = np.zeros_like(mask, dtype=np.uint8)
-                
-                # 血管类型定义
-                vessel_types = {
-                    1: "门静脉",
-                    2: "肝静脉"
-                }
-                
-                for label in [1, 2]:  # 只处理门静脉和肝静脉
-                    vessel_mask = (mask == label).astype(bool)
-                    
-                    if not np.any(vessel_mask):
-                        continue
-                    
-                    print(f"处理{label} ({vessel_types[label]})...")
-                    
-                    # 提取骨架
-                    skeleton = morphology.skeletonize(vessel_mask)
-                    
-                    if not np.any(skeleton):
-                        # 无法提取骨架，整体视为small
-                        processed_mask[vessel_mask] = label
-                        continue
-                    
-                    # 计算距离变换
-                    edt = ndimage.distance_transform_edt(vessel_mask)
-                    radii = edt[skeleton]
-                    
-                    if radii.size == 0:
-                        processed_mask[vessel_mask] = label
-                        continue
-                    
-                    # 根据分解方法选择阈值
-                    if self.decomposition_method.startswith("fixed_"):
-                        fixed_val = float(self.decomposition_method.split("_")[1])
-                        th = fixed_val
-                        print(f"  使用固定阈值: {th}")
-                    elif self.decomposition_method == "adaptive":
-                        if np.unique(radii).size > 1:
-                            th = threshold_otsu(radii)
-                        else:
-                            th = radii.max() + 1e-5
-                        print(f"  使用自适应阈值: {th:.3f}")
-                    elif self.decomposition_method == "median":
-                        th = np.median(radii)
-                        print(f"  使用中位数阈值: {th:.3f}")
-                    elif self.decomposition_method.startswith("percentile_"):
-                        percentile_val = int(self.decomposition_method.split("_")[1])
-                        th = np.percentile(radii, percentile_val)
-                        print(f"  使用{percentile_val}%百分位数阈值: {th:.3f}")
-                    else:
-                        # 默认使用adaptive
-                        if np.unique(radii).size > 1:
-                            th = threshold_otsu(radii)
-                        else:
-                            th = radii.max() + 1e-5
-                        print(f"  使用默认自适应阈值: {th:.3f}")
-                    
-                    # 计算trunk、small和junction
-                    _, idx = ndimage.distance_transform_edt(~skeleton, return_indices=True)
-                    prop_r = edt[tuple(idx)]
-                    
-                    # 血管分级（5级以上微小血管）
-                    # 1级：主干（直径 > 3mm）
-                    # 2级：大分支（直径 2-3mm）
-                    # 3级：中分支（直径 1-2mm）
-                    # 4级：小分支（直径 0.5-1mm）
-                    # 5级及以上：微小分支（直径 < 0.5mm）
-                    level1 = (prop_r >= 1.5) & vessel_mask  # 3mm直径
-                    level2 = (prop_r >= 1.0) & (prop_r < 1.5) & vessel_mask  # 2-3mm
-                    level3 = (prop_r >= 0.5) & (prop_r < 1.0) & vessel_mask  # 1-2mm
-                    level4 = (prop_r >= 0.25) & (prop_r < 0.5) & vessel_mask  # 0.5-1mm
-                    level5_plus = (prop_r < 0.25) & vessel_mask  # < 0.5mm
-                    
-                    # 识别分叉点
-                    # 分叉点：骨架上具有3个或更多邻居的点
-                    structure = ndimage.generate_binary_structure(3, 2)  # 26连通
-                    neighbors = ndimage.convolve(skeleton.astype(int), structure, mode='constant')
-                    junction_points = (skeleton & (neighbors >= 3))
-                    
-                    # 膨胀分叉点以提高可见性
-                    junction_mask = ndimage.binary_dilation(junction_points, iterations=1)
-                    
-                    # 根据分解方法应用不同的后处理策略
-                    if self.decomposition_method == "adaptive":
-                        # 自适应：保留所有部分
-                        processed_mask[level1 | level2 | level3 | level4 | level5_plus] = label
-                        print(f"  {vessel_types[label]}: 自适应模式 - 保留所有级别血管")
-                        print(f"    1级主干: {np.sum(level1)}")
-                        print(f"    2级大分支: {np.sum(level2)}")
-                        print(f"    3级中分支: {np.sum(level3)}")
-                        print(f"    4级小分支: {np.sum(level4)}")
-                        print(f"    5级及以上微小分支: {np.sum(level5_plus)}")
-                        print(f"    分叉点: {np.sum(junction_points)}")
-                    elif self.decomposition_method.startswith("fixed_"):
-                        # 固定阈值：根据阈值决定保留哪些级别
-                        fixed_val = float(self.decomposition_method.split("_")[1])
-                        if fixed_val >= 2.0:
-                            # 高阈值：只保留主干和大分支
-                            processed_mask[level1 | level2] = label
-                            print(f"  {vessel_types[label]}: 高阈值模式 - 只保留主干和大分支")
-                            print(f"    1级主干: {np.sum(level1)}")
-                            print(f"    2级大分支: {np.sum(level2)}")
-                        elif fixed_val >= 1.0:
-                            # 中等阈值：保留主干、大分支和中分支
-                            processed_mask[level1 | level2 | level3] = label
-                            print(f"  {vessel_types[label]}: 中等阈值模式 - 保留主干、大分支和中分支")
-                            print(f"    1级主干: {np.sum(level1)}")
-                            print(f"    2级大分支: {np.sum(level2)}")
-                            print(f"    3级中分支: {np.sum(level3)}")
-                        else:
-                            # 低阈值：保留所有级别
-                            processed_mask[level1 | level2 | level3 | level4 | level5_plus] = label
-                            print(f"  {vessel_types[label]}: 低阈值模式 - 保留所有级别血管")
-                            print(f"    1级主干: {np.sum(level1)}")
-                            print(f"    2级大分支: {np.sum(level2)}")
-                            print(f"    3级中分支: {np.sum(level3)}")
-                            print(f"    4级小分支: {np.sum(level4)}")
-                            print(f"    5级及以上微小分支: {np.sum(level5_plus)}")
-                    elif self.decomposition_method == "median":
-                        # 中位数：平衡保留
-                        processed_mask[level1 | level2 | level3 | level4] = label
-                        print(f"  {vessel_types[label]}: 中位数模式 - 保留主干、大分支、中分支和小分支")
-                        print(f"    1级主干: {np.sum(level1)}")
-                        print(f"    2级大分支: {np.sum(level2)}")
-                        print(f"    3级中分支: {np.sum(level3)}")
-                        print(f"    4级小分支: {np.sum(level4)}")
-                    elif self.decomposition_method.startswith("percentile_"):
-                        percentile_val = int(self.decomposition_method.split("_")[1])
-                        if percentile_val >= 75:
-                            # 高百分位数：更保守，只保留主干
-                            processed_mask[level1] = label
-                            print(f"  {vessel_types[label]}: 高百分位数{percentile_val}% - 只保留主干")
-                            print(f"    1级主干: {np.sum(level1)}")
-                        elif percentile_val >= 50:
-                            # 中等百分位数：保留主干和大分支
-                            processed_mask[level1 | level2] = label
-                            print(f"  {vessel_types[label]}: 中等百分位数{percentile_val}% - 保留主干和大分支")
-                            print(f"    1级主干: {np.sum(level1)}")
-                            print(f"    2级大分支: {np.sum(level2)}")
-                        else:
-                            # 低百分位数：更激进，保留更多
-                            processed_mask[level1 | level2 | level3 | level4 | level5_plus] = label
-                            print(f"  {vessel_types[label]}: 低百分位数{percentile_val}% - 保留所有级别血管")
-                            print(f"    1级主干: {np.sum(level1)}")
-                            print(f"    2级大分支: {np.sum(level2)}")
-                            print(f"    3级中分支: {np.sum(level3)}")
-                            print(f"    4级小分支: {np.sum(level4)}")
-                            print(f"    5级及以上微小分支: {np.sum(level5_plus)}")
-                
-                mask = processed_mask
-                print(f"血管分解后处理完成，最终非零像素: {np.count_nonzero(mask)}")
-                print(f"  门静脉: {np.sum(mask == 1)}")
-                print(f"  肝静脉: {np.sum(mask == 2)}")
-            except Exception as e:
-                print(f"血管分解后处理失败: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # 调整尺寸（如果需要）
+
+        # 调整尺寸（如果需要），使用最近邻保持多标签
         if mask.shape != original_shape:
-            from scipy.ndimage import zoom
-            zoom_factors = [orig / mask for orig, mask in zip(original_shape, mask.shape)]
-            mask = zoom(mask, zoom_factors, order=1)
-            mask = (mask > 0.5).astype(np.uint8)
-        
+            try:
+                from scipy.ndimage import zoom
+                zoom_factors = [float(orig) / float(cur) for orig, cur in zip(original_shape, mask.shape)]
+                mask = zoom(mask.astype(np.float32), zoom_factors, order=0, mode="nearest")
+                mask = np.rint(mask).astype(np.uint8)
+            except Exception as e:
+                print(f"掩码尺寸回采样失败: {e}")
+
+        # 基础去噪：去掉每类血管极小孤立块，降低假阳性
+        try:
+            from scipy import ndimage
+            clean_mask = np.zeros_like(mask, dtype=np.uint8)
+            for label in (1, 2):
+                comp, n_comp = ndimage.label(mask == label)
+                if n_comp == 0:
+                    continue
+                sizes = np.bincount(comp.ravel())
+                # 背景索引0不算；阈值自适应，最低8体素
+                min_keep = max(8, int(0.00001 * mask.size))
+                keep_ids = np.where(sizes >= min_keep)[0]
+                keep_ids = keep_ids[keep_ids != 0]
+                if keep_ids.size > 0:
+                    clean_mask[np.isin(comp, keep_ids)] = label
+            # 若清洗后全空，回退
+            if np.any(clean_mask > 0):
+                mask = clean_mask
+        except Exception as e:
+            print(f"后处理去噪失败，继续使用原始掩码: {e}")
+
+        # 结构识别：PV/HV 主干/细分支/分叉/5级分层
+        try:
+            analysis = self.analyze_vessel_structure(mask, spacing=spacing)
+
+            # 分解策略控制“显示保留级别”
+            # 默认尽量保留细分支，满足5级以上识别需求
+            keep_max_level = 5
+            m = self.decomposition_method or "adaptive"
+            if m in ("fixed_2.5", "percentile_75"):
+                keep_max_level = 2
+            elif m in ("fixed_2.0",):
+                keep_max_level = 3
+            elif m in ("fixed_1.5",):
+                keep_max_level = 4
+            # adaptive / percentile_25 / percentile_50 / median / fixed_1.0 -> 保留到5级
+
+            if keep_max_level < 5:
+                filtered = np.zeros_like(mask, dtype=np.uint8)
+                for label, name in ((1, "pv"), (2, "hv")):
+                    level_map = analysis.get(name, {}).get("level_map")
+                    if level_map is None:
+                        continue
+                    keep = (level_map > 0) & (level_map <= keep_max_level)
+                    filtered[keep] = label
+                # 避免过度裁剪导致空结果
+                if np.any(filtered > 0):
+                    mask = filtered
+                    # 重新分析一次，保证缓存和最终mask一致
+                    self.analyze_vessel_structure(mask, spacing=spacing)
+
+            print(f"血管结构识别完成: 非零体素={np.count_nonzero(mask)}")
+            print(f"  PV体素: {np.sum(mask == 1)}")
+            print(f"  HV体素: {np.sum(mask == 2)}")
+        except Exception as e:
+            self.last_vessel_analysis = {}
+            print(f"血管结构识别失败: {e}")
+
         return mask
     
-    def segment(self, image_data: np.ndarray) -> Optional[np.ndarray]:
+    def segment(
+        self,
+        image_data: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> Optional[np.ndarray]:
         """
         执行AI分割
         
@@ -499,7 +566,7 @@ class AISegmentationInterface:
                 outputs = self.model_session.run([output_name], {input_name: input_data})
                 
                 # 后处理
-                mask = self.postprocess_mask(outputs[0], original_shape)
+                mask = self.postprocess_mask(outputs[0], original_shape, spacing=spacing)
                 
             elif self.model_type == 'pytorch' and PYTORCH_AVAILABLE:
                 # PyTorch 模型推理（与 pred4.py 逻辑一致）
@@ -566,6 +633,8 @@ class AISegmentationInterface:
                     )
                     
                     mask = final_pred_nii.get_fdata().astype(np.uint8)
+                    # PyTorch路径也做统一结构识别与策略后处理
+                    mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
                     
                 finally:
                     # 清理临时文件

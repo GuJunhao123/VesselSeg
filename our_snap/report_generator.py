@@ -10,60 +10,13 @@ import sys
 import datetime
 import numpy as np
 
-# 直接导入reportlab库
-print("开始导入reportlab库...")
-try:
-    import reportlab
-    print(f"reportlab库导入成功，版本: {reportlab.__version__}")
-except ImportError as e:
-    print(f"reportlab库导入失败: {e}")
-    import traceback
-    traceback.print_exc()
-    raise
-
-try:
-    from reportlab.lib import colors
-    print("reportlab.lib.colors导入成功")
-except ImportError as e:
-    print(f"reportlab.lib.colors导入失败: {e}")
-    raise
-
-try:
-    from reportlab.lib.pagesizes import A4, landscape
-    print("reportlab.lib.pagesizes导入成功")
-except ImportError as e:
-    print(f"reportlab.lib.pagesizes导入失败: {e}")
-    raise
-
-try:
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    print("reportlab.lib.styles导入成功")
-except ImportError as e:
-    print(f"reportlab.lib.styles导入失败: {e}")
-    raise
-
-try:
-    from reportlab.lib.units import cm
-    print("reportlab.lib.units导入成功")
-except ImportError as e:
-    print(f"reportlab.lib.units导入失败: {e}")
-    raise
-
-try:
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-    print("reportlab.platypus导入成功")
-except ImportError as e:
-    print(f"reportlab.platypus导入失败: {e}")
-    raise
-
-try:
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-    print("reportlab.lib.enums导入成功")
-except ImportError as e:
-    print(f"reportlab.lib.enums导入失败: {e}")
-    raise
-
-print("所有reportlab模块导入成功")
+import reportlab
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
 import matplotlib.pyplot as plt
 from io import BytesIO
@@ -166,16 +119,28 @@ class ReportGenerator:
                 metric_data = []
                 metric_names = {
                     'vascular_volume': '血管总体积 (ml)',
+                    'portal_volume': '门静脉体积 (ml)',
+                    'hepatic_volume': '肝静脉体积 (ml)',
+                    'pv_hv_volume_ratio': '门/肝静脉体积比',
                     'vascular_length': '血管总长度 (mm)',
+                    'portal_length': '门静脉长度 (mm)',
+                    'hepatic_length': '肝静脉长度 (mm)',
                     'mean_diameter': '平均直径 (mm)',
                     'max_diameter': '最大直径 (mm)',
+                    'portal_mean_diameter': '门静脉平均直径 (mm)',
+                    'hepatic_mean_diameter': '肝静脉平均直径 (mm)',
                     'branch_count': '分支数',
+                    'portal_branch_count': '门静脉分支数',
+                    'hepatic_branch_count': '肝静脉分支数',
+                    'junction_count': '分叉点数量',
                     'vascular_density': '血管密度',
                     'surface_area': '血管表面积 (mm²)',
                     'volume_fraction': '血管体积分数',
                     'mean_branch_angle': '平均分支角度 (°)',
                     'connectivity': '血管连通性',
-                    'curvature': '血管弯曲度'
+                    'curvature': '血管弯曲度',
+                    'trunk_small_ratio': '主干/细支比例',
+                    'micro_branch_voxels': '5级+微小分支体素数',
                 }
                 
                 for key, value in metrics.items():
@@ -185,17 +150,20 @@ class ReportGenerator:
                         else:
                             metric_data.append([metric_names[key], str(value)])
                 
-                table = Table(metric_data, colWidths=[6*cm, 3*cm])
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                ]))
-                elements.append(table)
+                if metric_data:
+                    table = Table(metric_data, colWidths=[6*cm, 3*cm])
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+                        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    elements.append(table)
+                else:
+                    elements.append(Paragraph('无可用血管量化指标', self.styles['CustomNormal']))
                 elements.append(Spacer(1, 0.5*cm))
             
             # 肿瘤-血管距离评估
@@ -228,6 +196,50 @@ class ReportGenerator:
                 elements.append(Paragraph(f'整体风险: {risk.get("overall_risk", "未知")}', self.styles['CustomNormal']))
                 elements.append(Paragraph(f'建议: {risk.get("recommendation", "无")}', self.styles['CustomNormal']))
                 elements.append(Spacer(1, 0.5*cm))
+
+            # AI血管结构识别摘要（主干/细支/分叉/5级）
+            if 'vessel_analysis' in report_data:
+                elements.append(Paragraph('AI血管结构识别摘要', self.styles['CustomSection']))
+                va = report_data['vessel_analysis']
+                for key, title in [('pv', '门静脉(PV)'), ('hv', '肝静脉(HV)')]:
+                    if key in va and isinstance(va[key], dict):
+                        item = va[key]
+                        levels = item.get('level_counts', {})
+                        txt = (
+                            f"{title}: 主干={item.get('trunk_voxel_count', 0)}, "
+                            f"细支={item.get('small_voxel_count', 0)}, "
+                            f"分叉={item.get('junction_voxel_count', 0)}, "
+                            f"5级+微小分支={levels.get('level_5_plus', 0)}"
+                        )
+                        elements.append(Paragraph(txt, self.styles['CustomNormal']))
+                elements.append(Spacer(1, 0.5*cm))
+
+            # 切割模拟统计
+            if 'cut_stats' in report_data:
+                elements.append(Paragraph('手术切割模拟', self.styles['CustomSection']))
+                cs = report_data['cut_stats']
+                if cs.get('available'):
+                    cut_data = [
+                        ['剩余肝体积', f"{cs.get('remaining_ml', 0.0):.2f} ml"],
+                        ['切除体积', f"{cs.get('resected_ml', 0.0):.2f} ml"],
+                        ['剩余比例', f"{cs.get('remaining_ratio', 0.0) * 100:.1f}%"],
+                        ['门静脉切断预警', '是' if cs.get('severed_pv') else '否'],
+                        ['肝静脉切断预警', '是' if cs.get('severed_hv') else '否'],
+                    ]
+                else:
+                    cut_data = [['状态', '暂无可用切割体积统计']]
+                table = Table(cut_data, colWidths=[5*cm, 6*cm])
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                elements.append(table)
+                elements.append(Spacer(1, 0.5*cm))
             
             # 添加图像
             if 'images' in report_data:
@@ -238,9 +250,18 @@ class ReportGenerator:
                     elements.append(Paragraph(img_name, self.styles['CustomSection']))
                     # 将numpy数组转换为PIL图像
                     img_buffer = BytesIO()
-                    plt.imshow(img_data, cmap='gray')
+                    fig = plt.figure(figsize=(6, 4), dpi=150)
+                    if isinstance(img_data, np.ndarray) and img_data.ndim == 2:
+                        # 标签图（整数）优先彩色显示，普通影像灰度显示
+                        if np.issubdtype(img_data.dtype, np.integer) and np.max(img_data) <= 10:
+                            plt.imshow(img_data, cmap='jet', vmin=0, vmax=max(1, int(np.max(img_data))))
+                        else:
+                            plt.imshow(img_data, cmap='gray')
+                    else:
+                        plt.imshow(img_data)
                     plt.axis('off')
                     plt.savefig(img_buffer, format='png', bbox_inches='tight')
+                    plt.close(fig)
                     img_buffer.seek(0)
                     
                     # 添加图像到报告
@@ -301,16 +322,28 @@ class ReportGenerator:
             summary.append('\n血管量化指标:')
             metric_names = {
                 'vascular_volume': '血管总体积',
+                'portal_volume': '门静脉体积',
+                'hepatic_volume': '肝静脉体积',
+                'pv_hv_volume_ratio': '门/肝静脉体积比',
                 'vascular_length': '血管总长度',
+                'portal_length': '门静脉长度',
+                'hepatic_length': '肝静脉长度',
                 'mean_diameter': '平均直径',
                 'max_diameter': '最大直径',
+                'portal_mean_diameter': '门静脉平均直径',
+                'hepatic_mean_diameter': '肝静脉平均直径',
                 'branch_count': '分支数',
+                'portal_branch_count': '门静脉分支数',
+                'hepatic_branch_count': '肝静脉分支数',
+                'junction_count': '分叉点数量',
                 'vascular_density': '血管密度',
                 'surface_area': '血管表面积',
                 'volume_fraction': '血管体积分数',
                 'mean_branch_angle': '平均分支角度',
                 'connectivity': '血管连通性',
-                'curvature': '血管弯曲度'
+                'curvature': '血管弯曲度',
+                'trunk_small_ratio': '主干/细支比例',
+                'micro_branch_voxels': '5级+微小分支体素数',
             }
             for key, value in metrics.items():
                 if key in metric_names:
@@ -333,6 +366,31 @@ class ReportGenerator:
             summary.append('\n手术风险评估:')
             summary.append(f'  整体风险: {risk.get("overall_risk", "未知")}')
             summary.append(f'  建议: {risk.get("recommendation", "无")}')
+
+        # AI结构识别摘要
+        if 'vessel_analysis' in report_data:
+            va = report_data['vessel_analysis']
+            summary.append('\nAI血管结构识别:')
+            for key, title in [('pv', '门静脉(PV)'), ('hv', '肝静脉(HV)')]:
+                if key in va and isinstance(va[key], dict):
+                    item = va[key]
+                    levels = item.get('level_counts', {})
+                    summary.append(
+                        f"  {title}: 主干={item.get('trunk_voxel_count', 0)}, 细支={item.get('small_voxel_count', 0)}, "
+                        f"分叉={item.get('junction_voxel_count', 0)}, 5级+={levels.get('level_5_plus', 0)}"
+                    )
+
+        # 切割统计
+        if 'cut_stats' in report_data:
+            cs = report_data['cut_stats']
+            summary.append('\n切割模拟:')
+            if cs.get('available'):
+                summary.append(f"  剩余体积: {cs.get('remaining_ml', 0.0):.2f} ml")
+                summary.append(f"  切除体积: {cs.get('resected_ml', 0.0):.2f} ml")
+                summary.append(f"  门静脉切断预警: {'是' if cs.get('severed_pv') else '否'}")
+                summary.append(f"  肝静脉切断预警: {'是' if cs.get('severed_hv') else '否'}")
+            else:
+                summary.append("  暂无可用切割体积统计")
         
         # 结论
         summary.append('\n结论:')

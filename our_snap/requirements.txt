@@ -1,8 +1,4 @@
-# 医学影像分割软件依赖库
-# 使用清华镜像源安装
-# 安装前请确保已安装Python 3.11
-
-# 核心依赖库（必须安装）
+﻿# VesselSeg app dependencies
 numpy==2.3.5
 PyQt5==5.15.11
 nibabel==5.4.2
@@ -16,8 +12,11 @@ matplotlib==3.10.6
 nilearn
 simpleitk==2.5.3
 reportlab==4.4.10
+pyvista==0.44.1
+pyvistaqt==0.11.2
+vtk==9.3.1
 
-# 其他依赖库（根据需要安装）
+# Optional development tools
 jupyterlab==4.4.7
 notebook==7.4.5
 spyder==6.1.0

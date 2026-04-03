@@ -2,20 +2,17 @@ version: '3.8'
 
 services:
   vessel-seg:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: vessel-seg:latest
     container_name: vessel-seg
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MODEL_DIR: /app/our_snap/model
+      QT_QPA_PLATFORM: offscreen
     volumes:
       - ./data:/app/data
       - ./output:/app/output
-      - ./model:/app/model
-    environment:
-      - PYTHONUNBUFFERED=1
-      - MODEL_DIR=/app/model
-    # 如需暴露端口，取消注释以下行
-    # ports:
-    #   - "8000:8000"
-    # 如需使用GPU，取消注释以下行并安装nvidia-docker2
-    # runtime: nvidia
-    # environment:
-    #   - NVIDIA_VISIBLE_DEVICES=all
+      - ./our_snap/model:/app/our_snap/model
+    command: ["python", "our_snap/main.py"]

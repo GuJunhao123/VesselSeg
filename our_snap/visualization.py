@@ -15,6 +15,7 @@ from matplotlib.patches import Rectangle
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.colors as mcolors
+from typing import Dict, Optional, Tuple
 
 
 class SliceViewer(QWidget):
@@ -50,6 +51,8 @@ class SliceViewer(QWidget):
         self.tool_mode = 'pointer'
         self.brush_size = 3
         self.active_label_id = 1
+        self.seed_points = []
+        self.show_seed_points = True
         
         # 方向标识
         self.direction_labels = self._get_direction_labels()
@@ -189,6 +192,20 @@ class SliceViewer(QWidget):
     def set_label_data(self, label_data: np.ndarray):
         """设置标签数据"""
         self.label_data = label_data
+        self._update_display()
+
+    def set_seed_points(self, seed_points):
+        """设置种子点列表（体素坐标，格式[(x,y,z), ...]）"""
+        if seed_points is None:
+            self.seed_points = []
+        else:
+            cleaned = []
+            for p in seed_points:
+                try:
+                    cleaned.append((int(p[0]), int(p[1]), int(p[2])))
+                except Exception:
+                    continue
+            self.seed_points = cleaned
         self._update_display()
     
     def set_label_color(self, label_value: int, color: tuple):
@@ -385,6 +402,49 @@ class SliceViewer(QWidget):
             slice_label = self.label_data[:, self.current_slice, :].T
             return np.flipud(slice_label)
         return None
+
+    def _get_slice_seed_pixels(self):
+        """获取当前切片上的种子点像素坐标列表[(col, row), ...]。"""
+        if self.image_data is None or not self.seed_points:
+            return []
+
+        sx, sy, sz = self.image_data.shape  # axis0, axis1, axis2
+        points = []
+
+        if self.view_type == 'axial':
+            z = self.current_slice
+            for x, y, z0 in self.seed_points:
+                if 0 <= x < sx and 0 <= y < sy and 0 <= z0 < sz and z0 == z:
+                    # axial显示 image_data[:, :, z].T => (row=y, col=x)
+                    points.append((x, y))
+        elif self.view_type == 'coronal':
+            x_slice = self.current_slice
+            h = sz
+            for x, y, z0 in self.seed_points:
+                if 0 <= x < sx and 0 <= y < sy and 0 <= z0 < sz and x == x_slice:
+                    # coronal显示 image_data[x, :, :].T 再flipud => col=y, row=(h-1-z)
+                    points.append((y, h - 1 - z0))
+        elif self.view_type == 'sagittal':
+            y_slice = self.current_slice
+            h = sz
+            for x, y, z0 in self.seed_points:
+                if 0 <= x < sx and 0 <= y < sy and 0 <= z0 < sz and y == y_slice:
+                    # sagittal显示 image_data[:, y, :].T 再flipud => col=x, row=(h-1-z)
+                    points.append((x, h - 1 - z0))
+
+        return points
+
+    def _get_slice_spacing_xy(self):
+        """返回当前2D切片显示坐标系下的(x_spacing, y_spacing)。"""
+        if self.image_spacing is None:
+            return 1.0, 1.0
+        if self.view_type == 'axial':
+            return float(self.image_spacing[1]), float(self.image_spacing[0])
+        if self.view_type == 'coronal':
+            return float(self.image_spacing[1]), float(self.image_spacing[2])
+        if self.view_type == 'sagittal':
+            return float(self.image_spacing[1]), float(self.image_spacing[2])
+        return 1.0, 1.0
     
     def _update_display(self):
         """更新显示"""
@@ -507,6 +567,30 @@ class SliceViewer(QWidget):
                 else:
                     self.ax.imshow(label_colored, interpolation='antialiased', origin='upper',
                                   aspect='equal', rasterized=False)
+
+        # 绘制种子点高亮（青绿色环 + 黄色中心）
+        if self.show_seed_points:
+            seed_px = self._get_slice_seed_pixels()
+            if seed_px:
+                spacing_x, spacing_y = self._get_slice_spacing_xy()
+                xs = np.array([p[0] * spacing_x for p in seed_px], dtype=np.float32)
+                ys = np.array([p[1] * spacing_y for p in seed_px], dtype=np.float32)
+                self.ax.scatter(
+                    xs, ys,
+                    s=64,
+                    facecolors='none',
+                    edgecolors='#00ffd9',
+                    linewidths=1.8,
+                    zorder=12
+                )
+                self.ax.scatter(
+                    xs, ys,
+                    s=22,
+                    c='#ffe600',
+                    edgecolors='black',
+                    linewidths=0.6,
+                    zorder=13
+                )
         
         # 绘制十字线：蓝色虚线 + 绿色方块交叉点
         # 注意：crosshair_x和crosshair_y是像素坐标，需要转换为物理坐标
@@ -1172,11 +1256,13 @@ class ThreeDViewer(QWidget):
         super().__init__(parent)
         self.image_data = None
         self.label_data = None
-        
+        self.image_spacing = None
+        self.structure_data = None
+
         self.crosshair_3d = [0, 0, 0]
         self.setMinimumSize(300, 300)
         self.setStyleSheet("background-color: black;")
-        
+
         size_policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         size_policy.setHeightForWidth(True)
         self.setSizePolicy(size_policy)
@@ -1188,7 +1274,17 @@ class ThreeDViewer(QWidget):
         except ImportError as e:
             self.use_pyvista = False
             print(f"警告：PyVista/PyVistaQt不可用，将使用matplotlib作为备选: {e}")
-        
+
+        # 渲染缓存：避免每次刷新都重新做marching cubes
+        self._mesh_cache_signature = None
+        self._mesh_cache: Dict[int, object] = {}
+        self._mesh_max_cells = 120000
+
+        # 当前切割平面状态
+        self.clip_planes = []
+        self.active_clip_plane: Optional[Dict[str, object]] = None
+        self.last_cut_stats: Dict[str, object] = {}
+
         self._init_ui()
     
     def _init_ui(self):
@@ -1253,19 +1349,284 @@ class ThreeDViewer(QWidget):
         
         # 3D交互模式（默认启用旋转，这样用户可以拖动视图）
         self.interaction_mode = 'rotate'  # 'pointer', 'rotate', 'pan', 'zoom', 'clip'
-        self.clip_planes = []  # 裁剪平面列表
-        
+
         self.setLayout(layout)
-    
+
+    def _normalize_spacing(self) -> Tuple[float, float, float]:
+        """返回(x, y, z)方向spacing，默认(1,1,1)。"""
+        if self.image_spacing is None or len(self.image_spacing) < 3:
+            return 1.0, 1.0, 1.0
+        try:
+            sx = float(self.image_spacing[0])
+            sy = float(self.image_spacing[1])
+            sz = float(self.image_spacing[2])
+            return sx if sx > 0 else 1.0, sy if sy > 0 else 1.0, sz if sz > 0 else 1.0
+        except Exception:
+            return 1.0, 1.0, 1.0
+
+    def _spacing_xyz_for_pyvista(self) -> Tuple[float, float, float]:
+        """
+        返回PyVista坐标系的spacing:
+        PyVista(x, y, z) <=> numpy(axis2, axis1, axis0)
+        """
+        sx, sy, sz = self._normalize_spacing()
+        return sz, sy, sx
+
+    def _label_signature(self) -> Tuple:
+        """轻量级签名，用于判断label是否变化。"""
+        if self.label_data is None:
+            return ("none",)
+        label = self.label_data
+        return (
+            label.shape,
+            int(np.count_nonzero(label)),
+            int(np.sum(label, dtype=np.int64)),
+            tuple(np.unique(label)[:8].tolist()),
+            tuple(round(v, 4) for v in self._normalize_spacing()),
+        )
+
+    def _invalidate_mesh_cache(self):
+        self._mesh_cache_signature = None
+        self._mesh_cache = {}
+
+    def get_volume_center(self) -> Tuple[float, float, float]:
+        """获取当前体数据中心（PyVista坐标系）。"""
+        if self.image_data is None:
+            return 0.0, 0.0, 0.0
+        h, w, d = self.image_data.shape
+        sx, sy, sz = self._normalize_spacing()
+        # PyVista: x<-d, y<-w, z<-h
+        return (d * sz * 0.5, w * sy * 0.5, h * sx * 0.5)
+
+    def _volume_bounds(self) -> Tuple[float, float, float, float, float, float]:
+        """当前体数据包围盒（PyVista坐标系）。"""
+        if self.image_data is None:
+            return (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+        h, w, d = self.image_data.shape
+        sx, sy, sz = self._normalize_spacing()
+        return (0.0, d * sz, 0.0, w * sy, 0.0, h * sx)
+
+    def _extract_surface_mesh(self, label_id: int):
+        """提取指定标签的等值面（带ROI裁剪+可选降面）。"""
+        if self.label_data is None:
+            return None
+        mask = (self.label_data == label_id)
+        return self._extract_surface_mesh_from_mask(mask)
+
+    def _extract_surface_mesh_from_mask(self, mask: np.ndarray):
+        """从二值mask提取等值面。"""
+        if not np.any(mask):
+            return None
+
+        coords = np.argwhere(mask)
+        min_h, min_w, min_d = coords.min(axis=0)
+        max_h, max_w, max_d = coords.max(axis=0)
+
+        pad = 1
+        h0 = max(int(min_h) - pad, 0)
+        w0 = max(int(min_w) - pad, 0)
+        d0 = max(int(min_d) - pad, 0)
+        h1 = min(int(max_h) + pad + 1, self.label_data.shape[0])
+        w1 = min(int(max_w) + pad + 1, self.label_data.shape[1])
+        d1 = min(int(max_d) + pad + 1, self.label_data.shape[2])
+
+        roi = mask[h0:h1, w0:w1, d0:d1].astype(np.uint8)
+        if roi.size == 0 or np.count_nonzero(roi) < 8:
+            return None
+
+        import pyvista as pv
+        # numpy(H,W,D) -> pv(X,Y,Z): (D,W,H)
+        roi_xyz = np.transpose(roi, (2, 1, 0))
+        grid = pv.ImageData()
+        grid.dimensions = roi_xyz.shape
+        grid.spacing = self._spacing_xyz_for_pyvista()
+
+        sx, sy, sz = self._normalize_spacing()
+        # 对应PyVista坐标: x<-d, y<-w, z<-h
+        grid.origin = (d0 * sz, w0 * sy, h0 * sx)
+        grid["values"] = roi_xyz.flatten(order="F")
+
+        mesh = grid.contour([0.5])
+        if mesh is None or mesh.n_points == 0:
+            return None
+
+        # 大模型降面，提升渲染性能
+        n_cells = int(getattr(mesh, "n_cells", 0))
+        if n_cells > self._mesh_max_cells:
+            reduction = 1.0 - (self._mesh_max_cells / float(max(n_cells, 1)))
+            reduction = max(0.0, min(0.95, reduction))
+            try:
+                mesh = mesh.decimate_pro(reduction, preserve_topology=True)
+            except Exception:
+                pass
+
+        return mesh
+
+    def _mesh_style(self, label_id: int) -> Dict[str, object]:
+        # 按需求：PV红色、HV蓝色
+        if label_id == 1:
+            return {"name": "PV", "color": "#ff4d4f", "opacity": 0.92}
+        if label_id == 2:
+            return {"name": "HV", "color": "#4096ff", "opacity": 0.88}
+        return {"name": f"Label-{label_id}", "color": "#ff9f1a", "opacity": 0.85}
+
+    def _get_mesh_bundle(self) -> Dict[int, object]:
+        """按标签生成/复用mesh缓存。"""
+        signature = self._label_signature()
+        if signature == self._mesh_cache_signature and self._mesh_cache:
+            return self._mesh_cache
+
+        meshes: Dict[int, object] = {}
+        if self.use_pyvista and self.label_data is not None and np.any(self.label_data > 0):
+            for label_id in (1, 2):
+                mesh = self._extract_surface_mesh(label_id)
+                if mesh is not None:
+                    meshes[label_id] = mesh
+            # 若1/2没有数据，兜底展示非零总mask
+            if not meshes:
+                tmp = np.where(self.label_data > 0, 1, 0).astype(np.uint8)
+                backup = self.label_data
+                try:
+                    self.label_data = tmp
+                    mesh = self._extract_surface_mesh(1)
+                    if mesh is not None:
+                        meshes[99] = mesh
+                finally:
+                    self.label_data = backup
+
+        self._mesh_cache_signature = signature
+        self._mesh_cache = meshes
+        return meshes
+
     def set_image_data(self, image_data: np.ndarray, spacing=None):
         """设置图像数据：不自动更新，只在refresh_view时更新"""
         self.image_data = image_data
         self.image_spacing = spacing  # 保存spacing信息用于正确的3D比例
-    
+        # 影像变化通常意味着尺度或空间变化，清缓存更安全
+        self._invalidate_mesh_cache()
+
     def set_label_data(self, label_data: np.ndarray):
         """设置标签数据：不自动更新，只在refresh_view时更新"""
         self.label_data = label_data
-    
+        self._invalidate_mesh_cache()
+
+    def set_structure_data(self, structure_data: Optional[np.ndarray]):
+        """
+        设置血管结构分解图：
+        0背景, 1主干, 2细分支, 3分叉点。
+        """
+        self.structure_data = structure_data
+
+    def compute_cut_statistics(self, normal, origin) -> Dict[str, object]:
+        """
+        计算平面切割统计（基于体素）：
+        - 剩余体积/切除体积（优先使用label=3作为肝脏，若不存在则回退到非零标签）
+        - 是否切断PV/HV（切面两侧都有该血管体素）
+        """
+        result: Dict[str, object] = {
+            "available": False,
+            "source": "none",
+            "remaining_ml": 0.0,
+            "resected_ml": 0.0,
+            "total_ml": 0.0,
+            "remaining_ratio": 0.0,
+            "resected_ratio": 0.0,
+            "severed_pv": False,
+            "severed_hv": False,
+            "pv_cut_voxels": 0,
+            "hv_cut_voxels": 0,
+        }
+        if self.label_data is None:
+            return result
+
+        n = np.asarray(normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm < 1e-8:
+            return result
+        n = n / n_norm
+        o = np.asarray(origin, dtype=np.float64)
+        plane_offset = float(np.dot(n, o))
+
+        sx, sy, sz = self._normalize_spacing()
+        voxel_ml = (sx * sy * sz) / 1000.0
+
+        # 优先使用标签3（若用户有肝脏标签），否则回退非零标签
+        if np.any(self.label_data == 3):
+            target_mask = (self.label_data == 3)
+            result["source"] = "label_3_liver"
+        elif np.any(self.label_data > 0):
+            target_mask = (self.label_data > 0)
+            result["source"] = "nonzero_label_proxy"
+        else:
+            target_mask = None
+
+        if target_mask is not None and np.any(target_mask):
+            coords = np.argwhere(target_mask)
+            # PyVista坐标: x<-axis2, y<-axis1, z<-axis0
+            px = coords[:, 2].astype(np.float64) * sz
+            py = coords[:, 1].astype(np.float64) * sy
+            pz = coords[:, 0].astype(np.float64) * sx
+            signed = n[0] * px + n[1] * py + n[2] * pz - plane_offset
+
+            keep = signed <= 0.0
+            cut = ~keep
+            keep_count = int(np.count_nonzero(keep))
+            cut_count = int(np.count_nonzero(cut))
+            total = keep_count + cut_count
+
+            result["available"] = True
+            result["remaining_ml"] = keep_count * voxel_ml
+            result["resected_ml"] = cut_count * voxel_ml
+            result["total_ml"] = total * voxel_ml
+            if total > 0:
+                result["remaining_ratio"] = keep_count / total
+                result["resected_ratio"] = cut_count / total
+
+        def _calc_vessel_cut(label_id: int):
+            vessel = (self.label_data == label_id)
+            if not np.any(vessel):
+                return False, 0
+            coords = np.argwhere(vessel)
+            px = coords[:, 2].astype(np.float64) * sz
+            py = coords[:, 1].astype(np.float64) * sy
+            pz = coords[:, 0].astype(np.float64) * sx
+            signed = n[0] * px + n[1] * py + n[2] * pz - plane_offset
+            on_a = int(np.count_nonzero(signed <= 0.0))
+            on_b = int(np.count_nonzero(signed > 0.0))
+            return (on_a > 0 and on_b > 0), min(on_a, on_b)
+
+        pv_cut, pv_vox = _calc_vessel_cut(1)
+        hv_cut, hv_vox = _calc_vessel_cut(2)
+        result["severed_pv"] = pv_cut
+        result["severed_hv"] = hv_cut
+        result["pv_cut_voxels"] = pv_vox
+        result["hv_cut_voxels"] = hv_vox
+        self.last_cut_stats = result
+        return result
+
+    def set_clip_plane(self, normal=(1.0, 0.0, 0.0), origin=None, apply_to_mesh=True):
+        """设置/更新单个切割平面，并返回切割统计。"""
+        n = np.asarray(normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(n))
+        if n_norm < 1e-8:
+            n = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            n_norm = 1.0
+        n = (n / n_norm).tolist()
+
+        if origin is None:
+            origin = list(self.get_volume_center())
+        else:
+            origin = [float(origin[0]), float(origin[1]), float(origin[2])]
+
+        self.active_clip_plane = {
+            "normal": tuple(n),
+            "origin": tuple(origin),
+            "apply_to_mesh": bool(apply_to_mesh),
+        }
+        stats = self.compute_cut_statistics(n, origin)
+        self.refresh_view()
+        return stats
+
     def set_crosshair_3d(self, x: int, y: int, z: int):
         """设置3D十字准心位置"""
         self.crosshair_3d = [x, y, z]
@@ -1284,223 +1645,159 @@ class ThreeDViewer(QWidget):
             self._update_3d_view_matplotlib()
     
     def _update_3d_view_vtk(self):
-        """使用VTK/PyVista更新3D视图"""
+        """使用VTK/PyVista更新3D视图（分标签渲染 + 切割平面模拟 + 缓存）。"""
         import pyvista as pv
-        
-        # 清除之前的actor
+
         self.plotter.clear()
-        self.plotter.background_color = 'black'  # 黑色背景
-        
-        # 启用阴影和光照效果
-        # 使用简化的方法避免OpenGL shader错误，同时增强阴影深度
-        try:
-            # 方法1：使用PyVista的高级API（最兼容）
-            self.plotter.enable_shadows()
-            
-            # 尝试调整阴影参数以增强阴影深度
-            try:
-                renderer = self.plotter.renderer
-                # 设置阴影相关参数（如果支持）
-                if hasattr(renderer, 'SetUseShadows'):
-                    renderer.SetUseShadows(True)
-                # 尝试设置阴影偏移和分辨率（增强阴影对比度）
-                if hasattr(renderer, 'SetShadowMapResolution'):
-                    renderer.SetShadowMapResolution(2048)  # 提高阴影分辨率，使阴影更清晰
-                if hasattr(renderer, 'SetShadowBias'):
-                    renderer.SetShadowBias(0.001)  # 减小阴影偏移，使阴影更贴近物体
-            except:
-                pass  # 如果设置失败，继续使用默认阴影
-        except:
-            try:
-                # 方法2：使用VTK底层API
-                renderer = self.plotter.renderer
-                if hasattr(renderer, 'SetUseShadows'):
-                    renderer.SetUseShadows(True)
-            except Exception as e:
-                pass  # 静默失败，避免输出过多警告
-        
-        # 添加光源：头灯跟随视角（像拿着手电筒），辅以极弱填充光
-        try:
-            # 清除默认光源
-            self.plotter.renderer.RemoveAllLights()
-            
-            # 头灯：始终和摄像机同方向，模拟手电筒照射当前视角
-            head_light = pv.Light(light_type='headlight')
-            head_light.intensity = 1.1  # 视角方向的主光
-            self.plotter.add_light(head_light)
-            
-            # 极弱填充光：仅防止完全漆黑的背面，不影响阴影方向感
-            fill_light = pv.Light(position=(0, 0, -1), focal_point=(0, 0, 0),
-                                  color='white', intensity=0.08)
-            fill_light.positional = False
-            self.plotter.add_light(fill_light)
-            
-        except Exception as e:
-            print(f"警告：添加光源失败: {e}，使用默认光源")
-        
-        # 不添加地面平面（只有3D模型，没有地面）
-        
+        self.plotter.background_color = "black"
+
         if self.image_data is None:
             self.view_updated.emit()
             return
-        
-        # 获取图像尺寸
-        h, w, d = self.image_data.shape
-        
-        # 显示标签的3D表面（如果有标签数据）
-        if self.label_data is not None and np.any(self.label_data > 0):
+
+        # 光照：兼容优先
+        try:
+            self.plotter.renderer.RemoveAllLights()
+            head = pv.Light(light_type="headlight")
+            head.intensity = 1.0
+            self.plotter.add_light(head)
+            fill = pv.Light(position=(0, 0, -1), focal_point=(0, 0, 0), color="white", intensity=0.1)
+            fill.positional = False
+            self.plotter.add_light(fill)
+        except Exception:
+            pass
+
+        meshes = self._get_mesh_bundle()
+        for label_id, mesh in meshes.items():
+            style = self._mesh_style(label_id)
+            render_mesh = mesh
+
+            # 若启用切割模拟，使用平面实时裁剪模型
+            if self.active_clip_plane and self.active_clip_plane.get("apply_to_mesh"):
+                try:
+                    render_mesh = mesh.clip(
+                        normal=self.active_clip_plane["normal"],
+                        origin=self.active_clip_plane["origin"],
+                        invert=False,
+                    )
+                except Exception:
+                    render_mesh = mesh
+
             try:
-                # 使用PyVista直接处理3D数据
-                # PyVista可以高效处理大型数据，自动优化渲染
-                label_binary = (self.label_data > 0).astype(np.uint8)
-                
-                # 创建PyVista ImageData（直接从numpy数组）
-                # PyVista使用(x, y, z)顺序，需要转置numpy的(z, y, x)顺序
-                # 转置：从(z, y, x)到(x, y, z)
-                label_transposed = np.transpose(label_binary, (2, 1, 0))
-                
-                # 创建ImageData（UniformGrid的新名称）
-                grid = pv.ImageData()
-                grid.dimensions = label_transposed.shape
-                
-                # 使用正确的spacing信息（如果可用），否则使用1.0
-                # 注意：label_transposed是(x, y, z)顺序，spacing也需要对应
-                # 原始spacing是(spacing_x, spacing_y, spacing_z)，对应numpy的(z, y, x)
-                # 转置后是(x, y, z)，所以spacing应该是(spacing_z, spacing_y, spacing_x)
-                if self.image_spacing is not None:
-                    # image_spacing是(spacing_x, spacing_y, spacing_z)，对应(z, y, x)
-                    # 转置后是(x, y, z)，所以需要反转：spacing = (spacing_z, spacing_y, spacing_x)
-                    spacing_xyz = (self.image_spacing[2], self.image_spacing[1], self.image_spacing[0])
-                    grid.spacing = spacing_xyz
-                else:
-                    grid.spacing = (1.0, 1.0, 1.0)
-                    print("警告：未提供spacing信息，使用默认值(1.0, 1.0, 1.0)")
-                
-                grid.origin = (0.0, 0.0, 0.0)
-                grid['values'] = label_transposed.flatten(order='F')  # Fortran顺序
-                
-                # 使用contour提取等值面
-                # PyVista的contour使用VTK的marching cubes，性能优异
-                mesh = grid.contour([0.5])  # 提取0.5等值面
-                
-                if mesh.n_points > 0:
-                    # 红色表面，完全不透明，启用阴影和光照
-                    # 使用简化的渲染设置，但保留阴影效果
-                    try:
-                        # 使用基本设置添加mesh，启用光照（阴影需要光照）
-                        # 关键：不使用show_edges，不使用line_width，避免EdgesGLES30错误
-                        actor = self.plotter.add_mesh(
-                            mesh, 
-                            color='red', 
-                            opacity=1.0,  # 完全不透明
-                            show_edges=False,  # 禁用边缘显示（避免EdgesGLES30错误）
-                            lighting=True  # 启用光照（阴影需要光照）
-                        )
-                        
-                        # 设置材质属性以启用阴影和双面光照
+                self.plotter.add_mesh(
+                    render_mesh,
+                    color=style["color"],
+                    opacity=style["opacity"],
+                    show_edges=False,
+                    lighting=True,
+                    name=f"mesh_{style['name']}",
+                )
+            except Exception:
+                # 兼容性兜底
+                try:
+                    self.plotter.add_mesh(
+                        render_mesh,
+                        color=style["color"],
+                        opacity=min(float(style["opacity"]), 0.85),
+                        lighting=False,
+                        name=f"mesh_{style['name']}",
+                    )
+                except Exception as e:
+                    print(f"警告：渲染{style['name']}失败: {e}")
+
+        # 结构差异化显示（主干/分叉点）
+        if (
+            self.structure_data is not None
+            and self.label_data is not None
+            and self.structure_data.shape == self.label_data.shape
+        ):
+            try:
+                # 主干叠加（更亮、更高不透明）
+                trunk_styles = {
+                    1: {"color": "#ff0000", "opacity": 0.98, "name": "pv_trunk"},
+                    2: {"color": "#005eff", "opacity": 0.98, "name": "hv_trunk"},
+                }
+                for label_id in (1, 2):
+                    trunk_mask = (self.label_data == label_id) & (self.structure_data == 1)
+                    if np.any(trunk_mask):
+                        trunk_mesh = self._extract_surface_mesh_from_mask(trunk_mask)
+                        if trunk_mesh is not None:
+                            ts = trunk_styles[label_id]
+                            try:
+                                self.plotter.add_mesh(
+                                    trunk_mesh,
+                                    color=ts["color"],
+                                    opacity=ts["opacity"],
+                                    show_edges=False,
+                                    lighting=True,
+                                    name=ts["name"],
+                                )
+                            except Exception:
+                                pass
+
+                # 分叉点高亮（黄色）
+                junc_mask = (self.structure_data == 3) & (self.label_data > 0)
+                if np.any(junc_mask):
+                    junc_mesh = self._extract_surface_mesh_from_mask(junc_mask)
+                    if junc_mesh is not None:
                         try:
-                            if hasattr(actor, 'GetProperty'):
-                                prop = actor.GetProperty()
-                                # 启用双面光照（背面也能看清）
-                                prop.SetBackfaceCulling(False)  # 禁用背面剔除
-                                
-                                # 设置光照属性（深阴影，清晰结构）
-                                try:
-                                    # 降低环境光和漫反射，增强阴影对比度
-                                    # 让阴影更深，结构更清晰
-                                    prop.SetDiffuse(0.6)  # 降低漫反射，增强阴影对比度
-                                    prop.SetAmbient(0.2)  # 大幅降低环境光，让阴影更深
-                                    prop.SetSpecular(0.3)  # 增加镜面反射，增强结构细节
-                                    prop.SetSpecularPower(20)  # 提高镜面反射锐度，增强细节
-                                except:
-                                    pass  # 如果设置失败，继续使用默认光照
-                                
-                                # 尝试启用阴影（如果系统支持）
-                                try:
-                                    # 注意：阴影可能需要额外的渲染器设置
-                                    if hasattr(prop, 'SetReceiveShadows'):
-                                        prop.SetReceiveShadows(True)
-                                    if hasattr(prop, 'SetCastShadows'):
-                                        prop.SetCastShadows(True)
-                                except:
-                                    pass  # 阴影设置失败不影响基本渲染
+                            self.plotter.add_mesh(
+                                junc_mesh,
+                                color="#ffd400",
+                                opacity=1.0,
+                                show_edges=False,
+                                lighting=True,
+                                name="junction_highlight",
+                            )
                         except Exception:
-                            # 材质设置失败不影响基本渲染
                             pass
-                        
-                    except Exception as e:
-                        # 如果启用光照失败，尝试无光照模式
-                        print(f"警告：启用光照失败，尝试无光照模式: {e}")
-                        try:
-                            # 降级到无光照模式
-                            self.plotter.add_mesh(mesh, color='red', opacity=0.8, show_edges=False, lighting=False)
-                        except Exception as e2:
-                            print(f"错误：渲染完全失败: {e2}")
-                            # 如果还是失败，跳过这个mesh
-                            pass
-                else:
-                    print("警告：未提取到表面")
-                    
             except Exception as e:
-                print(f"VTK渲染失败：{e}")
-                import traceback
-                traceback.print_exc()
-        
-        # 绘制坐标轴（蓝色）和原点（绿色）
-        origin = [0, 0, 0]
-        axis_length = min(h, w, d) * 0.3
-        
-        # X轴（蓝色）- 使用基本设置，避免shader错误（不使用line_width参数）
-        try:
-            x_axis = pv.Line(origin, [axis_length, 0, 0])
-            self.plotter.add_mesh(x_axis, color='blue', lighting=False)  # 移除line_width避免shader错误
-        except Exception as e:
-            print(f"警告：添加X轴失败: {e}")
-        
-        # Y轴（蓝色）- 使用基本设置，避免shader错误（不使用line_width参数）
-        try:
-            y_axis = pv.Line(origin, [0, axis_length, 0])
-            self.plotter.add_mesh(y_axis, color='blue', lighting=False)  # 移除line_width避免shader错误
-        except Exception as e:
-            print(f"警告：添加Y轴失败: {e}")
-        
-        # Z轴（蓝色）- 使用基本设置，避免shader错误（不使用line_width参数）
-        try:
-            z_axis = pv.Line(origin, [0, 0, axis_length])
-            self.plotter.add_mesh(z_axis, color='blue', lighting=False)  # 移除line_width避免shader错误
-        except Exception as e:
-            print(f"警告：添加Z轴失败: {e}")
-        
-        # 原点（绿色方块）- 使用基本设置，避免shader错误
-        origin_marker = pv.Sphere(radius=axis_length*0.05, center=origin)
-        self.plotter.add_mesh(origin_marker, color='#00FF00', lighting=False)  # 禁用光照和smooth_shading避免shader错误
-        
-        # 设置相机（等轴测视图，正交投影）
-        self.plotter.camera_position = 'iso'
-        self.plotter.camera.parallel_projection = True
-        
-        # 设置坐标轴标签（白色）- 使用try-except避免shader错误（不使用line_width参数）
-        try:
-            # 不使用line_width参数，避免EdgesGLES30 shader错误
-            self.plotter.add_axes(labels_off=False)
-        except Exception as e:
-            print(f"警告：添加坐标轴失败（可能由于OpenGL兼容性问题）: {e}")
-            # 如果add_axes失败，尝试使用更简单的设置
+                print(f"警告：结构差异化显示失败: {e}")
+
+        # 切割平面可视化
+        self.clip_planes = []
+        if self.active_clip_plane:
             try:
-                self.plotter.add_axes(labels_off=True)  # 只显示轴线，不显示标签
-            except:
-                pass  # 如果还是失败，跳过坐标轴显示
-        
-        # 绘制3D十字准心（三条线）
+                bounds = self._volume_bounds()
+                extent = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4])
+                plane = pv.Plane(
+                    center=self.active_clip_plane["origin"],
+                    direction=self.active_clip_plane["normal"],
+                    i_size=extent * 1.2,
+                    j_size=extent * 1.2,
+                )
+                actor = self.plotter.add_mesh(
+                    plane,
+                    color="#00d3b8",
+                    opacity=0.28,
+                    lighting=False,
+                    name="surgical_plane",
+                )
+                self.clip_planes.append(
+                    {
+                        "plane": plane,
+                        "actor": actor,
+                        "normal": self.active_clip_plane["normal"],
+                        "origin": self.active_clip_plane["origin"],
+                    }
+                )
+            except Exception as e:
+                print(f"警告：切割平面渲染失败: {e}")
+
+        # 坐标系与相机
+        try:
+            self.plotter.add_axes(labels_off=False)
+        except Exception:
+            try:
+                self.plotter.add_axes(labels_off=True)
+            except Exception:
+                pass
+
+        self.plotter.camera_position = "iso"
+        self.plotter.camera.parallel_projection = True
+
         self._update_crosshair_display()
-        
-        # 设置默认交互模式（默认启用旋转，这样用户可以拖动视图）
-        if hasattr(self, 'interaction_mode'):
-            self.set_interaction_mode(self.interaction_mode)
-        else:
-            # 如果没有设置，默认启用旋转模式
-            self.set_interaction_mode('rotate')
-        
+        self.set_interaction_mode(self.interaction_mode if hasattr(self, "interaction_mode") else "rotate")
         self.view_updated.emit()
     
     def _update_crosshair_display(self):
@@ -1675,85 +1972,16 @@ class ThreeDViewer(QWidget):
             print(f"设置3D交互模式失败: {e}")
     
     def add_clip_plane(self, normal=(1, 0, 0), origin=(0, 0, 0)):
-        """添加裁剪平面"""
-        if not hasattr(self, 'plotter') or self.plotter is None:
-            return
-        
-        try:
-            import pyvista as pv
-            
-            # 创建裁剪平面
-            plane = pv.Plane(center=origin, direction=normal, i_size=1000, j_size=1000)
-            
-            # 添加到plotter - 使用最基本的设置避免shader错误
-            try:
-                actor = self.plotter.add_mesh(
-                    plane, 
-                    color='yellow', 
-                    opacity=0.3, 
-                    name='clip_plane',
-                    lighting=False  # 禁用光照避免shader错误
-                )
-            except Exception as e1:
-                print(f"警告：添加裁剪平面mesh失败: {e1}")
-                # 如果失败，尝试更简单的设置
-                try:
-                    actor = self.plotter.add_mesh(plane, color='yellow', opacity=0.3)
-                except Exception as e2:
-                    print(f"错误：添加裁剪平面完全失败: {e2}")
-                    return
-            
-            # 保存到列表
-            if not hasattr(self, 'clip_planes'):
-                self.clip_planes = []
-            self.clip_planes.append({
-                'plane': plane,
-                'actor': actor,
-                'normal': normal,
-                'origin': origin
-            })
-            
-            # 更新显示
-            try:
-                self.plotter.render()
-            except Exception as e:
-                print(f"警告：渲染裁剪平面失败: {e}")
-        except Exception as e:
-            print(f"添加裁剪平面失败: {e}")
+        """添加/更新切割平面，默认应用到模型裁剪。"""
+        return self.set_clip_plane(normal=normal, origin=origin, apply_to_mesh=True)
     
     def remove_clip_planes(self):
         """移除所有裁剪平面"""
-        if not hasattr(self, 'plotter') or self.plotter is None:
-            return
-        
-        try:
-            if not hasattr(self, 'clip_planes') or not self.clip_planes:
-                return
-            
-            # 移除所有裁剪平面
-            for clip_plane in self.clip_planes:
-                # 尝试移除actor（如果存在）
-                if 'actor' in clip_plane:
-                    try:
-                        self.plotter.remove_actor(clip_plane['actor'])
-                    except:
-                        pass
-                # 也尝试移除plane（向后兼容）
-                elif 'plane' in clip_plane:
-                    try:
-                        self.plotter.remove_actor(clip_plane['plane'])
-                    except:
-                        pass
-            
-            self.clip_planes.clear()
-            
-            # 更新显示
-            try:
-                self.plotter.render()
-            except Exception as e:
-                print(f"警告：移除裁剪平面后渲染失败: {e}")
-        except Exception as e:
-            print(f"移除裁剪平面失败: {e}")
+        self.active_clip_plane = None
+        self.clip_planes = []
+        self.last_cut_stats = {}
+        if self.use_pyvista:
+            self.refresh_view()
     
     def _update_3d_view_matplotlib(self):
         """使用matplotlib更新3D视图（备选方案）"""
@@ -1854,6 +2082,7 @@ class FourViewWidget(QWidget):
         self.image_data = None
         self.label_data = None
         self.image_spacing = None  # 保存spacing信息
+        self.seed_points = []
         
         # 当前十字线位置（3D空间坐标）
         self.crosshair_3d = [0, 0, 0]  # [x, y, z]
@@ -2091,6 +2320,7 @@ class FourViewWidget(QWidget):
         self.coronal_view.set_image_data(image_data, spacing)
         self.sagittal_view.set_image_data(image_data, spacing)
         self.view_3d.set_image_data(image_data, spacing)
+        self.set_seed_points(self.seed_points)
         
             # 初始化十字线到中心，并同步所有视图
         if image_data is not None:
@@ -2136,6 +2366,13 @@ class FourViewWidget(QWidget):
             # 3D视图不自动更新（需要手动点击Update按钮）
         # 只设置数据，不触发更新，避免卡顿
         self.view_3d.set_label_data(label_data)
+
+    def set_seed_points(self, seed_points):
+        """向三个2D视图同步种子点高亮。"""
+        self.seed_points = list(seed_points) if seed_points is not None else []
+        self.axial_view.set_seed_points(self.seed_points)
+        self.coronal_view.set_seed_points(self.seed_points)
+        self.sagittal_view.set_seed_points(self.seed_points)
     
     def set_window(self, window_width: float, window_level: float):
         """设置窗宽窗位（所有视图）"""

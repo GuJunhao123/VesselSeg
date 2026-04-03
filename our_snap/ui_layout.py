@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QLineEdit,
     QSizePolicy, QDialog, QFormLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QInputDialog, QTextEdit, QSplitter, QScrollArea,
-    QFrame
+    QFrame, QApplication
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QFont
@@ -70,6 +70,17 @@ class SegmentationWorker(QThread):
                     iterations=self.params['iterations'],
                     smoothness=self.params['smoothness'],
                     edge_weight=self.params['edge_weight']
+                )
+
+            # 兜底：若主算法输出为空，自动尝试一轮更稳健的region competition
+            if mask is None or not np.any(mask):
+                fallback_iters = max(int(self.params.get('iterations', 100)), 120)
+                fallback_smooth = max(float(self.params.get('smoothness', 1.0)), 1.0)
+                fallback_expand = max(float(self.params.get('expansion_force', 1.0)), 1.2)
+                mask = self.algorithm.region_competition(
+                    iterations=fallback_iters,
+                    smoothness=fallback_smooth,
+                    expansion_force=fallback_expand
                 )
 
             self.finished.emit(mask)
@@ -367,6 +378,11 @@ class MainWindow(QMainWindow):
         self.seed_points = []
         self.label_list = []  # 标签列表
         self.active_label_id = 1  # 活动标签ID
+        self.ai_model_variant = 'mobileuvit_l'
+        self.ai_decomposition_method = 'percentile_50'
+        self.last_vessel_analysis = {}
+        self.last_cut_stats = {}
+        self._last_seed = None
 
         # 当前病人/检查/序列信息（从DICOM或数据库获取）
         self.current_patient_info = {}
@@ -967,6 +983,7 @@ class MainWindow(QMainWindow):
             # 从撤销栈恢复
             self.current_label_data = self.undo_history.pop()
             self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
 
     def _on_redo(self):
         """重做操作"""
@@ -981,6 +998,7 @@ class MainWindow(QMainWindow):
             # 从重做栈恢复
             self.current_label_data = self.redo_history.pop()
             self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
 
     def _on_load_label(self):
         """加载标签"""
@@ -1009,6 +1027,7 @@ class MainWindow(QMainWindow):
                         # 更新标签数据
                         self.current_label_data = label_data
                         self.four_view.set_label_data(label_data)
+                        self._refresh_structure_from_current_labels()
                         # 清空重做栈
                         self.redo_history.clear()
                         QMessageBox.information(self, "成功", "标签加载成功")
@@ -1050,6 +1069,7 @@ class MainWindow(QMainWindow):
             # 清空标签
             self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
+            self._reset_analysis_state()
             # 清空重做栈
             self.redo_history.clear()
             QMessageBox.information(self, "成功", "标签已清除")
@@ -1283,42 +1303,148 @@ class MainWindow(QMainWindow):
                 self.four_view.coronal_view.set_label_color(self.active_label_id, color_str)
                 self.four_view.sagittal_view.set_label_color(self.active_label_id, color_str)
 
-    def _on_update_3d_view_clicked(self):
-        """更新3D视图"""
+    def _on_update_3d_view_clicked(self, notify: bool = True):
+        """更新主界面内嵌3D视图。"""
         if self.current_image_data is None:
             QMessageBox.warning(self, "提示", "请先加载一张影像")
-            return
+            return False
 
-        # 检查是否有3D视图组件
-        if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
-            # 更新3D视图
-            try:
-                # 传递spacing信息给3D视图
-                spacing = getattr(self, 'current_image_spacing', None)
-                self.four_view.view_3d.set_image_data(self.current_image_data, spacing)
-                self.four_view.view_3d.set_label_data(self.current_label_data)
-                # 刷新3D视图
-                self.four_view.view_3d.refresh_view()
-                QMessageBox.information(self, "成功", "3D视图已更新")
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"更新3D视图时发生错误:\n{e}")
-        else:
-            # 提示用户3D视图功能需要额外配置
-            QMessageBox.information(self, "提示",
-                                    "3D视图功能已触发\n\n注意：完整的3D视图功能需要额外的可视化库支持（如VTK或Mayavi）。\n当前版本仅提供基本触发功能。")
-            # 实际项目中，这里应该初始化3D视图组件并调用其更新方法
+        if not (hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d')):
+            QMessageBox.warning(self, "提示", "未检测到3D视图组件，请检查可视化模块配置。")
+            return False
+
+        try:
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else None
+            self.four_view.view_3d.set_image_data(self.current_image_data, spacing)
+            self.four_view.view_3d.set_label_data(self.current_label_data)
+            structure_map = None
+            if getattr(self, 'last_vessel_analysis', None):
+                structure_map = self.last_vessel_analysis.get("structure_map")
+            self.four_view.view_3d.set_structure_data(structure_map)
+            self.four_view.view_3d.refresh_view()
+            self.statusBar().showMessage("3D视图已更新", 3000)
+            if notify:
+                QMessageBox.information(self, "成功", "3D视图已更新（左下角视窗）。")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"更新3D视图时发生错误:\n{e}")
+            return False
 
     def _on_toggle_seed_mode(self):
         """切换种子点模式"""
-        pass
+        self.seed_mode_enabled = self.btn_add_seed.isChecked()
+        if self.seed_mode_enabled:
+            # 种子点依赖点击同步十字线，强制切到指针模式避免点了无效
+            self._on_tool_selected('pointer')
+            self.btn_add_seed.setText("✅ 种子点模式开启")
+            self.btn_add_seed.setStyleSheet("background-color: #d1fae5; color: #065f46;")
+            self.statusBar().showMessage("种子点模式已开启：已切换到指针工具，请在三视图点击添加种子点", 5000)
+        else:
+            self.btn_add_seed.setText("➕ 添加种子点")
+            self.btn_add_seed.setStyleSheet("")
+            self.statusBar().showMessage("种子点模式已关闭", 2000)
 
     def _on_clear_seeds(self):
         """清除种子点"""
-        pass
+        self.seed_points = []
+        self._update_seed_count()
+        self.statusBar().showMessage("已清除全部种子点", 3000)
+        QMessageBox.information(self, "提示", "种子点已清除")
 
     def _on_segment_3d(self):
         """3D分割"""
-        pass
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像")
+            return
+
+        # 过滤并校验种子点，避免越界导致无结果
+        if self.seed_points is None:
+            self.seed_points = []
+        valid_seeds = []
+        sx, sy, sz = self.current_image_data.shape
+        for seed in self.seed_points:
+            try:
+                x, y, z = int(seed[0]), int(seed[1]), int(seed[2])
+            except Exception:
+                continue
+            if 0 <= x < sx and 0 <= y < sy and 0 <= z < sz:
+                valid_seeds.append((x, y, z))
+        # 去重保持顺序
+        valid_seeds = list(dict.fromkeys(valid_seeds))
+        self.seed_points = valid_seeds
+        self._update_seed_count()
+
+        if len(self.seed_points) == 0:
+            QMessageBox.warning(self, "提示", "请先添加至少一个种子点")
+            return
+
+        # 获取参数
+        algo_name = self.algo_combo.currentText().strip().lower()
+        method = 'region_competition' if 'region' in algo_name else 'edge_based'
+        params = {
+            'method': method,
+            'iterations': int(self.iterations_spin.value()),
+            'smoothness': float(self.smoothness_spin.value()),
+            'expansion_force': float(self.expansion_spin.value()),
+            'edge_weight': 1.0,
+        }
+
+        # 进度对话框
+        progress = QProgressDialog("正在执行3D分割，请稍候...", None, 0, 0, self)
+        progress.setWindowTitle("3D分割")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        # 后台线程执行，避免界面卡死
+        worker = SegmentationWorker(
+            algorithm=self.segmentation,
+            image_data=self.current_image_data,
+            seed_points=list(self.seed_points),
+            params=params
+        )
+        self._segment_worker = worker
+
+        worker.finished.connect(lambda mask: self._on_segment_3d_finished(mask, progress))
+        worker.error.connect(lambda err: self._on_segment_3d_error(err, progress))
+        worker.start()
+
+    def _on_segment_3d_finished(self, mask, progress_dialog: QProgressDialog):
+        """3D分割完成回调"""
+        progress_dialog.close()
+        if mask is None or not np.any(mask):
+            QMessageBox.warning(self, "提示", "3D分割未得到有效结果")
+            self.statusBar().showMessage("3D分割完成，但无有效区域", 3000)
+            return
+
+        # 保存撤销历史
+        if self.current_label_data is not None:
+            self.undo_history.append(np.copy(self.current_label_data))
+            if len(self.undo_history) > self.max_history_size:
+                self.undo_history.pop(0)
+            self.redo_history.clear()
+
+        label_id = int(self.active_label_id) if hasattr(self, 'active_label_id') else 1
+        updated = np.copy(self.current_label_data) if self.current_label_data is not None else np.zeros_like(mask, dtype=np.uint8)
+        updated[mask > 0] = label_id
+        self.current_label_data = updated
+        self.four_view.set_label_data(updated)
+        self._refresh_structure_from_current_labels()
+
+        self.statusBar().showMessage("3D分割完成", 3000)
+        QMessageBox.information(
+            self,
+            "3D分割完成",
+            f"已完成3D分割并写入当前标签(Label {label_id})。\n分割体素数: {int(np.sum(mask > 0))}"
+        )
+
+    def _on_segment_3d_error(self, error_msg: str, progress_dialog: QProgressDialog):
+        """3D分割失败回调"""
+        progress_dialog.close()
+        self.statusBar().showMessage("3D分割失败", 3000)
+        QMessageBox.critical(self, "错误", f"3D分割失败:\n{error_msg}")
 
     def _on_ai_segmentation(self):
         """AI自动分割"""
@@ -1330,11 +1456,19 @@ class MainWindow(QMainWindow):
         if not self._show_ai_segmentation_dialog():
             return
 
-        # 显示状态栏提示
+        # 进度提示（避免用户误以为未执行）
+        progress = QProgressDialog("正在初始化AI自动分割...", None, 0, 0, self)
+        progress.setWindowTitle("AI自动分割")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
         self.statusBar().showMessage("正在初始化AI分割...")
 
         # 确保AI接口已初始化
         if not self.ai_interface:
+            progress.setLabelText("正在加载AI模型，请稍候...")
+            QApplication.processEvents()
             self.statusBar().showMessage("正在加载AI模型，请稍候...")
             try:
                 # 延迟导入，减少启动时的模块加载
@@ -1343,32 +1477,45 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.statusBar().showMessage("AI分割初始化失败")
                 QMessageBox.critical(self, "错误", f"AI分割初始化失败:\n{e}")
+                progress.close()
                 return
 
         # 重新加载模型（使用新选择的参数）
         try:
+            progress.setLabelText("正在加载AI模型参数...")
+            QApplication.processEvents()
             self.statusBar().showMessage("正在加载AI模型，请稍候...")
             model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
+
+            # 应用用户选择参数
+            self.ai_interface.set_model_variant(self.ai_model_variant)
+            self.ai_interface.set_decomposition_method(self.ai_decomposition_method)
 
             # 加载模型
             if not self.ai_interface.load_model(model_path):
                 self.statusBar().showMessage("AI分割失败")
                 QMessageBox.critical(self, "错误", "AI模型加载失败")
+                progress.close()
                 return
         except Exception as e:
             self.statusBar().showMessage("AI分割初始化失败")
             QMessageBox.critical(self, "错误", f"AI模型加载失败:\n{e}")
+            progress.close()
             return
 
         # 执行分割
+        progress.setLabelText("正在进行图像预处理、推理和后处理...")
+        QApplication.processEvents()
         self.statusBar().showMessage("正在执行AI分割，请稍候...")
         try:
-            # 清除现有标签
-            self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
-            self.four_view.set_label_data(self.current_label_data)
+            # 仅在成功后替换标签，避免失败时丢失已有结果
+            previous_label = np.copy(self.current_label_data) if self.current_label_data is not None else None
 
             # 执行分割
-            mask = self.ai_interface.segment(self.current_image_data)
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+            mask = self.ai_interface.segment(self.current_image_data, spacing=spacing)
 
             if mask is not None:
                 # 更新当前标签数据
@@ -1376,13 +1523,36 @@ class MainWindow(QMainWindow):
                 # 更新视图
                 self.four_view.set_label_data(mask)
                 self.statusBar().showMessage("AI分割完成")
+
+                # 保存血管结构识别结果（主干/细支/分叉/5级）
+                self._refresh_structure_from_current_labels()
+
+                # 反馈简要统计
+                pv_count = int(np.sum(mask == 1))
+                hv_count = int(np.sum(mask == 2))
+                pv_l5 = self.last_vessel_analysis.get("pv", {}).get("level_counts", {}).get("level_5_plus", 0)
+                hv_l5 = self.last_vessel_analysis.get("hv", {}).get("level_counts", {}).get("level_5_plus", 0)
+                QMessageBox.information(
+                    self,
+                    "AI分割结果",
+                    f"分割完成。\n\n"
+                    f"门静脉(PV)体素: {pv_count}\n"
+                    f"肝静脉(HV)体素: {hv_count}\n"
+                    f"PV 5级及以上微小分支体素: {pv_l5}\n"
+                    f"HV 5级及以上微小分支体素: {hv_l5}"
+                )
             else:
+                if previous_label is not None:
+                    self.current_label_data = previous_label
+                    self.four_view.set_label_data(previous_label)
                 self.statusBar().showMessage("AI分割失败")
                 QMessageBox.critical(self, "错误", "AI分割失败")
 
         except Exception as e:
             self.statusBar().showMessage("AI分割过程中发生错误")
             QMessageBox.critical(self, "错误", f"AI分割过程中发生错误:\n{e}")
+        finally:
+            progress.close()
 
     def _show_ai_segmentation_dialog(self):
         """显示AI分割参数选择对话框"""
@@ -1453,9 +1623,12 @@ class MainWindow(QMainWindow):
             model_variant = model_variant_combo.currentText().split()[0]
             decomposition_method = decomposition_combo.currentText().split()[0]
 
-            # 设置AI接口参数
-            self.ai_interface.set_model_variant(model_variant)
-            self.ai_interface.set_decomposition_method(decomposition_method)
+            # 先保存参数；若AI接口已初始化则同步更新
+            self.ai_model_variant = model_variant
+            self.ai_decomposition_method = decomposition_method
+            if self.ai_interface is not None:
+                self.ai_interface.set_model_variant(model_variant)
+                self.ai_interface.set_decomposition_method(decomposition_method)
 
             return True
         else:
@@ -1484,6 +1657,7 @@ class MainWindow(QMainWindow):
                 # 初始化标签数据
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                 self.four_view.set_label_data(self.current_label_data)
+                self._reset_analysis_state()
 
                 # 设置活动标签ID
                 self.four_view.axial_view.set_active_label_id(self.active_label_id)
@@ -1623,29 +1797,59 @@ class MainWindow(QMainWindow):
 
             # 初始化量化分析器
             analyzer = QuantitativeAnalyzer()
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
 
             # 提取门静脉和肝静脉掩码
             portal_vein_mask = (self.current_label_data == 1)
             hepatic_vein_mask = (self.current_label_data == 2)
+            vessel_union = portal_vein_mask | hepatic_vein_mask
+            if not np.any(vessel_union):
+                QMessageBox.warning(self, "提示", "当前标签中未检测到PV/HV（标签1/2），请先完成血管分割。")
+                self.statusBar().showMessage("量化分析中止：缺少血管标签", 3000)
+                return
+
+            # 肝脏掩码优先使用标签3，若不存在则用血管膨胀近似
+            liver_mask = (self.current_label_data == 3)
+            if not np.any(liver_mask):
+                try:
+                    from scipy import ndimage
+                    if np.any(vessel_union):
+                        liver_mask = ndimage.binary_dilation(vessel_union, iterations=20)
+                    else:
+                        liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+                except Exception:
+                    liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+
+            # 肿瘤掩码：默认标签4（可扩展）
+            tumor_mask = (self.current_label_data == 4)
 
             # 计算肝脏分段
             segmentation = analyzer.couinaud_segmentation(
-                np.ones_like(self.current_label_data),  # 假设整个区域都是肝脏
+                liver_mask,
                 portal_vein_mask,
                 hepatic_vein_mask
             )
 
             # 计算体积
-            volumes = analyzer.calculate_volumes(segmentation)
+            volumes = analyzer.calculate_volumes(segmentation, voxel_size=spacing)
 
             # 提取血管量化指标
-            vascular_metrics = analyzer.extract_vascular_metrics(portal_vein_mask, hepatic_vein_mask)
-
-            # 模拟肿瘤-血管距离评估
-            tumor_vessel_assessment = analyzer.assess_tumor_vessel_distance(
-                np.zeros_like(self.current_label_data),  # 假设没有肿瘤
+            vascular_metrics = analyzer.extract_vascular_metrics(
                 portal_vein_mask,
-                hepatic_vein_mask
+                hepatic_vein_mask,
+                voxel_size=spacing,
+                liver_mask=liver_mask,
+                vessel_analysis=getattr(self, 'last_vessel_analysis', None)
+            )
+
+            # 肿瘤-血管距离评估
+            tumor_vessel_assessment = analyzer.assess_tumor_vessel_distance(
+                tumor_mask,
+                portal_vein_mask,
+                hepatic_vein_mask,
+                voxel_size=spacing
             )
 
             # 手术风险评估
@@ -1670,15 +1874,33 @@ class MainWindow(QMainWindow):
                 else:
                     result_text += f"{key}: {value}\n"
 
-            QMessageBox.information(self, "量化分析结果", result_text)
+            result_text += "\n肿瘤-血管距离评估:\n"
+            min_dist = tumor_vessel_assessment.get("min_distance", float("inf"))
+            mean_dist = tumor_vessel_assessment.get("mean_distance", float("inf"))
+            if np.isfinite(min_dist):
+                result_text += f"最小距离: {min_dist:.2f} mm\n"
+                result_text += f"平均距离: {mean_dist:.2f} mm\n"
+            else:
+                result_text += "最小距离: 未知\n平均距离: 未知\n"
+            result_text += f"风险等级: {tumor_vessel_assessment.get('risk_level', '未知')}\n"
+            result_text += f"风险评分: {tumor_vessel_assessment.get('risk_score', 0)}\n"
+
+            result_text += "\n手术风险评估:\n"
+            result_text += f"整体风险: {risk_assessment.get('overall_risk', '未知')}\n"
+            result_text += f"建议: {risk_assessment.get('recommendation', '无')}\n"
+
+            self._show_long_text_dialog("量化分析结果", result_text)
 
             # 保存分析结果
             self.quantitative_results = {
                 'volumes': volumes,
                 'vascular_metrics': vascular_metrics,
                 'tumor_vessel_assessment': tumor_vessel_assessment,
-                'risk_assessment': risk_assessment
+                'risk_assessment': risk_assessment,
+                'couinaud_segmentation': segmentation.astype(np.uint8)
             }
+            if getattr(self, 'last_cut_stats', None):
+                self.quantitative_results['cut_stats'] = self.last_cut_stats
 
             # 显示状态栏提示
             self.statusBar().showMessage("量化分析完成")
@@ -1694,31 +1916,14 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 延迟导入，减少启动时的模块加载
-            from visualization import SliceViewer
-
-            # 创建3D视图窗口
-            from PyQt5.QtWidgets import QDialog
-
-            dialog = QDialog(self)
-            dialog.setWindowTitle("3D血管树可视化")
-            dialog.setGeometry(100, 100, 800, 600)
-
-            layout = QVBoxLayout()
-
-            # 创建3D视图
-            viewer = SliceViewer('3d')
-            spacing = self.current_metadata['spacing'] if (
-                        self.current_metadata and 'spacing' in self.current_metadata) else None
-            viewer.set_image_data(self.current_image_data, spacing)
-            viewer.set_label_data(self.current_label_data)
-            viewer._update_display()
-
-            layout.addWidget(viewer)
-            dialog.setLayout(layout)
-
-            dialog.exec_()
-
+            ok = self._on_update_3d_view_clicked(notify=False)
+            if ok:
+                self.statusBar().showMessage("3D血管树已在主界面左下角显示", 4000)
+                QMessageBox.information(
+                    self,
+                    "3D可视化",
+                    "3D血管树已更新并显示在主界面左下角视图。\n\n提示：可先点击任意2D切片定位，再执行切割平面模拟。"
+                )
         except Exception as e:
             QMessageBox.critical(self, "错误", f"3D可视化失败:\n{e}")
 
@@ -1728,8 +1933,96 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
             return
 
-        QMessageBox.information(self, "提示",
-                                "请先打开3D血管树可视化，然后在3D视图中添加切割平面。\n\n操作步骤：\n1. 点击'显示3D血管树'按钮\n2. 在3D视图中，切割平面会自动显示")
+        if not self._on_update_3d_view_clicked(notify=False):
+            return
+
+        viewer = self.four_view.view_3d
+
+        # 1) 法向轴选择
+        axis_options = [
+            "X轴法向（切YZ平面）",
+            "Y轴法向（切XZ平面）",
+            "Z轴法向（切XY平面）",
+        ]
+        axis_choice, ok = QInputDialog.getItem(
+            self,
+            "切割平面方向",
+            "请选择切割平面的法向方向：",
+            axis_options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        normal_map = {
+            axis_options[0]: (1.0, 0.0, 0.0),
+            axis_options[1]: (0.0, 1.0, 0.0),
+            axis_options[2]: (0.0, 0.0, 1.0),
+        }
+        normal = normal_map[axis_choice]
+
+        # 2) 偏移量
+        offset_mm, ok = QInputDialog.getDouble(
+            self,
+            "切割平面偏移",
+            "沿法向偏移量（mm，正负都可）：",
+            0.0,
+            -500.0,
+            500.0,
+            1,
+        )
+        if not ok:
+            return
+
+        # 3) 是否应用模型裁切（视觉上切掉一侧）
+        apply_choice = QMessageBox.question(
+            self,
+            "切割显示模式",
+            "是否将切割平面直接应用到3D模型（仅保留一侧显示）？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        apply_to_mesh = (apply_choice == QMessageBox.Yes)
+
+        center = viewer.get_volume_center()
+        origin = [
+            center[0] + normal[0] * offset_mm,
+            center[1] + normal[1] * offset_mm,
+            center[2] + normal[2] * offset_mm,
+        ]
+
+        try:
+            stats = viewer.set_clip_plane(normal=normal, origin=origin, apply_to_mesh=apply_to_mesh)
+            self.last_cut_stats = stats
+            self.statusBar().showMessage("切割平面已更新", 3000)
+
+            source_desc = "无可用体积统计"
+            if stats.get("source") == "label_3_liver":
+                source_desc = "体积统计依据：标签3（肝脏）"
+            elif stats.get("source") == "nonzero_label_proxy":
+                source_desc = "体积统计依据：非零标签近似（未检测到肝脏标签）"
+
+            if stats.get("available"):
+                summary = (
+                    f"切割模拟完成\n\n"
+                    f"{source_desc}\n"
+                    f"剩余体积: {stats.get('remaining_ml', 0.0):.2f} ml\n"
+                    f"切除体积: {stats.get('resected_ml', 0.0):.2f} ml\n"
+                    f"剩余比例: {stats.get('remaining_ratio', 0.0) * 100:.1f}%\n\n"
+                    f"切断识别:\n"
+                    f"- 门静脉(PV): {'是' if stats.get('severed_pv') else '否'}\n"
+                    f"- 肝静脉(HV): {'是' if stats.get('severed_hv') else '否'}"
+                )
+            else:
+                summary = (
+                    "切割平面已添加，但当前标签不足以进行体积统计。\n"
+                    "请先完成分割或加载有效标签。"
+                )
+
+            QMessageBox.information(self, "切割平面结果", summary)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"添加切割平面失败:\n{e}")
 
     def _on_generate_report(self):
         """生成PDF报告"""
@@ -1738,55 +2031,46 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 延迟导入，减少启动时的模块加载
-            import sys
-            import os
-            import subprocess
-
-            # 确保当前目录在Python路径中
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            if current_dir not in sys.path:
-                sys.path.insert(0, current_dir)
-
-            # 尝试安装reportlab库
-            print("尝试安装reportlab库...")
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
-                print("reportlab库安装成功")
-            except subprocess.CalledProcessError as e:
-                print(f"reportlab库安装失败: {e}")
-
-            # 直接导入reportlab库，确保它可用
-            import reportlab
-            print(f"reportlab版本: {reportlab.__version__}")
-
             from report_generator import ReportGenerator
-
-            # 创建ReportGenerator实例
-            generator = ReportGenerator()
 
             # 显示状态栏提示
             self.statusBar().showMessage("正在生成PDF报告...")
 
             # 准备报告数据
             report_data = {
-                'patient_id': self.current_patient_info.get('id', 'N/A'),
-                'exam_date': self.current_patient_info.get('study_date', ''),
-                'segmentation_method': 'AI自动分割',
-                'model_variant': getattr(self, 'ai_model_variant', 'mobileuvit_l')
+                'patient_id': self.current_patient_info.get('PatientID', 'N/A'),
+                'exam_date': self.current_patient_info.get('StudyDate', ''),
+                'segmentation_method': 'AI自动分割' if self.ai_interface is not None else '手动/传统分割',
+                'model_variant': getattr(self, 'ai_model_variant', 'mobileuvit_l'),
+                'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
             # 添加量化分析结果
             if hasattr(self, 'quantitative_results'):
                 report_data.update(self.quantitative_results)
+            else:
+                # 若用户未手动点“运行量化分析”，自动补一次
+                self._on_quantitative_analysis()
+                if hasattr(self, 'quantitative_results'):
+                    report_data.update(self.quantitative_results)
+
+            # 添加AI血管结构识别摘要
+            if hasattr(self, 'last_vessel_analysis') and self.last_vessel_analysis:
+                report_data['vessel_analysis'] = self.last_vessel_analysis
+
+            # 添加切割模拟统计
+            if hasattr(self, 'last_cut_stats') and self.last_cut_stats:
+                report_data['cut_stats'] = self.last_cut_stats
 
             # 添加图像
             if self.current_image_data is not None:
                 # 提取中间切片作为示例
                 middle_slice = self.current_image_data.shape[2] // 2
                 slice_data = self.current_image_data[:, :, middle_slice]
+                label_slice = self.current_label_data[:, :, middle_slice]
                 report_data['images'] = {
-                    '肝脏影像 (中间切片)': slice_data
+                    '肝脏影像 (中间切片)': slice_data,
+                    '血管分割标签 (中间切片)': label_slice
                 }
 
             # 生成报告
@@ -1828,6 +2112,22 @@ class MainWindow(QMainWindow):
             elif view_type == 'sagittal':
                 if hasattr(self.four_view, 'sagittal_view'):
                     z = self.four_view.sagittal_view.current_slice
+
+            # 种子点模式：点击三视图时记录当前3D十字准心对应体素
+            if self.seed_mode_enabled and hasattr(self, 'four_view'):
+                try:
+                    vx = int(self.four_view.sagittal_view.current_slice)
+                    vy = int(self.four_view.coronal_view.current_slice)
+                    vz = int(self.four_view.axial_view.current_slice)
+                    seed = (vx, vy, vz)
+                    # 去重+轻微防抖
+                    if seed != self._last_seed and seed not in self.seed_points:
+                        self.seed_points.append(seed)
+                        self._last_seed = seed
+                        self._update_seed_count()
+                        self.statusBar().showMessage(f"已添加种子点: {seed}", 1500)
+                except Exception:
+                    pass
 
             # 更新光标位置标签
             self.cursor_pos_label.setText(f"位置 (x,y,z): ({int(x)}, {int(y)}, {int(z)})")
@@ -1879,7 +2179,69 @@ class MainWindow(QMainWindow):
 
     def _update_seed_count(self):
         """更新种子点数量"""
-        pass
+        count = len(self.seed_points) if self.seed_points is not None else 0
+        self.seed_count_label.setText(f"种子点数量: {count}")
+        if hasattr(self, 'four_view'):
+            try:
+                self.four_view.set_seed_points(self.seed_points)
+            except Exception as e:
+                print(f"同步种子点高亮失败: {e}")
+
+    def _show_long_text_dialog(self, title: str, text: str):
+        """用于显示长文本结果，支持滚动查看，避免信息被截断。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(900, 700)
+
+        layout = QVBoxLayout(dialog)
+
+        text_view = QTextEdit(dialog)
+        text_view.setReadOnly(True)
+        text_view.setLineWrapMode(QTextEdit.NoWrap)
+        text_view.setPlainText(text)
+        layout.addWidget(text_view)
+
+        btn_close = QPushButton("关闭", dialog)
+        btn_close.clicked.connect(dialog.accept)
+        layout.addWidget(btn_close, alignment=Qt.AlignRight)
+
+        dialog.exec_()
+
+    def _reset_analysis_state(self):
+        """在新病例/清空标签时重置AI结构分析和切割状态。"""
+        self.last_vessel_analysis = {}
+        self.last_cut_stats = {}
+        if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
+            try:
+                self.four_view.view_3d.set_structure_data(None)
+                self.four_view.view_3d.remove_clip_planes()
+            except Exception:
+                pass
+
+    def _refresh_structure_from_current_labels(self):
+        """基于当前标签更新血管结构识别（无需重新跑模型）。"""
+        if self.current_label_data is None:
+            self._reset_analysis_state()
+            return
+        if not np.any((self.current_label_data == 1) | (self.current_label_data == 2)):
+            self._reset_analysis_state()
+            return
+        try:
+            if self.ai_interface is None:
+                from ai_interface import AISegmentationInterface
+                self.ai_interface = AISegmentationInterface()
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+            self.last_vessel_analysis = self.ai_interface.analyze_vessel_structure(
+                self.current_label_data, spacing=spacing
+            )
+            if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
+                self.four_view.view_3d.set_structure_data(
+                    self.last_vessel_analysis.get("structure_map")
+                )
+        except Exception as e:
+            print(f"基于标签更新结构识别失败: {e}")
 
     def _preload_ai_model(self):
         """后台预加载AI模型"""
@@ -1965,6 +2327,7 @@ class MainWindow(QMainWindow):
                     # 初始化标签数据
                     self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                     self.four_view.set_label_data(self.current_label_data)
+                    self._reset_analysis_state()
                     # 设置活动标签ID
                     self.four_view.axial_view.set_active_label_id(self.active_label_id)
                     self.four_view.coronal_view.set_active_label_id(self.active_label_id)
@@ -2123,6 +2486,7 @@ class MainWindow(QMainWindow):
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
 
             self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
 
             # 更新信息显示
             self._update_patient_info_from_metadata(metadata)
@@ -2302,6 +2666,7 @@ class MainWindow(QMainWindow):
             # 初始化标签数据
             self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
+            self._reset_analysis_state()
             # 设置活动标签ID
             self.four_view.axial_view.set_active_label_id(self.active_label_id)
             self.four_view.coronal_view.set_active_label_id(self.active_label_id)
@@ -2356,6 +2721,7 @@ class MainWindow(QMainWindow):
 
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                 self.four_view.set_label_data(self.current_label_data)
+                self._reset_analysis_state()
 
                 self.four_view.axial_view.set_active_label_id(self.active_label_id)
                 self.four_view.coronal_view.set_active_label_id(self.active_label_id)
