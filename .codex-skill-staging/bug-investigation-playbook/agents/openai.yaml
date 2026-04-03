@@ -1,0 +1,4 @@
+interface:
+  display_name: Bug Investigation Playbook
+  short_description: Debug weird bugs systematically instead of randomly
+  default_prompt: Help me investigate this bug with hypotheses, narrowing steps, and explicit evidence.

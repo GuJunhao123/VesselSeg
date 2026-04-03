@@ -1,0 +1,4 @@
+interface:
+  display_name: Architecture Decision Playbook
+  short_description: Choose architecture patterns with explicit tradeoffs
+  default_prompt: Compare architecture options, explain tradeoffs, and recommend a staged design path for this system.

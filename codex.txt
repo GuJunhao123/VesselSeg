@@ -1,0 +1,117 @@
+Codex engineering setup for this machine
+========================================
+
+Installed plugins
+- github: GitHub repo, PR, issue, CI, review workflow.
+- sentry: Error monitoring, stack trace triage, production issue investigation.
+- linear: Task decomposition, issue tracking, execution follow-through.
+- slack: Team communication, status sync, notification triage.
+- notion: Specs, research notes, knowledge capture, project context.
+- figma: Design reference, design-to-code, component and design-system alignment.
+
+Plugin registration location
+- C:\Users\zicv8\.agents\plugins\marketplace.json
+
+Plugin files location
+- C:\Users\zicv8\plugins
+
+Installed official skills
+- frontend-skill: Makes landing pages and app UI more polished, intentional, and responsive.
+- figma-use: Reads and uses Figma context during implementation.
+- figma-generate-design: Generates stronger visual directions instead of plain generic pages.
+- figma-implement-design: Turns design artifacts into production-oriented frontend code.
+- figma-create-design-system-rules: Establishes reusable visual rules and design tokens.
+- figma-code-connect-components: Helps align coded components with design system components.
+- figma-generate-library: Supports component-library style thinking and reusable UI building blocks.
+- doc: Produces cleaner README, API docs, and structured project documentation.
+- gh-address-comments: Handles PR review comments with more realistic team workflow.
+- gh-fix-ci: Investigates and fixes CI failures in GitHub-based delivery flows.
+- linear: Connects implementation with task tracking and issue execution.
+- notion-knowledge-capture: Captures useful project knowledge into a durable knowledge base.
+- notion-research-documentation: Turns research and project understanding into organized docs.
+- notion-spec-to-implementation: Bridges specs and actual implementation tasks.
+- playwright: Verifies real frontend behavior, especially for flows, routing, and regressions.
+- screenshot: Helps inspect UI output and layout issues visually.
+- security-best-practices: Brings architecture and implementation choices closer to production-grade safety.
+- security-ownership-map: Clarifies boundaries and responsibilities in larger systems.
+- security-threat-model: Surfaces architecture risks before they become implementation debt.
+- sentry: Supports production bug triage and issue analysis using Sentry-style workflows.
+
+Installed custom local skills
+- architecture-decision-playbook: Choose architecture patterns with explicit tradeoffs, staged evolution, and ADR-style outputs.
+- session-resume-ledger: Keep long tasks resumable after interrupted sessions.
+- memory-hygiene: Separate durable knowledge from stale or noisy notes and reduce memory drift.
+- execution-guardrails: Keep implementation aligned with plans and milestones.
+- bug-investigation-playbook: Debug weird issues systematically with hypotheses and evidence.
+- team-review: Review changes like a real senior teammate, focusing on correctness, regressions, and rollout risk.
+
+Custom skill location
+- C:\Users\zicv8\.codex\skills
+
+How this setup maps to your extra requirements
+1. Better visual frontend quality
+- frontend-skill
+- figma-use
+- figma-generate-design
+- figma-implement-design
+- figma-create-design-system-rules
+- figma-generate-library
+- screenshot
+
+2. Complex SPA capability, routing/state/components, better layout/color/responsiveness
+- frontend-skill
+- figma-implement-design
+- figma-code-connect-components
+- figma-generate-library
+- playwright
+- screenshot
+
+3. Cleaner README and API documentation
+- doc
+- notion-research-documentation
+- notion-spec-to-implementation
+
+4. Clearer task decomposition and safer resumption after interruption
+- linear
+- session-resume-ledger
+- execution-guardrails
+
+5. Better architecture decisions and fewer system-design mistakes
+- architecture-decision-playbook
+- security-threat-model
+- security-best-practices
+- security-ownership-map
+
+6. More professional, team-like code review
+- team-review
+- gh-address-comments
+- gh-fix-ci
+- github plugin
+
+7. Preserve debugging experience and project detail across sessions
+- session-resume-ledger
+- notion-knowledge-capture
+- memory-hygiene
+
+8. Reduce stale or invalid memory that hurts Codex accuracy
+- memory-hygiene
+
+9. Prevent plan drift during execution
+- execution-guardrails
+- linear
+
+10. Systematic investigation for strange bugs
+- bug-investigation-playbook
+- sentry
+- playwright
+
+Suggested usage habits
+- For frontend work, mention: frontend-skill, figma-use, playwright.
+- For docs, mention: doc or notion-research-documentation.
+- For system design, mention: architecture-decision-playbook.
+- For long tasks, mention: session-resume-ledger and execution-guardrails.
+- For debugging, mention: bug-investigation-playbook and sentry.
+- For review, mention: team-review and gh-address-comments.
+
+Important note
+- Restart Codex to ensure newly installed skills and plugins are fully discovered.

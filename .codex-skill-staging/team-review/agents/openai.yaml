@@ -1,0 +1,4 @@
+interface:
+  display_name: Team Review
+  short_description: Review code like an experienced engineering teammate
+  default_prompt: Review this change for bugs, regressions, missing tests, and production risks in a team-style review.

@@ -1,0 +1,4 @@
+interface:
+  display_name: Memory Hygiene
+  short_description: Keep Codex memory clean, durable, and relevant
+  default_prompt: Review project memory, keep the durable facts, and identify stale or noisy items to prune.

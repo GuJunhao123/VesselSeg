@@ -1,0 +1,4 @@
+interface:
+  display_name: Execution Guardrails
+  short_description: Keep implementation aligned with the plan
+  default_prompt: Turn this plan into checkpointed execution and help me avoid scope drift while implementing it.

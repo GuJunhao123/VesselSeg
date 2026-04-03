@@ -1,0 +1,4 @@
+interface:
+  display_name: Session Resume Ledger
+  short_description: Keep long tasks resumable across interrupted sessions
+  default_prompt: Create or refresh a resume ledger for this project so work can continue cleanly after interruptions.
