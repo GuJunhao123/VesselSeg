@@ -418,47 +418,54 @@ class QuantitativeAnalyzer:
         Returns:
             肿瘤-血管距离评估结果
         """
-        assessment = {}
+        tumor = tumor_mask > 0
+        assessment = {
+            "min_distance": float("inf"),
+            "mean_distance": float("inf"),
+            "risk_level": "未评估",
+            "risk_score": 0,
+            "tumor_voxel_count": int(np.count_nonzero(tumor)),
+            "assessable": False
+        }
         sx, sy, sz = self._normalize_spacing(voxel_size)
 
         vessel_mask = (portal_vein_mask > 0) | (hepatic_vein_mask > 0)
-        tumor = tumor_mask > 0
 
-        if np.any(tumor) and np.any(vessel_mask):
-            try:
-                # 到“最近血管体素”的欧式距离场(mm)
-                dist_map = ndimage.distance_transform_edt(~vessel_mask, sampling=(sx, sy, sz))
-                tumor_dist = dist_map[tumor]
-                if tumor_dist.size > 0:
-                    min_dist = float(np.min(tumor_dist))
-                    mean_dist = float(np.mean(tumor_dist))
-                else:
-                    min_dist = float("inf")
-                    mean_dist = float("inf")
+        if not np.any(tumor):
+            assessment["reason"] = "no_tumor_label"
+            return assessment
 
-                assessment["min_distance"] = min_dist
-                assessment["mean_distance"] = mean_dist
+        if not np.any(vessel_mask):
+            assessment["reason"] = "no_vessel_label"
+            return assessment
 
-                # 风险分级
-                if min_dist < 1.0:
-                    assessment["risk_level"] = "高风险"
-                    assessment["risk_score"] = 3
-                elif min_dist < 3.0:
-                    assessment["risk_level"] = "中风险"
-                    assessment["risk_score"] = 2
-                else:
-                    assessment["risk_level"] = "低风险"
-                    assessment["risk_score"] = 1
-            except Exception:
-                assessment["min_distance"] = float("inf")
-                assessment["mean_distance"] = float("inf")
-                assessment["risk_level"] = "未知"
-                assessment["risk_score"] = 0
-        else:
-            assessment["min_distance"] = float("inf")
-            assessment["mean_distance"] = float("inf")
-            assessment["risk_level"] = "未知"
-            assessment["risk_score"] = 0
+        try:
+            # 到“最近血管体素”的欧式距离场(mm)
+            dist_map = ndimage.distance_transform_edt(~vessel_mask, sampling=(sx, sy, sz))
+            tumor_dist = dist_map[tumor]
+            if tumor_dist.size > 0:
+                min_dist = float(np.min(tumor_dist))
+                mean_dist = float(np.mean(tumor_dist))
+            else:
+                min_dist = float("inf")
+                mean_dist = float("inf")
+
+            assessment["min_distance"] = min_dist
+            assessment["mean_distance"] = mean_dist
+
+            # 风险分级
+            if min_dist < 1.0:
+                assessment["risk_level"] = "高风险"
+                assessment["risk_score"] = 3
+            elif min_dist < 3.0:
+                assessment["risk_level"] = "中风险"
+                assessment["risk_score"] = 2
+            else:
+                assessment["risk_level"] = "低风险"
+                assessment["risk_score"] = 1
+            assessment["assessable"] = True
+        except Exception:
+            assessment["reason"] = "exception"
 
         return assessment
     

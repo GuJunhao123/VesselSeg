@@ -17,6 +17,9 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 import matplotlib.pyplot as plt
 from io import BytesIO
@@ -26,18 +29,68 @@ class ReportGenerator:
     
     def __init__(self):
         """初始化"""
+        self.font_name, self.font_bold_name = self._init_pdf_fonts()
         self.styles = getSampleStyleSheet()
         # 添加自定义样式（如果不存在）
         if 'CustomTitle' not in self.styles:
-            self.styles.add(ParagraphStyle(name='CustomTitle', fontName='Helvetica-Bold', fontSize=16, alignment=TA_CENTER, spaceAfter=12))
+            self.styles.add(ParagraphStyle(name='CustomTitle', fontName=self.font_bold_name, fontSize=16, alignment=TA_CENTER, spaceAfter=12))
         if 'CustomSubtitle' not in self.styles:
-            self.styles.add(ParagraphStyle(name='CustomSubtitle', fontName='Helvetica-Bold', fontSize=14, alignment=TA_CENTER, spaceAfter=8))
+            self.styles.add(ParagraphStyle(name='CustomSubtitle', fontName=self.font_bold_name, fontSize=14, alignment=TA_CENTER, spaceAfter=8))
         if 'CustomSection' not in self.styles:
-            self.styles.add(ParagraphStyle(name='CustomSection', fontName='Helvetica-Bold', fontSize=12, alignment=TA_LEFT, spaceAfter=6))
+            self.styles.add(ParagraphStyle(name='CustomSection', fontName=self.font_bold_name, fontSize=12, alignment=TA_LEFT, spaceAfter=6))
         if 'CustomNormal' not in self.styles:
-            self.styles.add(ParagraphStyle(name='CustomNormal', fontName='Helvetica', fontSize=10, alignment=TA_LEFT, spaceAfter=4))
+            self.styles.add(ParagraphStyle(name='CustomNormal', fontName=self.font_name, fontSize=10, alignment=TA_LEFT, spaceAfter=4))
         if 'Right' not in self.styles:
-            self.styles.add(ParagraphStyle(name='Right', fontName='Helvetica', fontSize=10, alignment=TA_RIGHT, spaceAfter=4))
+            self.styles.add(ParagraphStyle(name='Right', fontName=self.font_name, fontSize=10, alignment=TA_RIGHT, spaceAfter=4))
+
+    def _init_pdf_fonts(self):
+        """
+        初始化PDF字体，优先Windows中文字体，失败则回退STSong-Light，再回退Helvetica。
+        """
+        font_candidates = [
+            ("VS_SimHei", os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "simhei.ttf")),
+            ("VS_MSYH", os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "msyh.ttc")),
+            ("VS_SimSun", os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "simsun.ttc")),
+        ]
+
+        for alias, path in font_candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                if alias not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont(alias, path))
+                return alias, alias
+            except Exception:
+                continue
+
+        try:
+            if "STSong-Light" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+            return "STSong-Light", "STSong-Light"
+        except Exception:
+            return "Helvetica", "Helvetica-Bold"
+
+    @staticmethod
+    def _format_assessment_reason(reason_code: str) -> str:
+        reason_map = {
+            "no_tumor_label": "未检测到肿瘤标签",
+            "no_tumor_label_4": "未检测到肿瘤标签4",
+            "no_vessel_label": "未检测到血管标签(PV/HV)",
+            "exception": "距离计算异常"
+        }
+        return reason_map.get(reason_code, "原因未知")
+
+    def _two_col_table_style(self, second_col_align: str = 'RIGHT'):
+        return TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (-1, -1), second_col_align),
+            ('FONTNAME', (0, 0), (-1, -1), self.font_name),
+            ('FONTNAME', (0, 0), (0, -1), self.font_bold_name),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
     
     def generate_report(self, report_data: dict, output_path: str) -> bool:
         """
@@ -73,15 +126,7 @@ class ReportGenerator:
             ]
             
             table = Table(basic_info, colWidths=[4*cm, 10*cm])
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                ('ALIGN', (1, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black)
-            ]))
+            table.setStyle(self._two_col_table_style(second_col_align='LEFT'))
             elements.append(table)
             elements.append(Spacer(1, 1*cm))
             
@@ -100,15 +145,7 @@ class ReportGenerator:
                 volume_data.append(['总体积', f'{volumes.get("total_liver", 0):.2f} ml'])
                 
                 table = Table(volume_data, colWidths=[4*cm, 4*cm])
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                ]))
+                table.setStyle(self._two_col_table_style())
                 elements.append(table)
                 elements.append(Spacer(1, 0.5*cm))
             
@@ -152,41 +189,10 @@ class ReportGenerator:
                 
                 if metric_data:
                     table = Table(metric_data, colWidths=[6*cm, 3*cm])
-                    table.setStyle(TableStyle([
-                        ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                        ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                    ]))
+                    table.setStyle(self._two_col_table_style())
                     elements.append(table)
                 else:
                     elements.append(Paragraph('无可用血管量化指标', self.styles['CustomNormal']))
-                elements.append(Spacer(1, 0.5*cm))
-            
-            # 肿瘤-血管距离评估
-            if 'tumor_vessel_assessment' in report_data:
-                elements.append(Paragraph('肿瘤-血管距离评估', self.styles['CustomSection']))
-                assessment = report_data['tumor_vessel_assessment']
-                risk_data = [
-                    ['最小距离', f'{assessment.get("min_distance", 0):.2f} mm'],
-                    ['风险等级', assessment.get("risk_level", '未知')],
-                    ['风险评分', str(assessment.get("risk_score", 0))]
-                ]
-                
-                table = Table(risk_data, colWidths=[4*cm, 4*cm])
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                ]))
-                elements.append(table)
                 elements.append(Spacer(1, 0.5*cm))
             
             # 手术风险评估
@@ -229,15 +235,7 @@ class ReportGenerator:
                 else:
                     cut_data = [['状态', '暂无可用切割体积统计']]
                 table = Table(cut_data, colWidths=[5*cm, 6*cm])
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                ]))
+                table.setStyle(self._two_col_table_style())
                 elements.append(table)
                 elements.append(Spacer(1, 0.5*cm))
             
@@ -351,14 +349,6 @@ class ReportGenerator:
                         summary.append(f'  {metric_names[key]}: {value:.2f}')
                     else:
                         summary.append(f'  {metric_names[key]}: {value}')
-        
-        # 肿瘤-血管距离评估
-        if 'tumor_vessel_assessment' in report_data:
-            assessment = report_data['tumor_vessel_assessment']
-            summary.append('\n肿瘤-血管距离评估:')
-            summary.append(f'  最小距离: {assessment.get("min_distance", 0):.2f} mm')
-            summary.append(f'  风险等级: {assessment.get("risk_level", "未知")}')
-            summary.append(f'  风险评分: {assessment.get("risk_score", 0)}')
         
         # 手术风险评估
         if 'risk_assessment' in report_data:
