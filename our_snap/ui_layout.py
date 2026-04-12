@@ -1515,7 +1515,11 @@ class MainWindow(QMainWindow):
             spacing = self.current_metadata['spacing'] if (
                 self.current_metadata and 'spacing' in self.current_metadata
             ) else (1.0, 1.0, 1.0)
-            mask = self.ai_interface.segment(self.current_image_data, spacing=spacing)
+            mask = self.ai_interface.segment(
+                self.current_image_data,
+                spacing=spacing,
+                metadata=self.current_metadata,
+            )
 
             if mask is not None:
                 # 更新当前标签数据

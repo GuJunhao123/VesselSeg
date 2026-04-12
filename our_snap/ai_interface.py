@@ -7,7 +7,7 @@ AI自动分割接口模块
 
 import numpy as np
 import onnxruntime as ort
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Mapping
 import os
 import sys
 
@@ -382,6 +382,208 @@ class AISegmentationInterface:
     def get_last_vessel_analysis(self) -> Dict[str, Any]:
         """获取最近一次血管结构分析结果。"""
         return self.last_vessel_analysis if self.last_vessel_analysis else {}
+
+    def _normalize_spacing_tuple(
+        self,
+        spacing: Tuple[float, float, float],
+    ) -> Tuple[float, float, float]:
+        """归一化spacing，确保为正值。"""
+        try:
+            sx = float(spacing[0])
+            sy = float(spacing[1])
+            sz = float(spacing[2])
+            sx = sx if sx > 0 else 1.0
+            sy = sy if sy > 0 else 1.0
+            sz = sz if sz > 0 else 1.0
+            return sx, sy, sz
+        except Exception:
+            return 1.0, 1.0, 1.0
+
+    def _prepare_nifti_payload(
+        self,
+        image_data: np.ndarray,
+        spacing: Tuple[float, float, float],
+        metadata: Optional[Mapping[str, Any]],
+    ) -> Tuple[np.ndarray, np.ndarray, bool]:
+        """
+        将内存图像准备为NIfTI写盘所需的数据与仿射。
+        返回:
+            nii_data: 写入NIfTI的数据
+            affine: 4x4仿射
+            swapped_xy: 是否做过x/y轴互换（用于结果还原）
+        """
+        nii_data = np.asarray(image_data, dtype=np.float32)
+        swapped_xy = False
+
+        # DICOM/NRRD(SITK)路径在本项目内采用(H, W, D)=(Y, X, Z)。
+        # 写入NIfTI前转为(X, Y, Z)，确保与affine语义一致。
+        if isinstance(metadata, Mapping) and "sitk_image" in metadata and nii_data.ndim == 3:
+            nii_data = np.transpose(nii_data, (1, 0, 2))
+            swapped_xy = True
+
+        affine = None
+        if isinstance(metadata, Mapping):
+            meta_affine = metadata.get("affine")
+            if meta_affine is not None:
+                candidate = np.asarray(meta_affine, dtype=np.float64)
+                if candidate.shape == (4, 4) and np.all(np.isfinite(candidate)):
+                    affine = candidate
+
+        if affine is None:
+            sx, sy, sz = self._normalize_spacing_tuple(spacing)
+            affine = np.diag([sx, sy, sz, 1.0]).astype(np.float64)
+
+        return nii_data, affine, swapped_xy
+
+    def _restore_internal_axis_order(self, mask: np.ndarray, swapped_xy: bool) -> np.ndarray:
+        """将NIfTI空间结果还原为项目内部轴顺序。"""
+        if swapped_xy and mask.ndim == 3:
+            return np.transpose(mask, (1, 0, 2))
+        return mask
+
+    def _fragmentation_metrics(self, mask: np.ndarray) -> Tuple[int, float]:
+        """
+        计算碎片化指标：
+        - 连通域个数（联合PV/HV）
+        - 最大连通域占比
+        """
+        from scipy import ndimage
+
+        vessel = mask > 0
+        total = int(np.count_nonzero(vessel))
+        if total == 0:
+            return 0, 0.0
+
+        structure = ndimage.generate_binary_structure(3, 2)
+        comp, n_comp = ndimage.label(vessel, structure=structure)
+        if n_comp == 0:
+            return 0, 0.0
+
+        sizes = np.bincount(comp.ravel())
+        sizes[0] = 0
+        largest = int(sizes.max()) if sizes.size > 1 else 0
+        largest_ratio = (largest / float(total)) if total > 0 else 0.0
+        return int(n_comp), float(largest_ratio)
+
+    def _cleanup_fragmented_vessels(self, mask: np.ndarray) -> np.ndarray:
+        """
+        针对明显碎片化的AI结果做连通性约束：
+        1) 先在联合血管上保留主要连通团块
+        2) 再按标签保留主连通结构，去除远离主干的散点伪阳性
+        """
+        from scipy import ndimage
+
+        if mask is None or mask.ndim != 3:
+            return mask
+
+        if not np.any(mask > 0):
+            return mask
+
+        structure = ndimage.generate_binary_structure(3, 2)
+        cleaned = np.copy(mask).astype(np.uint8)
+
+        # 先轻度闭运算，连接近邻碎块，避免主血管被切成很多段
+        vessel_union = ndimage.binary_closing(cleaned > 0, structure=np.ones((3, 3, 3)))
+        union_comp, union_n = ndimage.label(vessel_union, structure=structure)
+        if union_n > 0:
+            union_sizes = np.bincount(union_comp.ravel())
+            union_sizes[0] = 0
+            sorted_ids = np.argsort(union_sizes)[::-1]
+            largest = int(union_sizes[sorted_ids[0]]) if sorted_ids.size > 0 else 0
+
+            keep_union_ids = []
+            for cid in sorted_ids:
+                if cid == 0:
+                    continue
+                size = int(union_sizes[cid])
+                if size <= 0:
+                    continue
+                # 保留最大的主体；若第二大也足够大则一起保留，防止误删另一条主静脉树
+                if not keep_union_ids:
+                    keep_union_ids.append(int(cid))
+                    continue
+                if len(keep_union_ids) < 2 and size >= max(1500, int(0.22 * largest)):
+                    keep_union_ids.append(int(cid))
+                    continue
+                break
+
+            if keep_union_ids:
+                union_keep = np.isin(union_comp, keep_union_ids)
+                cleaned[~union_keep] = 0
+
+        # 分标签精修：去除明显“薄片型”小连通域，只保留主连通成分
+        refined = np.zeros_like(cleaned, dtype=np.uint8)
+        for label in (1, 2):
+            binary = cleaned == label
+            if not np.any(binary):
+                continue
+
+            comp, n_comp = ndimage.label(binary, structure=structure)
+            if n_comp == 0:
+                continue
+
+            sizes = np.bincount(comp.ravel())
+            sizes[0] = 0
+            ids = np.argsort(sizes)[::-1]
+            largest = int(sizes[ids[0]]) if ids.size > 0 else 0
+            keep_ids = []
+
+            for cid in ids:
+                if cid == 0:
+                    continue
+                size = int(sizes[cid])
+                if size <= 0:
+                    continue
+                cmask = comp == cid
+                coords = np.argwhere(cmask)
+                if coords.size == 0:
+                    continue
+                span = coords.max(axis=0) - coords.min(axis=0) + 1
+                min_span = int(span.min())
+                max_span = int(span.max())
+
+                # 过滤“单层薄片”类伪阳性：很扁且体素数不大
+                if min_span <= 2 and max_span >= 18 and size < max(4000, int(0.05 * largest)):
+                    continue
+
+                if not keep_ids:
+                    keep_ids.append(int(cid))
+                    continue
+
+                # 额外保留次级主分支（足够大）
+                if len(keep_ids) < 2 and size >= max(500, int(0.2 * largest)):
+                    keep_ids.append(int(cid))
+                    continue
+
+            if keep_ids:
+                refined[np.isin(comp, keep_ids)] = label
+
+        # 若过度清理导致空结果，则回退到清理前
+        if np.any(refined > 0):
+            cleaned = refined
+
+        return cleaned
+
+    def _keep_largest_component_per_label(self, mask: np.ndarray) -> np.ndarray:
+        """保守模式：每个标签仅保留最大连通域。"""
+        from scipy import ndimage
+
+        if mask is None or mask.ndim != 3:
+            return mask
+
+        out = np.zeros_like(mask, dtype=np.uint8)
+        structure = ndimage.generate_binary_structure(3, 2)
+        for label in (1, 2):
+            comp, n_comp = ndimage.label(mask == label, structure=structure)
+            if n_comp == 0:
+                continue
+            sizes = np.bincount(comp.ravel())
+            sizes[0] = 0
+            best_id = int(np.argmax(sizes))
+            if best_id > 0 and sizes[best_id] > 0:
+                out[comp == best_id] = label
+
+        return out
     
     def preprocess_image(self, image_data: np.ndarray) -> np.ndarray:
         """
@@ -491,6 +693,27 @@ class AISegmentationInterface:
         except Exception as e:
             print(f"后处理去噪失败，继续使用原始掩码: {e}")
 
+        # 碎片化检测与连通性清理（解决3D中大量离散薄片的问题）
+        try:
+            n_comp, largest_ratio = self._fragmentation_metrics(mask)
+            print(f"分割连通性评估: components={n_comp}, largest_ratio={largest_ratio:.3f}")
+            if n_comp >= 14 or largest_ratio < 0.42:
+                print("检测到明显碎片化，启用主连通血管清理...")
+                cleaned_mask = self._cleanup_fragmented_vessels(mask)
+                if np.any(cleaned_mask > 0):
+                    mask = cleaned_mask
+                    n2, r2 = self._fragmentation_metrics(mask)
+                    print(f"清理后连通性: components={n2}, largest_ratio={r2:.3f}")
+                    if n2 >= 10 or r2 < 0.50:
+                        print("仍然存在碎片，启用最大连通域保守模式...")
+                        conservative = self._keep_largest_component_per_label(mask)
+                        if np.any(conservative > 0):
+                            mask = conservative
+                            n3, r3 = self._fragmentation_metrics(mask)
+                            print(f"保守模式后连通性: components={n3}, largest_ratio={r3:.3f}")
+        except Exception as e:
+            print(f"连通性清理失败，继续使用原始掩码: {e}")
+
         # 结构识别：PV/HV 主干/细分支/分叉/5级分层
         try:
             analysis = self.analyze_vessel_structure(mask, spacing=spacing)
@@ -534,12 +757,15 @@ class AISegmentationInterface:
         self,
         image_data: np.ndarray,
         spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        metadata: Optional[Mapping[str, Any]] = None,
     ) -> Optional[np.ndarray]:
         """
         执行AI分割
         
         Args:
             image_data: 输入图像 (H, W, D)
+            spacing: 体素间距
+            metadata: 影像元数据（优先使用其中affine）
             
         Returns:
             分割掩码 (H, W, D)，uint8类型，失败返回None
@@ -548,7 +774,7 @@ class AISegmentationInterface:
             raise RuntimeError("模型未加载，请先调用load_model()")
         
         try:
-            original_shape = image_data.shape
+            original_shape = tuple(int(v) for v in image_data.shape)
             
             if self.model_type == 'onnx':
                 # ONNX 模型推理
@@ -581,7 +807,12 @@ class AISegmentationInterface:
                     tmp_path = tmp.name
                 
                 # 保存临时 NIfTI 文件
-                tmp_nii = nib.Nifti1Image(image_data, affine=np.eye(4))
+                nifti_data, nifti_affine, swapped_xy = self._prepare_nifti_payload(
+                    image_data=image_data,
+                    spacing=spacing,
+                    metadata=metadata,
+                )
+                tmp_nii = nib.Nifti1Image(nifti_data, affine=nifti_affine)
                 nib.save(tmp_nii, tmp_path)
                 
                 try:
@@ -594,8 +825,8 @@ class AISegmentationInterface:
                         EnsureChannelFirstd(keys=["image"]),
                         Orientationd(keys=["image"], axcodes="LPI"),
                         Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode=('bilinear')),
-                        # 由于没有标签，使用图像本身作为前景
-                        CropForegroundd(keys=["image"], source_key="image", select_fn=lambda x: x > 0),
+                        # 无GT标签时使用更稳健的体部阈值，避免ROI过碎导致伪阳性扩散
+                        CropForegroundd(keys=["image"], source_key="image", select_fn=lambda x: x > -200),
                         SpatialPadd(keys=["image"], spatial_size=PATCH_SIZE),
                     ]
                     
@@ -617,7 +848,15 @@ class AISegmentationInterface:
                     
                     with torch.no_grad():
                         output = inferer(input_tensor, self.pytorch_model)
-                        pred_label = torch.argmax(output[0], dim=1).cpu().numpy()  # [1, H, W, D]
+                        # 兼容Tensor/tuple输出，统一提取全局多分类logits
+                        logits = output[0] if isinstance(output, (tuple, list)) else output
+                        if not isinstance(logits, torch.Tensor):
+                            raise RuntimeError(f"模型输出类型异常: {type(logits)}")
+                        if logits.ndim == 4:
+                            logits = logits.unsqueeze(0)
+                        if logits.ndim != 5:
+                            raise RuntimeError(f"模型输出维度异常: {tuple(logits.shape)}")
+                        pred_label = torch.argmax(logits, dim=1).cpu().numpy()  # [B, H, W, D]
                     
                     # 还原到原始空间
                     orig_nii = nib.load(tmp_path)
@@ -633,6 +872,7 @@ class AISegmentationInterface:
                     )
                     
                     mask = final_pred_nii.get_fdata().astype(np.uint8)
+                    mask = self._restore_internal_axis_order(mask, swapped_xy)
                     # PyTorch路径也做统一结构识别与策略后处理
                     mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
                     
@@ -652,4 +892,3 @@ class AISegmentationInterface:
     def is_loaded(self) -> bool:
         """检查模型是否已加载"""
         return self.is_model_loaded
-
