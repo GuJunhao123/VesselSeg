@@ -50,6 +50,15 @@ class AISegmentationInterface:
         # MobileUViT 模型参数
         self.model_variant = 'mobileuvit_l'  # 'mobileuvit' 或 'mobileuvit_l'
         self.decomposition_method = 'percentile_50'  # 血管分解方法
+        # 严格碎片清理：每个标签仅保留最大连通域（默认关闭，避免误删主体）
+        strict_flag = os.environ.get("VESSELSEG_STRICT_FRAGMENT_PRUNE", "0")
+        self.strict_fragment_prune = str(strict_flag).strip().lower() not in ("0", "false", "off", "no")
+        # 重清理（连通域形态学强裁剪）默认关闭，避免把主体裁成大块
+        heavy_flag = os.environ.get("VESSELSEG_HEAVY_CLEANUP", "0")
+        self.heavy_cleanup = str(heavy_flag).strip().lower() in ("1", "true", "on", "yes")
+        # PyTorch推理模式：stable(默认，内存直推) / legacy(NIfTI回采样旧链路)
+        infer_mode = os.environ.get("VESSELSEG_PYTORCH_INFER_MODE", "stable")
+        self.pytorch_infer_mode = str(infer_mode).strip().lower() if infer_mode is not None else "stable"
         # 保存最近一次血管结构分析结果
         self.last_vessel_analysis: Dict[str, Any] = {}
     
@@ -619,6 +628,156 @@ class AISegmentationInterface:
         img_processed = img_processed.astype(np.float32)
         
         return img_processed
+
+    def _extract_logits(self, output: Any) -> "torch.Tensor":
+        """兼容Tensor/tuple输出，统一提取logits张量。"""
+        logits = output[0] if isinstance(output, (tuple, list)) else output
+        if not isinstance(logits, torch.Tensor):
+            raise RuntimeError(f"模型输出类型异常: {type(logits)}")
+        if logits.ndim == 4:
+            logits = logits.unsqueeze(0)
+        if logits.ndim != 5:
+            raise RuntimeError(f"模型输出维度异常: {tuple(logits.shape)}")
+        return logits
+
+    def _prepare_stable_infer_input(
+        self,
+        image_data: np.ndarray,
+        metadata: Optional[Mapping[str, Any]],
+    ) -> Tuple[np.ndarray, bool]:
+        """
+        稳定推理输入准备：
+        1) 仅做必要轴向对齐（SITK来源做X/Y互换）；
+        2) 在内存中完成强度预处理，避免NIfTI写盘+重采样带来的跨平台差异。
+        """
+        arr = np.asarray(image_data, dtype=np.float32)
+        swapped_xy = False
+
+        # 项目内部DICOM/NRRD为(Y, X, Z)；模型训练习惯为(X, Y, Z)
+        if isinstance(metadata, Mapping) and "sitk_image" in metadata and arr.ndim == 3:
+            arr = np.transpose(arr, (1, 0, 2))
+            swapped_xy = True
+
+        arr = np.nan_to_num(arr, nan=-1024.0, posinf=4000.0, neginf=-1024.0)
+        arr = np.clip(arr, 0.0, 400.0)
+        arr = arr / 400.0
+
+        # 与NormalizeIntensityd(nonzero=True)保持一致：仅对非零体素做z-score
+        nonzero = arr > 0
+        if np.any(nonzero):
+            values = arr[nonzero]
+            mean_v = float(values.mean())
+            std_v = float(values.std())
+            if std_v > 1e-6:
+                arr[nonzero] = (values - mean_v) / std_v
+            else:
+                arr[nonzero] = values - mean_v
+
+        return arr.astype(np.float32), swapped_xy
+
+    def _segment_pytorch_stable(
+        self,
+        image_data: np.ndarray,
+        original_shape: Tuple[int, int, int],
+        spacing: Tuple[float, float, float],
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> np.ndarray:
+        """稳定推理链路：内存直推，不走NIfTI回采样。"""
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        patch_size = (96, 96, 96)
+        inferer = SlidingWindowInferer(
+            roi_size=patch_size,
+            sw_batch_size=1,
+            overlap=0.6,
+            mode="gaussian",
+        )
+
+        input_arr, swapped_xy = self._prepare_stable_infer_input(image_data, metadata)
+        input_tensor = torch.from_numpy(input_arr).unsqueeze(0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = inferer(input_tensor, self.pytorch_model)
+            logits = self._extract_logits(output)
+            pred_label = torch.argmax(logits, dim=1).cpu().numpy()
+
+        mask = pred_label[0].astype(np.uint8)
+        mask = self._restore_internal_axis_order(mask, swapped_xy)
+        mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
+        return mask
+
+    def _segment_pytorch_legacy(
+        self,
+        image_data: np.ndarray,
+        original_shape: Tuple[int, int, int],
+        spacing: Tuple[float, float, float],
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> np.ndarray:
+        """旧链路：NIfTI临时写盘+方向/间距变换+回采样。"""
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        nifti_data, nifti_affine, swapped_xy = self._prepare_nifti_payload(
+            image_data=image_data,
+            spacing=spacing,
+            metadata=metadata,
+        )
+        tmp_nii = nib.Nifti1Image(nifti_data, affine=nifti_affine)
+        nib.save(tmp_nii, tmp_path)
+
+        try:
+            patch_size = (96, 96, 96)
+            spatial_ops = [
+                LoadImaged(keys=["image"]),
+                EnsureChannelFirstd(keys=["image"]),
+                Orientationd(keys=["image"], axcodes="LPI"),
+                Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear")),
+                CropForegroundd(keys=["image"], source_key="image", select_fn=lambda x: x > -200),
+                SpatialPadd(keys=["image"], spatial_size=patch_size),
+            ]
+
+            inf_transforms = Compose(spatial_ops + [
+                ScaleIntensityRanged(keys="image", a_min=0, a_max=400, b_min=0.0, b_max=1.0, clip=True),
+                NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+                EnsureTyped(keys=["image"]),
+            ])
+
+            data_inf = inf_transforms({"image": tmp_path})
+            input_tensor = data_inf["image"].unsqueeze(0).to(device)
+
+            inferer = SlidingWindowInferer(
+                roi_size=patch_size,
+                sw_batch_size=1,
+                overlap=0.6,
+                mode="gaussian",
+            )
+
+            with torch.no_grad():
+                output = inferer(input_tensor, self.pytorch_model)
+                logits = self._extract_logits(output)
+                pred_label = torch.argmax(logits, dim=1).cpu().numpy()
+
+            orig_nii = nib.load(tmp_path)
+            pred_nii_cropped = nib.Nifti1Image(
+                pred_label[0].astype(np.uint8),
+                data_inf["image"].meta["affine"],
+            )
+
+            final_pred_nii = resample_to_img(
+                pred_nii_cropped,
+                orig_nii,
+                interpolation="nearest",
+            )
+
+            mask = final_pred_nii.get_fdata().astype(np.uint8)
+            mask = self._restore_internal_axis_order(mask, swapped_xy)
+            mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
+            return mask
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
     
     def postprocess_mask(
         self,
@@ -672,17 +831,26 @@ class AISegmentationInterface:
             except Exception as e:
                 print(f"掩码尺寸回采样失败: {e}")
 
-        # 基础去噪：去掉每类血管极小孤立块，降低假阳性
+        # 基础去噪：保留更多小分支，同时去除真正的噪声
         try:
             from scipy import ndimage
             clean_mask = np.zeros_like(mask, dtype=np.uint8)
             for label in (1, 2):
-                comp, n_comp = ndimage.label(mask == label)
+                # 先进行形态学操作，填充小空洞
+                binary = mask == label
+                if not np.any(binary):
+                    continue
+                # 轻度膨胀操作，连接邻近的血管片段
+                binary = ndimage.binary_dilation(binary, structure=np.ones((3, 3, 3)))
+                # 轻度闭操作，填充小空洞
+                binary = ndimage.binary_closing(binary, structure=np.ones((3, 3, 3)))
+                # 标记连通区域
+                comp, n_comp = ndimage.label(binary)
                 if n_comp == 0:
                     continue
                 sizes = np.bincount(comp.ravel())
-                # 背景索引0不算；阈值自适应，最低8体素
-                min_keep = max(8, int(0.00001 * mask.size))
+                # 降低阈值，保留更多小分支，最低4体素
+                min_keep = max(4, int(0.000005 * mask.size))
                 keep_ids = np.where(sizes >= min_keep)[0]
                 keep_ids = keep_ids[keep_ids != 0]
                 if keep_ids.size > 0:
@@ -693,19 +861,21 @@ class AISegmentationInterface:
         except Exception as e:
             print(f"后处理去噪失败，继续使用原始掩码: {e}")
 
-        # 碎片化检测与连通性清理（解决3D中大量离散薄片的问题）
+        # 启用轻量级清理，保留更多分支结构
         try:
             n_comp, largest_ratio = self._fragmentation_metrics(mask)
             print(f"分割连通性评估: components={n_comp}, largest_ratio={largest_ratio:.3f}")
-            if n_comp >= 14 or largest_ratio < 0.42:
-                print("检测到明显碎片化，启用主连通血管清理...")
+            # 只有在严重碎片化时才进行清理
+            if n_comp >= 20 or largest_ratio < 0.3:
+                print("检测到严重碎片化，启用主连通血管清理...")
                 cleaned_mask = self._cleanup_fragmented_vessels(mask)
                 if np.any(cleaned_mask > 0):
                     mask = cleaned_mask
                     n2, r2 = self._fragmentation_metrics(mask)
                     print(f"清理后连通性: components={n2}, largest_ratio={r2:.3f}")
-                    if n2 >= 10 or r2 < 0.50:
-                        print("仍然存在碎片，启用最大连通域保守模式...")
+                    # 只有在仍然严重碎片化时才启用保守模式
+                    if n2 >= 15 or r2 < 0.4:
+                        print("仍然存在严重碎片，启用最大连通域保守模式...")
                         conservative = self._keep_largest_component_per_label(mask)
                         if np.any(conservative > 0):
                             mask = conservative
@@ -714,35 +884,35 @@ class AISegmentationInterface:
         except Exception as e:
             print(f"连通性清理失败，继续使用原始掩码: {e}")
 
+        # 禁用严格模式，保留更多血管分支
+        # 注释掉严格模式清理，以保留更多分支结构
+        # try:
+        #     strict_mask = self._keep_largest_component_per_label(mask)
+        #     if np.any(strict_mask > 0):
+        #         # 保底：若严格模式导致某一类血管体素骤降，则判定为误删并回退
+        #         accept_strict = True
+        #         for label in (1, 2):
+        #             before = int(np.sum(mask == label))
+        #             after = int(np.sum(strict_mask == label))
+        #             if before >= 500 and after < int(0.25 * before):
+        #                 accept_strict = False
+        #                 break
+
+        #         if accept_strict:
+        #             mask = strict_mask
+        #             n_strict, r_strict = self._fragmentation_metrics(mask)
+        #             print(f"严格碎片清理后: components={n_strict}, largest_ratio={r_strict:.3f}")
+        #         else:
+        #             print("严格碎片清理触发误删保护，已回退到非严格结果")
+        # except Exception as e:
+        #     print(f"严格碎片清理失败，继续使用当前掩码: {e}")
+
         # 结构识别：PV/HV 主干/细分支/分叉/5级分层
         try:
             analysis = self.analyze_vessel_structure(mask, spacing=spacing)
 
-            # 分解策略控制“显示保留级别”
-            # 默认尽量保留细分支，满足5级以上识别需求
+            # 默认不做分级裁剪，避免“只剩主干大块”
             keep_max_level = 5
-            m = self.decomposition_method or "adaptive"
-            if m in ("fixed_2.5", "percentile_75"):
-                keep_max_level = 2
-            elif m in ("fixed_2.0",):
-                keep_max_level = 3
-            elif m in ("fixed_1.5",):
-                keep_max_level = 4
-            # adaptive / percentile_25 / percentile_50 / median / fixed_1.0 -> 保留到5级
-
-            if keep_max_level < 5:
-                filtered = np.zeros_like(mask, dtype=np.uint8)
-                for label, name in ((1, "pv"), (2, "hv")):
-                    level_map = analysis.get(name, {}).get("level_map")
-                    if level_map is None:
-                        continue
-                    keep = (level_map > 0) & (level_map <= keep_max_level)
-                    filtered[keep] = label
-                # 避免过度裁剪导致空结果
-                if np.any(filtered > 0):
-                    mask = filtered
-                    # 重新分析一次，保证缓存和最终mask一致
-                    self.analyze_vessel_structure(mask, spacing=spacing)
 
             print(f"血管结构识别完成: 非零体素={np.count_nonzero(mask)}")
             print(f"  PV体素: {np.sum(mask == 1)}")
@@ -795,91 +965,38 @@ class AISegmentationInterface:
                 mask = self.postprocess_mask(outputs[0], original_shape, spacing=spacing)
                 
             elif self.model_type == 'pytorch' and PYTORCH_AVAILABLE:
-                # PyTorch 模型推理（与 pred4.py 逻辑一致）
+                # PyTorch 模型推理
                 if self.pytorch_model is None:
                     raise RuntimeError("PyTorch 模型未初始化")
-                
-                device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-                
-                # 构建临时 NIfTI 文件路径
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
-                    tmp_path = tmp.name
-                
-                # 保存临时 NIfTI 文件
-                nifti_data, nifti_affine, swapped_xy = self._prepare_nifti_payload(
-                    image_data=image_data,
-                    spacing=spacing,
-                    metadata=metadata,
+                infer_mode = self.pytorch_infer_mode
+                print(
+                    f"使用参数: 模型变体={self.model_variant}, "
+                    f"血管分解方法={self.decomposition_method}, 推理模式={infer_mode}"
                 )
-                tmp_nii = nib.Nifti1Image(nifti_data, affine=nifti_affine)
-                nib.save(tmp_nii, tmp_path)
-                
-                try:
-                    # 定义变换（与 pred4.py 一致）
-                    PATCH_SIZE = (96, 96, 96)
-                    
-                    # 空间变换
-                    spatial_ops = [
-                        LoadImaged(keys=["image"]),
-                        EnsureChannelFirstd(keys=["image"]),
-                        Orientationd(keys=["image"], axcodes="LPI"),
-                        Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode=('bilinear')),
-                        # 无GT标签时使用更稳健的体部阈值，避免ROI过碎导致伪阳性扩散
-                        CropForegroundd(keys=["image"], source_key="image", select_fn=lambda x: x > -200),
-                        SpatialPadd(keys=["image"], spatial_size=PATCH_SIZE),
-                    ]
-                    
-                    print(f"使用参数: 模型变体={self.model_variant}, 血管分解方法={self.decomposition_method}")
-                    
-                    # 推理专用 Transform
-                    inf_transforms = Compose(spatial_ops + [
-                        ScaleIntensityRanged(keys="image", a_min=0, a_max=400, b_min=0.0, b_max=1.0, clip=True),
-                        NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-                        EnsureTyped(keys=["image"]),
-                    ])
-                    
-                    # 执行变换
-                    data_inf = inf_transforms({"image": tmp_path})
-                    input_tensor = data_inf["image"].unsqueeze(0).to(device)
-                    
-                    # 滑窗推理
-                    inferer = SlidingWindowInferer(roi_size=PATCH_SIZE, sw_batch_size=1, overlap=0.6, mode="gaussian")
-                    
-                    with torch.no_grad():
-                        output = inferer(input_tensor, self.pytorch_model)
-                        # 兼容Tensor/tuple输出，统一提取全局多分类logits
-                        logits = output[0] if isinstance(output, (tuple, list)) else output
-                        if not isinstance(logits, torch.Tensor):
-                            raise RuntimeError(f"模型输出类型异常: {type(logits)}")
-                        if logits.ndim == 4:
-                            logits = logits.unsqueeze(0)
-                        if logits.ndim != 5:
-                            raise RuntimeError(f"模型输出维度异常: {tuple(logits.shape)}")
-                        pred_label = torch.argmax(logits, dim=1).cpu().numpy()  # [B, H, W, D]
-                    
-                    # 还原到原始空间
-                    orig_nii = nib.load(tmp_path)
-                    pred_nii_cropped = nib.Nifti1Image(
-                        pred_label[0].astype(np.uint8), 
-                        data_inf["image"].meta["affine"]
+
+                if infer_mode == "legacy":
+                    mask = self._segment_pytorch_legacy(
+                        image_data=image_data,
+                        original_shape=original_shape,
+                        spacing=spacing,
+                        metadata=metadata,
                     )
-                    
-                    final_pred_nii = resample_to_img(
-                        pred_nii_cropped, 
-                        orig_nii, 
-                        interpolation='nearest'
-                    )
-                    
-                    mask = final_pred_nii.get_fdata().astype(np.uint8)
-                    mask = self._restore_internal_axis_order(mask, swapped_xy)
-                    # PyTorch路径也做统一结构识别与策略后处理
-                    mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
-                    
-                finally:
-                    # 清理临时文件
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+                else:
+                    try:
+                        mask = self._segment_pytorch_stable(
+                            image_data=image_data,
+                            original_shape=original_shape,
+                            spacing=spacing,
+                            metadata=metadata,
+                        )
+                    except Exception as stable_err:
+                        print(f"稳定推理失败，回退旧链路: {stable_err}")
+                        mask = self._segment_pytorch_legacy(
+                            image_data=image_data,
+                            original_shape=original_shape,
+                            spacing=spacing,
+                            metadata=metadata,
+                        )
             else:
                 raise ValueError(f"不支持的模型类型: {self.model_type}")
             

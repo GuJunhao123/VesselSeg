@@ -124,8 +124,17 @@ class ActiveContourSegmentation:
             mask_binary = (mask > 0.5).astype(np.float32)
             
             # 形态学操作保持连通性
+            # 先膨胀再腐蚀，填充小空洞
+            mask_binary = ndimage.binary_dilation(mask_binary, structure=np.ones((3, 3, 3)))
             mask_binary = ndimage.binary_closing(mask_binary, structure=np.ones((3, 3, 3)))
-            mask_binary = ndimage.binary_opening(mask_binary, structure=np.ones((3, 3, 3)))
+            mask_binary = ndimage.binary_closing(mask_binary, structure=np.ones((3, 3, 3)))
+            # 移除小的孤立区域
+            labeled, num_features = ndimage.label(mask_binary)
+            if num_features > 0:
+                # 保留最大的连通区域
+                sizes = ndimage.sum(mask_binary, labeled, range(num_features + 1))
+                mask_sizes = sizes > 100  # 阈值：100个体素
+                mask_binary = mask_sizes[labeled]
             if not np.any(mask_binary):
                 # 若演化到全空，回退到初始种子区域，避免“有种子但无结果”
                 self._initialize_mask_from_seeds()
@@ -192,8 +201,17 @@ class ActiveContourSegmentation:
             mask_binary = (mask > 0.5).astype(np.float32)
             
             # 形态学操作
+            # 先膨胀再腐蚀，填充小空洞
+            mask_binary = ndimage.binary_dilation(mask_binary, structure=np.ones((3, 3, 3)))
             mask_binary = ndimage.binary_closing(mask_binary, structure=np.ones((3, 3, 3)))
-            mask_binary = ndimage.binary_opening(mask_binary, structure=np.ones((3, 3, 3)))
+            mask_binary = ndimage.binary_closing(mask_binary, structure=np.ones((3, 3, 3)))
+            # 移除小的孤立区域
+            labeled, num_features = ndimage.label(mask_binary)
+            if num_features > 0:
+                # 保留最大的连通区域
+                sizes = ndimage.sum(mask_binary, labeled, range(num_features + 1))
+                mask_sizes = sizes > 100  # 阈值：100个体素
+                mask_binary = mask_sizes[labeled]
             if not np.any(mask_binary):
                 self._initialize_mask_from_seeds()
                 mask_binary = self.current_mask > 0

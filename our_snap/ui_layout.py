@@ -340,6 +340,140 @@ class DatabaseDialog(QDialog):
         return self.selected_entry
 
 
+class LabelViewerWindow(QWidget):
+    """独立标签查看窗口（用于医生标签/AI标签并行对比）。"""
+
+    def __init__(self, title: str, role_text: str, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle(title)
+        self.setMinimumSize(900, 700)
+
+        self.role_text = role_text
+        self.image_io = ImageIO()
+        self.base_image_data = None
+        self.base_spacing = None
+        self.current_label_data = None
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel(self.role_text))
+        self.source_label = QLabel("标签来源: 未设置")
+        self.source_label.setWordWrap(True)
+        top_bar.addWidget(self.source_label, stretch=1)
+
+        btn_load = QPushButton("加载标签文件")
+        btn_load.clicked.connect(self._on_load_label_file)
+        top_bar.addWidget(btn_load)
+
+        btn_clear = QPushButton("清空标签")
+        btn_clear.clicked.connect(self._on_clear_label)
+        top_bar.addWidget(btn_clear)
+
+        btn_update_3d = QPushButton("更新3D")
+        btn_update_3d.clicked.connect(self._on_update_3d)
+        top_bar.addWidget(btn_update_3d)
+        layout.addLayout(top_bar)
+
+        self.four_view = FourViewWidget()
+        layout.addWidget(self.four_view, stretch=1)
+
+    def _refresh_3d_safely(self):
+        """刷新3D视图（失败时静默，避免打断主流程）。"""
+        try:
+            self.four_view.refresh_3d_view()
+        except Exception:
+            pass
+
+    def set_base_image(self, image_data, spacing=None):
+        """设置基础影像（两个窗口保持一致）。"""
+        if image_data is None:
+            return
+
+        self.base_image_data = np.asarray(image_data)
+        self.base_spacing = spacing
+        self.four_view.set_image_data(self.base_image_data, spacing)
+
+        if self.current_label_data is None or self.current_label_data.shape != self.base_image_data.shape:
+            self.current_label_data = np.zeros(self.base_image_data.shape, dtype=np.uint8)
+            self.four_view.set_label_data(self.current_label_data)
+
+        self._refresh_3d_safely()
+
+    def set_label_data(self, label_data, source_text: str = "") -> bool:
+        """设置标签数据。"""
+        if self.base_image_data is None:
+            QMessageBox.warning(self, "提示", "请先在主窗口加载影像。")
+            return False
+        if label_data is None:
+            return False
+
+        arr = np.asarray(label_data).astype(np.uint8)
+        if arr.shape != self.base_image_data.shape:
+            QMessageBox.warning(
+                self,
+                "错误",
+                f"标签尺寸与影像不匹配\n影像尺寸: {self.base_image_data.shape}\n标签尺寸: {arr.shape}",
+            )
+            return False
+
+        self.current_label_data = np.copy(arr)
+        self.four_view.set_label_data(self.current_label_data)
+        if source_text:
+            self.source_label.setText(f"标签来源: {source_text}")
+
+        self._refresh_3d_safely()
+        return True
+
+    def _on_load_label_file(self):
+        """从文件加载标签。"""
+        if self.base_image_data is None:
+            QMessageBox.warning(self, "提示", "请先在主窗口加载影像。")
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "加载标签",
+            "",
+            "NIfTI文件 (*.nii *.nii.gz);;NRRD文件 (*.nrrd);;所有文件 (*.*)",
+        )
+        if not filepath:
+            return
+
+        try:
+            label_data = self.image_io.load_label_map(filepath)
+            if label_data is None:
+                QMessageBox.warning(self, "错误", "标签加载失败")
+                return
+            if self.set_label_data(label_data, source_text=os.path.basename(filepath)):
+                QMessageBox.information(self, "成功", "标签加载成功")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载标签失败:\n{e}")
+
+    def _on_clear_label(self):
+        """清空当前窗口标签。"""
+        if self.base_image_data is None:
+            return
+
+        self.current_label_data = np.zeros(self.base_image_data.shape, dtype=np.uint8)
+        self.four_view.set_label_data(self.current_label_data)
+        self.source_label.setText("标签来源: 已清空")
+        self._refresh_3d_safely()
+
+    def _on_update_3d(self):
+        """手动刷新3D。"""
+        try:
+            self.four_view.refresh_3d_view()
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"刷新3D失败:\n{e}")
+
+
 class MainWindow(QMainWindow):
     """主窗口"""
 
@@ -383,6 +517,10 @@ class MainWindow(QMainWindow):
         self.last_vessel_analysis = {}
         self.last_cut_stats = {}
         self._last_seed = None
+        self.doctor_label_window = None
+        self.ai_label_window = None
+        self.last_doctor_label_data = None
+        self.last_ai_label_data = None
 
         # 当前病人/检查/序列信息（从DICOM或数据库获取）
         self.current_patient_info = {}
@@ -553,6 +691,11 @@ class MainWindow(QMainWindow):
         btn_save_label.setFixedHeight(32)
         btn_save_label.clicked.connect(self._on_save_label)
         main_toolbar_layout.addWidget(btn_save_label)
+
+        btn_compare_labels = QPushButton("🪟 双窗口标签对比")
+        btn_compare_labels.setFixedHeight(32)
+        btn_compare_labels.clicked.connect(self._on_open_dual_label_windows)
+        main_toolbar_layout.addWidget(btn_compare_labels)
 
         main_toolbar_group.setLayout(main_toolbar_layout)
         content_layout.addWidget(main_toolbar_group)
@@ -1000,6 +1143,88 @@ class MainWindow(QMainWindow):
             self.four_view.set_label_data(self.current_label_data)
             self._refresh_structure_from_current_labels()
 
+    def _get_current_spacing(self):
+        """获取当前体数据 spacing。"""
+        if self.current_metadata and 'spacing' in self.current_metadata:
+            return self.current_metadata['spacing']
+        return None
+
+    def _ensure_dual_label_windows(self):
+        """确保医生/AI两个独立标签窗口存在。"""
+        if self.doctor_label_window is None:
+            self.doctor_label_window = LabelViewerWindow("医生标签窗口", "医生标签", parent=None)
+            self.doctor_label_window.destroyed.connect(
+                lambda _obj=None: setattr(self, 'doctor_label_window', None)
+            )
+
+        if self.ai_label_window is None:
+            self.ai_label_window = LabelViewerWindow("AI标签窗口", "AI标签", parent=None)
+            self.ai_label_window.destroyed.connect(
+                lambda _obj=None: setattr(self, 'ai_label_window', None)
+            )
+
+    def _sync_dual_windows_base_image(self, reset_labels: bool = False):
+        """把主窗口当前影像同步到两个独立窗口。"""
+        if self.current_image_data is None:
+            return
+
+        spacing = self._get_current_spacing()
+        windows = [self.doctor_label_window, self.ai_label_window]
+        for window in windows:
+            if window is None:
+                continue
+            window.set_base_image(self.current_image_data, spacing)
+            if reset_labels:
+                empty_label = np.zeros(self.current_image_data.shape, dtype=np.uint8)
+                window.set_label_data(empty_label, source_text="已清空")
+
+    def _set_doctor_compare_label(self, label_data, source_text: str = ""):
+        """更新医生标签窗口内容，并缓存最近一次医生标签。"""
+        if label_data is None:
+            return
+        self.last_doctor_label_data = np.asarray(label_data).astype(np.uint8).copy()
+        if self.doctor_label_window is not None:
+            self._sync_dual_windows_base_image(reset_labels=False)
+            self.doctor_label_window.set_label_data(self.last_doctor_label_data, source_text=source_text)
+
+    def _set_ai_compare_label(self, label_data, source_text: str = ""):
+        """更新AI标签窗口内容，并缓存最近一次AI标签。"""
+        if label_data is None:
+            return
+        self.last_ai_label_data = np.asarray(label_data).astype(np.uint8).copy()
+        if self.ai_label_window is not None:
+            self._sync_dual_windows_base_image(reset_labels=False)
+            self.ai_label_window.set_label_data(self.last_ai_label_data, source_text=source_text)
+
+    def _on_open_dual_label_windows(self):
+        """打开医生标签窗口 + AI标签窗口。"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像，再打开双窗口对比。")
+            return
+
+        self._ensure_dual_label_windows()
+        self._sync_dual_windows_base_image(reset_labels=False)
+
+        if self.last_doctor_label_data is not None:
+            self.doctor_label_window.set_label_data(self.last_doctor_label_data, source_text="医生标签(最近加载)")
+
+        if self.last_ai_label_data is not None:
+            self.ai_label_window.set_label_data(self.last_ai_label_data, source_text="AI标签(最近生成)")
+        elif self.current_label_data is not None and np.any(self.current_label_data):
+            self.ai_label_window.set_label_data(self.current_label_data, source_text="主窗口当前标签")
+
+        self.doctor_label_window.show()
+        self.ai_label_window.show()
+
+        base_x = max(self.x() + 20, 0)
+        base_y = max(self.y() + 40, 0)
+        self.doctor_label_window.move(base_x, base_y)
+        self.ai_label_window.move(base_x + self.doctor_label_window.width() + 20, base_y)
+
+        self.doctor_label_window.raise_()
+        self.ai_label_window.raise_()
+        self.doctor_label_window.activateWindow()
+
     def _on_load_label(self):
         """加载标签"""
         if self.current_image_data is None:
@@ -1030,6 +1255,7 @@ class MainWindow(QMainWindow):
                         self._refresh_structure_from_current_labels()
                         # 清空重做栈
                         self.redo_history.clear()
+                        self._set_doctor_compare_label(label_data, source_text=os.path.basename(filepath))
                         QMessageBox.information(self, "成功", "标签加载成功")
                     else:
                         QMessageBox.warning(self, "错误",
@@ -1530,6 +1756,7 @@ class MainWindow(QMainWindow):
 
                 # 保存血管结构识别结果（主干/细支/分叉/5级）
                 self._refresh_structure_from_current_labels()
+                self._set_ai_compare_label(mask, source_text="AI自动分割结果")
 
                 # 反馈简要统计
                 pv_count = int(np.sum(mask == 1))
@@ -1661,6 +1888,9 @@ class MainWindow(QMainWindow):
                 # 初始化标签数据
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                 self.four_view.set_label_data(self.current_label_data)
+                self.last_doctor_label_data = None
+                self.last_ai_label_data = None
+                self._sync_dual_windows_base_image(reset_labels=True)
                 self._reset_analysis_state()
 
                 # 设置活动标签ID
@@ -2331,6 +2561,9 @@ class MainWindow(QMainWindow):
                     # 初始化标签数据
                     self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                     self.four_view.set_label_data(self.current_label_data)
+                    self.last_doctor_label_data = None
+                    self.last_ai_label_data = None
+                    self._sync_dual_windows_base_image(reset_labels=True)
                     self._reset_analysis_state()
                     # 设置活动标签ID
                     self.four_view.axial_view.set_active_label_id(self.active_label_id)
@@ -2491,6 +2724,14 @@ class MainWindow(QMainWindow):
 
             self.four_view.set_label_data(self.current_label_data)
             self._refresh_structure_from_current_labels()
+            if self.current_label_data is not None and np.any(self.current_label_data):
+                self.last_doctor_label_data = np.asarray(self.current_label_data).astype(np.uint8).copy()
+            else:
+                self.last_doctor_label_data = None
+            self.last_ai_label_data = None
+            self._sync_dual_windows_base_image(reset_labels=True)
+            if self.last_doctor_label_data is not None and self.doctor_label_window is not None:
+                self.doctor_label_window.set_label_data(self.last_doctor_label_data, source_text="历史病例标签")
 
             # 更新信息显示
             self._update_patient_info_from_metadata(metadata)
@@ -2670,6 +2911,9 @@ class MainWindow(QMainWindow):
             # 初始化标签数据
             self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
+            self.last_doctor_label_data = None
+            self.last_ai_label_data = None
+            self._sync_dual_windows_base_image(reset_labels=True)
             self._reset_analysis_state()
             # 设置活动标签ID
             self.four_view.axial_view.set_active_label_id(self.active_label_id)
@@ -2725,6 +2969,9 @@ class MainWindow(QMainWindow):
 
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                 self.four_view.set_label_data(self.current_label_data)
+                self.last_doctor_label_data = None
+                self.last_ai_label_data = None
+                self._sync_dual_windows_base_image(reset_labels=True)
                 self._reset_analysis_state()
 
                 self.four_view.axial_view.set_active_label_id(self.active_label_id)

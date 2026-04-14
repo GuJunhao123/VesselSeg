@@ -886,23 +886,23 @@ class SliceViewer(QWidget):
         
         # 对点云进行降采样，减少绘制的点数量
         total_points = len(x)
-        if total_points > 10000:
-            # 降采样到10000个点
-            step = total_points // 10000
+        if total_points > 20000:
+            # 降采样到20000个点，保留更多细节
+            step = total_points // 20000
             x = x[::step]
             y = y[::step]
             z = z[::step]
-        elif total_points > 5000:
-            # 降采样到5000个点
-            step = total_points // 5000
+        elif total_points > 10000:
+            # 降采样到10000个点
+            step = total_points // 10000
             x = x[::step]
             y = y[::step]
             z = z[::step]
         
         # 绘制点云
         if len(x) > 0:
-            # 使用更高效的方式绘制
-            self.ax.scatter(x, y, z, c=color, alpha=alpha, s=1, label=label, marker='.', linewidths=0)
+            # 使用更高效的方式绘制，增加点大小以提高可见性
+            self.ax.scatter(x, y, z, c=color, alpha=alpha, s=2, label=label, marker='.', linewidths=0)
     
     def _plot_cutting_plane(self):
         """绘制虚拟切割平面"""
