@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 AI自动分割接口模块
@@ -56,9 +56,15 @@ class AISegmentationInterface:
         # 重清理（连通域形态学强裁剪）默认关闭，避免把主体裁成大块
         heavy_flag = os.environ.get("VESSELSEG_HEAVY_CLEANUP", "0")
         self.heavy_cleanup = str(heavy_flag).strip().lower() in ("1", "true", "on", "yes")
-        # PyTorch推理模式：stable(默认，内存直推) / legacy(NIfTI回采样旧链路)
-        infer_mode = os.environ.get("VESSELSEG_PYTORCH_INFER_MODE", "stable")
-        self.pytorch_infer_mode = str(infer_mode).strip().lower() if infer_mode is not None else "stable"
+        # PyTorch推理模式：auto(默认，stable+legacy融合) / stable / legacy
+        infer_mode = os.environ.get("VESSELSEG_PYTORCH_INFER_MODE", "auto")
+        self.pytorch_infer_mode = str(infer_mode).strip().lower() if infer_mode is not None else "auto"
+        # 启用ROI聚焦推理，降低全腹部假阳性碎片
+        roi_flag = os.environ.get("VESSELSEG_ROI_FOCUS", "1")
+        self.roi_focus_enabled = str(roi_flag).strip().lower() not in ("0", "false", "off", "no")
+        # 稳定路径默认启用1mm各向同性重采样，降低厚层扫描带来的条带碎片
+        iso_flag = os.environ.get("VESSELSEG_STABLE_ISO", "1")
+        self.stable_iso_enabled = str(iso_flag).strip().lower() not in ("0", "false", "off", "no")
         # 保存最近一次血管结构分析结果
         self.last_vessel_analysis: Dict[str, Any] = {}
     
@@ -474,7 +480,11 @@ class AISegmentationInterface:
         largest_ratio = (largest / float(total)) if total > 0 else 0.0
         return int(n_comp), float(largest_ratio)
 
-    def _cleanup_fragmented_vessels(self, mask: np.ndarray) -> np.ndarray:
+    def _cleanup_fragmented_vessels(
+        self,
+        mask: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> np.ndarray:
         """
         针对明显碎片化的AI结果做连通性约束：
         1) 先在联合血管上保留主要连通团块
@@ -489,6 +499,7 @@ class AISegmentationInterface:
             return mask
 
         structure = ndimage.generate_binary_structure(3, 2)
+        sx, sy, sz = self._normalize_spacing_tuple(spacing)
         cleaned = np.copy(mask).astype(np.uint8)
 
         # 先轻度闭运算，连接近邻碎块，避免主血管被切成很多段
@@ -501,6 +512,8 @@ class AISegmentationInterface:
             largest = int(union_sizes[sorted_ids[0]]) if sorted_ids.size > 0 else 0
 
             keep_union_ids = []
+            first_centroid_mm = None
+            first_span_mm = None
             for cid in sorted_ids:
                 if cid == 0:
                     continue
@@ -510,10 +523,28 @@ class AISegmentationInterface:
                 # 保留最大的主体；若第二大也足够大则一起保留，防止误删另一条主静脉树
                 if not keep_union_ids:
                     keep_union_ids.append(int(cid))
+                    coords = np.argwhere(union_comp == cid)
+                    if coords.size > 0:
+                        centroid = coords.mean(axis=0)
+                        first_centroid_mm = np.array([centroid[0] * sx, centroid[1] * sy, centroid[2] * sz], dtype=np.float64)
+                        span = coords.max(axis=0) - coords.min(axis=0) + 1
+                        first_span_mm = np.array([span[0] * sx, span[1] * sy, span[2] * sz], dtype=np.float64)
                     continue
-                if len(keep_union_ids) < 2 and size >= max(1500, int(0.22 * largest)):
-                    keep_union_ids.append(int(cid))
-                    continue
+
+                # 第二大连通域需足够大且与主体空间邻近，避免保留远处整块假阳性
+                if len(keep_union_ids) < 2 and size >= max(1500, int(0.28 * largest)):
+                    near_main = False
+                    coords = np.argwhere(union_comp == cid)
+                    if coords.size > 0 and first_centroid_mm is not None and first_span_mm is not None:
+                        centroid = coords.mean(axis=0)
+                        centroid_mm = np.array([centroid[0] * sx, centroid[1] * sy, centroid[2] * sz], dtype=np.float64)
+                        dist_mm = float(np.linalg.norm(centroid_mm - first_centroid_mm))
+                        ref_mm = float(np.linalg.norm(first_span_mm))
+                        max_allow_mm = max(45.0, 0.60 * ref_mm)
+                        near_main = dist_mm <= max_allow_mm
+                    if near_main:
+                        keep_union_ids.append(int(cid))
+                        continue
                 break
 
             if keep_union_ids:
@@ -593,6 +624,284 @@ class AISegmentationInterface:
                 out[comp == best_id] = label
 
         return out
+
+    def _keep_primary_components_per_label(
+        self,
+        mask: np.ndarray,
+        max_components: int = 2,
+        min_ratio: float = 0.20,
+        min_voxels: int = 140,
+    ) -> np.ndarray:
+        """每个标签保留主连通域及少量足够大的次级主分支。"""
+        from scipy import ndimage
+
+        if mask is None or mask.ndim != 3:
+            return mask
+
+        out = np.zeros_like(mask, dtype=np.uint8)
+        structure = ndimage.generate_binary_structure(3, 2)
+        for label in (1, 2):
+            comp, n_comp = ndimage.label(mask == label, structure=structure)
+            if n_comp == 0:
+                continue
+
+            sizes = np.bincount(comp.ravel())
+            sizes[0] = 0
+            ids = np.argsort(sizes)[::-1]
+            if ids.size == 0:
+                continue
+
+            largest = int(sizes[ids[0]]) if ids[0] != 0 else 0
+            keep_ids = []
+            for cid in ids:
+                if cid == 0:
+                    continue
+                size = int(sizes[cid])
+                if size <= 0:
+                    continue
+
+                if not keep_ids:
+                    keep_ids.append(int(cid))
+                    continue
+
+                if (
+                    len(keep_ids) < max_components
+                    and size >= max(min_voxels, int(min_ratio * max(largest, 1)))
+                ):
+                    keep_ids.append(int(cid))
+
+            if keep_ids:
+                out[np.isin(comp, keep_ids)] = label
+
+        return out
+
+    def _prune_far_small_fragments(
+        self,
+        mask: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> np.ndarray:
+        """
+        删除“远离主体”的孤立碎片，尽量不影响主体及近邻分支。
+        规则采用分级阈值：
+        - 距离很近：保留（可能是被切断的真实分支）
+        - 距离较远且较小：删除
+        - 距离很远且中等体积：删除
+        并保留“非常大”的次级组件，避免误删被断开的主干段。
+        """
+        from scipy import ndimage
+
+        if mask is None or mask.ndim != 3:
+            return mask
+
+        sx, sy, sz = self._normalize_spacing_tuple(spacing)
+        spacing_mm = (sx, sy, sz)
+        structure = ndimage.generate_binary_structure(3, 2)
+        out = np.copy(mask).astype(np.uint8)
+        level = str(os.environ.get("VESSELSEG_FRAGMENT_CLEAN_LEVEL", "balanced")).strip().lower()
+        is_aggressive = level in ("aggressive", "high", "2")
+        is_conservative = level in ("conservative", "low", "0")
+
+        for label in (1, 2):
+            comp, n_comp = ndimage.label(out == label, structure=structure)
+            if n_comp <= 1:
+                continue
+
+            sizes = np.bincount(comp.ravel())
+            sizes[0] = 0
+            main_id = int(np.argmax(sizes))
+            if main_id <= 0:
+                continue
+
+            main_mask = comp == main_id
+            coords = np.argwhere(main_mask)
+            if coords.size == 0:
+                continue
+            main_size = int(sizes[main_id])
+            main_centroid = coords.mean(axis=0).astype(np.float64)
+            span = coords.max(axis=0) - coords.min(axis=0) + 1
+            main_extent_mm = float(np.linalg.norm(np.array([span[0] * sx, span[1] * sy, span[2] * sz], dtype=np.float64)))
+
+            # 预计算到主干的物理距离
+            dist_to_main = ndimage.distance_transform_edt(~main_mask, sampling=spacing_mm)
+
+            # 根据模式调整阈值：默认 balanced
+            if is_conservative:
+                near_keep_mm = 16.0
+                soft_far_mm = min(65.0, max(30.0, 0.33 * main_extent_mm))
+                hard_far_mm = min(86.0, max(46.0, 0.48 * main_extent_mm))
+                small_drop_ratio = 0.30
+                medium_drop_ratio = 0.50
+            elif is_aggressive:
+                near_keep_mm = 10.0
+                soft_far_mm = min(46.0, max(18.0, 0.22 * main_extent_mm))
+                hard_far_mm = min(62.0, max(28.0, 0.30 * main_extent_mm))
+                small_drop_ratio = 0.42
+                medium_drop_ratio = 0.72
+            else:
+                near_keep_mm = 12.0
+                soft_far_mm = min(56.0, max(22.0, 0.26 * main_extent_mm))
+                hard_far_mm = min(72.0, max(34.0, 0.36 * main_extent_mm))
+                small_drop_ratio = 0.35
+                medium_drop_ratio = 0.64
+
+            # 即使距离远，也保留“非常大”的次级组件，减少误删风险
+            very_large_keep_ratio = 0.80
+
+            keep_ids = {main_id}
+            ids = np.where(sizes > 0)[0]
+            for cid in ids:
+                if cid == 0 or cid == main_id:
+                    continue
+                size = int(sizes[cid])
+                cmask = comp == cid
+                if not np.any(cmask):
+                    continue
+
+                min_dist_mm = float(dist_to_main[cmask].min())
+                size_ratio = float(size) / float(max(main_size, 1))
+                if size_ratio >= very_large_keep_ratio:
+                    keep_ids.add(int(cid))
+                    continue
+
+                ccoords = np.argwhere(cmask)
+                if ccoords.size > 0:
+                    centroid = ccoords.mean(axis=0).astype(np.float64)
+                    centroid_dist_mm = float(
+                        np.linalg.norm((centroid - main_centroid) * np.array([sx, sy, sz], dtype=np.float64))
+                    )
+                else:
+                    centroid_dist_mm = float(min_dist_mm)
+
+                # 临近主体的组件保留（可能是被切断的真实分支）
+                if min_dist_mm <= near_keep_mm:
+                    keep_ids.add(int(cid))
+                    continue
+
+                should_drop = False
+                # 很远 + 中等或更小：删除
+                if min_dist_mm > hard_far_mm and size_ratio < medium_drop_ratio:
+                    should_drop = True
+                # 较远 + 较小：删除
+                elif min_dist_mm > soft_far_mm and size_ratio < small_drop_ratio:
+                    should_drop = True
+                # 补充规则：质心也明显远离且组件不大，删除
+                elif (
+                    min_dist_mm > 0.8 * soft_far_mm
+                    and centroid_dist_mm > max(1.3 * soft_far_mm, 0.55 * main_extent_mm)
+                    and size_ratio < 0.55
+                ):
+                    should_drop = True
+
+                if should_drop:
+                    continue
+                keep_ids.add(int(cid))
+
+            out[(out == label) & (~np.isin(comp, list(keep_ids)))] = 0
+
+        return out
+
+    def _estimate_focus_roi(
+        self,
+        image_data: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> Tuple[slice, slice, slice]:
+        """
+        基于强度和空间先验估计肝脏血管ROI，减少全腹部误检。
+        返回(H, W, D)上的切片范围。
+        """
+        from scipy import ndimage
+
+        arr = np.asarray(image_data, dtype=np.float32)
+        if arr.ndim != 3:
+            return (slice(0, arr.shape[0]), slice(0, arr.shape[1]), slice(0, arr.shape[2]))
+
+        h, w, d = arr.shape
+        sx, sy, sz = self._normalize_spacing_tuple(spacing)
+
+        # 体部掩码 + 对比增强血管候选
+        body = arr > -300.0
+        vessel_like = (arr >= 70.0) & (arr <= 360.0) & body
+        vessel_like = ndimage.binary_opening(vessel_like, structure=np.ones((3, 3, 1), dtype=bool))
+        vessel_like = ndimage.binary_closing(vessel_like, structure=np.ones((5, 5, 3), dtype=bool))
+
+        structure = ndimage.generate_binary_structure(3, 1)
+        comp, n_comp = ndimage.label(vessel_like, structure=structure)
+        if n_comp == 0:
+            return (slice(0, h), slice(0, w), slice(0, d))
+
+        sizes = np.bincount(comp.ravel())
+        sizes[0] = 0
+        ids = np.where(sizes > 0)[0]
+        if ids.size == 0:
+            return (slice(0, h), slice(0, w), slice(0, d))
+
+        center = np.array([h / 2.0, w / 2.0, d / 2.0], dtype=np.float64)
+        shape_vec = np.array([max(1, h), max(1, w), max(1, d)], dtype=np.float64)
+
+        best_id = int(ids[0])
+        best_score = -1.0
+        for cid in ids:
+            coords = np.argwhere(comp == cid)
+            if coords.size == 0:
+                continue
+            centroid = coords.mean(axis=0)
+            norm_dist = float(np.linalg.norm((centroid - center) / shape_vec))
+            size = int(sizes[cid])
+            score = float(size) * (1.35 - min(norm_dist, 1.0))
+            if score > best_score:
+                best_score = score
+                best_id = int(cid)
+
+        coords = np.argwhere(comp == best_id)
+        if coords.size == 0:
+            return (slice(0, h), slice(0, w), slice(0, d))
+
+        mins = coords.min(axis=0).astype(int)
+        maxs = coords.max(axis=0).astype(int) + 1
+
+        # 物理边界扩张（约45mm），并保证最小体积范围
+        pad = np.array([
+            max(12, int(45.0 / max(sx, 1e-6))),
+            max(12, int(45.0 / max(sy, 1e-6))),
+            max(8, int(45.0 / max(sz, 1e-6))),
+        ], dtype=int)
+        min_size = np.array([120, 120, 72], dtype=int)
+
+        starts = mins - pad
+        ends = maxs + pad
+        for i in range(3):
+            cur = int(ends[i] - starts[i])
+            if cur < int(min_size[i]):
+                need = int(min_size[i] - cur)
+                starts[i] -= need // 2
+                ends[i] += need - need // 2
+
+        starts = np.maximum(starts, 0)
+        ends = np.minimum(ends, np.array([h, w, d], dtype=int))
+
+        if np.any(ends <= starts):
+            return (slice(0, h), slice(0, w), slice(0, d))
+
+        return (
+            slice(int(starts[0]), int(ends[0])),
+            slice(int(starts[1]), int(ends[1])),
+            slice(int(starts[2]), int(ends[2])),
+        )
+
+    def _resample_volume(
+        self,
+        volume: np.ndarray,
+        src_spacing: Tuple[float, float, float],
+        dst_spacing: Tuple[float, float, float],
+        order: int = 1,
+    ) -> np.ndarray:
+        """按spacing做体数据重采样。"""
+        from scipy.ndimage import zoom
+
+        sx, sy, sz = self._normalize_spacing_tuple(src_spacing)
+        tx, ty, tz = self._normalize_spacing_tuple(dst_spacing)
+        zoom_factors = [sx / tx, sy / ty, sz / tz]
+        return zoom(volume, zoom_factors, order=order, mode="nearest")
     
     def preprocess_image(self, image_data: np.ndarray) -> np.ndarray:
         """
@@ -681,6 +990,7 @@ class AISegmentationInterface:
         original_shape: Tuple[int, int, int],
         spacing: Tuple[float, float, float],
         metadata: Optional[Mapping[str, Any]] = None,
+        apply_postprocess: bool = True,
     ) -> np.ndarray:
         """稳定推理链路：内存直推，不走NIfTI回采样。"""
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -692,17 +1002,81 @@ class AISegmentationInterface:
             mode="gaussian",
         )
 
-        input_arr, swapped_xy = self._prepare_stable_infer_input(image_data, metadata)
-        input_tensor = torch.from_numpy(input_arr).unsqueeze(0).unsqueeze(0).to(device)
+        roi_slices = (
+            self._estimate_focus_roi(image_data, spacing=spacing)
+            if self.roi_focus_enabled
+            else (slice(0, original_shape[0]), slice(0, original_shape[1]), slice(0, original_shape[2]))
+        )
+        image_roi = np.asarray(image_data[roi_slices], dtype=np.float32)
+        input_arr, swapped_xy = self._prepare_stable_infer_input(image_roi, metadata)
+
+        # 先重采样到1mm再推理，减少厚层数据导致的层间断裂/条带假阳性
+        src_spacing = self._normalize_spacing_tuple(spacing)
+        infer_arr = input_arr
+        infer_spacing = src_spacing
+        if self.stable_iso_enabled:
+            try:
+                voxel_count = int(np.prod(np.array(input_arr.shape, dtype=np.int64)))
+                # 粗略限制，避免极端数据重采样后爆内存
+                if voxel_count <= 50_000_000:
+                    infer_arr = self._resample_volume(
+                        input_arr,
+                        src_spacing=src_spacing,
+                        dst_spacing=(1.0, 1.0, 1.0),
+                        order=1,
+                    ).astype(np.float32)
+                    infer_spacing = (1.0, 1.0, 1.0)
+            except Exception as e:
+                print(f"stable路径1mm重采样失败，回退原spacing推理: {e}")
+                infer_arr = input_arr
+                infer_spacing = src_spacing
+
+        input_tensor = torch.from_numpy(infer_arr).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
             output = inferer(input_tensor, self.pytorch_model)
             logits = self._extract_logits(output)
             pred_label = torch.argmax(logits, dim=1).cpu().numpy()
 
-        mask = pred_label[0].astype(np.uint8)
-        mask = self._restore_internal_axis_order(mask, swapped_xy)
-        mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
+        roi_mask = pred_label[0].astype(np.uint8)
+
+        # 从推理空间回到ROI空间
+        if tuple(roi_mask.shape) != tuple(input_arr.shape):
+            try:
+                if infer_spacing != src_spacing:
+                    roi_mask = self._resample_volume(
+                        roi_mask.astype(np.float32),
+                        src_spacing=infer_spacing,
+                        dst_spacing=src_spacing,
+                        order=0,
+                    )
+                    roi_mask = np.rint(roi_mask).astype(np.uint8)
+                else:
+                    from scipy.ndimage import zoom
+                    zoom_factors = [
+                        float(input_arr.shape[i]) / float(max(1, roi_mask.shape[i]))
+                        for i in range(3)
+                    ]
+                    roi_mask = zoom(roi_mask.astype(np.float32), zoom_factors, order=0, mode="nearest")
+                    roi_mask = np.rint(roi_mask).astype(np.uint8)
+            except Exception as e:
+                print(f"stable路径回采样到ROI失败: {e}")
+
+        roi_mask = self._restore_internal_axis_order(roi_mask, swapped_xy)
+
+        # 将ROI结果还原到全尺寸体数据
+        mask = np.zeros(original_shape, dtype=np.uint8)
+        if mask[roi_slices].shape == roi_mask.shape:
+            mask[roi_slices] = roi_mask
+        else:
+            # 兜底：尺寸异常时直接回退全尺寸推理结果
+            from scipy.ndimage import zoom
+            zoom_factors = [float(dst) / float(src) for dst, src in zip(mask[roi_slices].shape, roi_mask.shape)]
+            resized = zoom(roi_mask.astype(np.float32), zoom_factors, order=0, mode="nearest")
+            mask[roi_slices] = np.rint(resized).astype(np.uint8)
+
+        if apply_postprocess:
+            mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
         return mask
 
     def _segment_pytorch_legacy(
@@ -711,6 +1085,7 @@ class AISegmentationInterface:
         original_shape: Tuple[int, int, int],
         spacing: Tuple[float, float, float],
         metadata: Optional[Mapping[str, Any]] = None,
+        apply_postprocess: bool = True,
     ) -> np.ndarray:
         """旧链路：NIfTI临时写盘+方向/间距变换+回采样。"""
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -773,11 +1148,123 @@ class AISegmentationInterface:
 
             mask = final_pred_nii.get_fdata().astype(np.uint8)
             mask = self._restore_internal_axis_order(mask, swapped_xy)
-            mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
+            if apply_postprocess:
+                mask = self.postprocess_mask(mask, original_shape, spacing=spacing)
             return mask
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def _fuse_pytorch_masks(
+        self,
+        stable_mask: Optional[np.ndarray],
+        legacy_mask: Optional[np.ndarray],
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    ) -> Optional[np.ndarray]:
+        """
+        融合stable/legacy两条推理路径，尽量保留主体血管树并抑制离散碎片。
+        """
+        from scipy import ndimage
+
+        if stable_mask is None and legacy_mask is None:
+            return None
+        if stable_mask is None:
+            return legacy_mask.astype(np.uint8)
+        if legacy_mask is None:
+            return stable_mask.astype(np.uint8)
+
+        if stable_mask.shape != legacy_mask.shape:
+            # 形状不一致时优先稳定路径
+            return stable_mask.astype(np.uint8)
+
+        sx, sy, sz = self._normalize_spacing_tuple(spacing)
+        spacing_mm = (sx, sy, sz)
+        structure = ndimage.generate_binary_structure(3, 2)
+
+        keep_maps: Dict[int, np.ndarray] = {}
+        for label in (1, 2):
+            a = stable_mask == label
+            b = legacy_mask == label
+            union = a | b
+            if not np.any(union):
+                keep_maps[label] = np.zeros_like(union, dtype=bool)
+                continue
+
+            inter = a & b
+            core = inter if np.any(inter) else (a if np.count_nonzero(a) >= np.count_nonzero(b) else b)
+            core_dil = ndimage.binary_dilation(core, structure=np.ones((3, 3, 3)), iterations=2)
+
+            comp, n_comp = ndimage.label(union, structure=structure)
+            sizes = np.bincount(comp.ravel()) if n_comp > 0 else np.array([0])
+            if sizes.size > 0:
+                sizes[0] = 0
+            largest = int(sizes.max()) if sizes.size > 1 else int(np.count_nonzero(union))
+
+            dist_to_core = (
+                ndimage.distance_transform_edt(~core, sampling=spacing_mm)
+                if np.any(core)
+                else None
+            )
+
+            keep = np.zeros_like(union, dtype=bool)
+            if n_comp > 0:
+                for cid in np.argsort(sizes)[::-1]:
+                    if cid == 0:
+                        continue
+                    size = int(sizes[cid])
+                    if size <= 0:
+                        continue
+                    cmask = comp == cid
+
+                    if np.any(core_dil & cmask):
+                        keep |= cmask
+                        continue
+
+                    # 次级大分支：仅在距离主体不远时保留
+                    if size >= max(240, int(0.12 * max(largest, 1))):
+                        if dist_to_core is None:
+                            keep |= cmask
+                        else:
+                            min_dist = float(dist_to_core[cmask].min()) if np.any(cmask) else 1e9
+                            if min_dist <= max(spacing_mm) * 8.0:
+                                keep |= cmask
+
+            if not np.any(keep):
+                best_id = int(np.argmax(sizes)) if sizes.size > 1 else 0
+                if best_id > 0:
+                    keep = comp == best_id
+                if not np.any(keep):
+                    keep = core
+
+            keep_maps[label] = keep | core
+
+        keep_pv = keep_maps.get(1, np.zeros_like(stable_mask, dtype=bool))
+        keep_hv = keep_maps.get(2, np.zeros_like(stable_mask, dtype=bool))
+
+        conflict = keep_pv & keep_hv
+        if np.any(conflict):
+            stable_pref = stable_mask[conflict]
+            legacy_pref = legacy_mask[conflict]
+            pref = np.where(stable_pref > 0, stable_pref, legacy_pref)
+            keep_pv[conflict] = pref == 1
+            keep_hv[conflict] = pref == 2
+
+        fused = np.zeros_like(stable_mask, dtype=np.uint8)
+        fused[keep_pv] = 1
+        fused[keep_hv] = 2
+        return fused
+
+    def _evaluate_mask_quality(self, mask: np.ndarray) -> Dict[str, float]:
+        """评估掩码连通性质量，用于auto模式候选结果选择。"""
+        n_comp, largest_ratio = self._fragmentation_metrics(mask)
+        voxels = int(np.count_nonzero(mask > 0))
+        score = float(largest_ratio) - 0.02 * max(0, int(n_comp) - 8)
+        return {
+            "score": float(score),
+            "components": int(n_comp),
+            "largest_ratio": float(largest_ratio),
+            "voxels": float(voxels),
+        }
     
     def postprocess_mask(
         self,
@@ -812,14 +1299,12 @@ class AISegmentationInterface:
         # 处理多通道输出（3通道：背景、门静脉、肝静脉）
         if output_data.ndim == 4:
             if output_data.shape[0] == 3:
-                # C,H,W,D -> H,W,D
                 output_data = np.argmax(output_data, axis=0)
             elif output_data.shape[-1] == 3:
-                # H,W,D,C -> H,W,D
                 output_data = np.argmax(output_data, axis=-1)
 
-        # 确保是uint8类型
         mask = output_data.astype(np.uint8)
+        mask = np.where((mask == 1) | (mask == 2), mask, 0).astype(np.uint8)
 
         # 调整尺寸（如果需要），使用最近邻保持多标签
         if mask.shape != original_shape:
@@ -831,89 +1316,170 @@ class AISegmentationInterface:
             except Exception as e:
                 print(f"掩码尺寸回采样失败: {e}")
 
-        # 基础去噪：保留更多小分支，同时去除真正的噪声
+        # 保守去噪：仅去除极小孤立碎片，不做默认膨胀/闭操作。
         try:
             from scipy import ndimage
+            structure = ndimage.generate_binary_structure(3, 2)
             clean_mask = np.zeros_like(mask, dtype=np.uint8)
+
             for label in (1, 2):
-                # 先进行形态学操作，填充小空洞
-                binary = mask == label
-                if not np.any(binary):
-                    continue
-                # 轻度膨胀操作，连接邻近的血管片段
-                binary = ndimage.binary_dilation(binary, structure=np.ones((3, 3, 3)))
-                # 轻度闭操作，填充小空洞
-                binary = ndimage.binary_closing(binary, structure=np.ones((3, 3, 3)))
-                # 标记连通区域
-                comp, n_comp = ndimage.label(binary)
+                comp, n_comp = ndimage.label(mask == label, structure=structure)
                 if n_comp == 0:
                     continue
+
                 sizes = np.bincount(comp.ravel())
-                # 降低阈值，保留更多小分支，最低4体素
-                min_keep = max(4, int(0.000005 * mask.size))
+                sizes[0] = 0
+                min_keep = max(10, int(0.00001 * mask.size))
                 keep_ids = np.where(sizes >= min_keep)[0]
                 keep_ids = keep_ids[keep_ids != 0]
+
+                # 保底：若阈值导致该类全空，至少保留最大连通域
+                if keep_ids.size == 0:
+                    best_id = int(np.argmax(sizes))
+                    if best_id > 0 and sizes[best_id] > 0:
+                        keep_ids = np.array([best_id], dtype=np.int64)
+
                 if keep_ids.size > 0:
                     clean_mask[np.isin(comp, keep_ids)] = label
-            # 若清洗后全空，回退
+
             if np.any(clean_mask > 0):
                 mask = clean_mask
         except Exception as e:
-            print(f"后处理去噪失败，继续使用原始掩码: {e}")
+            print(f"后处理去噪失败，继续使用当前掩码: {e}")
 
-        # 启用轻量级清理，保留更多分支结构
+        # 自动碎片化收敛：明显碎片化时，优先保留“主血管树”形态（带误删保护）
         try:
-            n_comp, largest_ratio = self._fragmentation_metrics(mask)
-            print(f"分割连通性评估: components={n_comp}, largest_ratio={largest_ratio:.3f}")
-            # 只有在严重碎片化时才进行清理
-            if n_comp >= 20 or largest_ratio < 0.3:
-                print("检测到严重碎片化，启用主连通血管清理...")
-                cleaned_mask = self._cleanup_fragmented_vessels(mask)
+            q_before = self._evaluate_mask_quality(mask)
+            n_comp = int(q_before["components"])
+            largest_ratio = float(q_before["largest_ratio"])
+
+            if n_comp >= 10 or largest_ratio < 0.55:
+                candidates = []
+
+                cleaned_mask = self._cleanup_fragmented_vessels(mask, spacing=spacing)
                 if np.any(cleaned_mask > 0):
-                    mask = cleaned_mask
-                    n2, r2 = self._fragmentation_metrics(mask)
-                    print(f"清理后连通性: components={n2}, largest_ratio={r2:.3f}")
-                    # 只有在仍然严重碎片化时才启用保守模式
-                    if n2 >= 15 or r2 < 0.4:
-                        print("仍然存在严重碎片，启用最大连通域保守模式...")
-                        conservative = self._keep_largest_component_per_label(mask)
-                        if np.any(conservative > 0):
-                            mask = conservative
-                            n3, r3 = self._fragmentation_metrics(mask)
-                            print(f"保守模式后连通性: components={n3}, largest_ratio={r3:.3f}")
+                    candidates.append(("cleaned", cleaned_mask))
+
+                primary_mask = self._keep_primary_components_per_label(
+                    cleaned_mask if np.any(cleaned_mask > 0) else mask,
+                    max_components=2,
+                    min_ratio=0.20,
+                    min_voxels=140,
+                )
+                if np.any(primary_mask > 0):
+                    candidates.append(("primary", primary_mask))
+
+                best_name = None
+                best_mask = None
+                best_score = float(q_before["score"])
+
+                for name, cand in candidates:
+                    accept = True
+                    for label in (1, 2):
+                        before = int(np.sum(mask == label))
+                        after = int(np.sum(cand == label))
+                        if before >= 250 and after < int(0.40 * before):
+                            accept = False
+                            break
+                    if not accept:
+                        continue
+
+                    q = self._evaluate_mask_quality(cand)
+                    if float(q["score"]) > best_score:
+                        best_score = float(q["score"])
+                        best_name = name
+                        best_mask = cand
+
+                if best_mask is not None:
+                    mask = best_mask
+                    q_after = self._evaluate_mask_quality(mask)
+                    print(
+                        f"自动去碎片采用{best_name}: "
+                        f"components={int(q_after['components'])}, "
+                        f"largest_ratio={q_after['largest_ratio']:.3f}"
+                    )
         except Exception as e:
-            print(f"连通性清理失败，继续使用原始掩码: {e}")
+            print(f"自动去碎片失败，继续使用当前掩码: {e}")
 
-        # 禁用严格模式，保留更多血管分支
-        # 注释掉严格模式清理，以保留更多分支结构
-        # try:
-        #     strict_mask = self._keep_largest_component_per_label(mask)
-        #     if np.any(strict_mask > 0):
-        #         # 保底：若严格模式导致某一类血管体素骤降，则判定为误删并回退
-        #         accept_strict = True
-        #         for label in (1, 2):
-        #             before = int(np.sum(mask == label))
-        #             after = int(np.sum(strict_mask == label))
-        #             if before >= 500 and after < int(0.25 * before):
-        #                 accept_strict = False
-        #                 break
+        # 重清理默认关闭，仅在显式开启时进一步执行
+        if self.heavy_cleanup:
+            try:
+                n_comp, largest_ratio = self._fragmentation_metrics(mask)
+                print(f"分割连通性评估: components={n_comp}, largest_ratio={largest_ratio:.3f}")
+                if n_comp >= 14 or largest_ratio < 0.45:
+                    cleaned_mask = self._cleanup_fragmented_vessels(mask, spacing=spacing)
+                    if np.any(cleaned_mask > 0):
+                        mask = cleaned_mask
+            except Exception as e:
+                print(f"重清理失败，继续使用当前掩码: {e}")
 
-        #         if accept_strict:
-        #             mask = strict_mask
-        #             n_strict, r_strict = self._fragmentation_metrics(mask)
-        #             print(f"严格碎片清理后: components={n_strict}, largest_ratio={r_strict:.3f}")
-        #         else:
-        #             print("严格碎片清理触发误删保护，已回退到非严格结果")
-        # except Exception as e:
-        #     print(f"严格碎片清理失败，继续使用当前掩码: {e}")
+        # 严格模式保持可选，并加误删保护
+        if self.strict_fragment_prune:
+            try:
+                strict_mask = self._keep_largest_component_per_label(mask)
+                if np.any(strict_mask > 0):
+                    accept_strict = True
+                    for label in (1, 2):
+                        before = int(np.sum(mask == label))
+                        after = int(np.sum(strict_mask == label))
+                        if before >= 400 and after < int(0.30 * before):
+                            accept_strict = False
+                            break
 
-        # 结构识别：PV/HV 主干/细分支/分叉/5级分层
+                    if accept_strict:
+                        mask = strict_mask
+                    else:
+                        print("严格模式触发误删保护，已回退到非严格结果")
+            except Exception as e:
+                print(f"严格碎片清理失败，继续使用当前掩码: {e}")
+
+        # 最终形态收敛：若仍明显碎片化，强制收敛到主连通血管树（医生标注风格）
         try:
-            analysis = self.analyze_vessel_structure(mask, spacing=spacing)
+            q_final = self._evaluate_mask_quality(mask)
+            if int(q_final["components"]) >= 8 or float(q_final["largest_ratio"]) < 0.55:
+                primary_final = self._keep_primary_components_per_label(
+                    mask,
+                    max_components=1,
+                    min_ratio=0.28,
+                    min_voxels=220,
+                )
+                if np.any(primary_final > 0):
+                    accept = True
+                    for label in (1, 2):
+                        before = int(np.sum(mask == label))
+                        after = int(np.sum(primary_final == label))
+                        if before >= 250 and after < int(0.45 * before):
+                            accept = False
+                            break
+                    if accept:
+                        mask = primary_final
+                        q2 = self._evaluate_mask_quality(mask)
+                        print(
+                            f"最终形态收敛后: components={int(q2['components'])}, "
+                            f"largest_ratio={q2['largest_ratio']:.3f}"
+                        )
+        except Exception as e:
+            print(f"最终形态收敛失败，继续使用当前掩码: {e}")
 
-            # 默认不做分级裁剪，避免“只剩主干大块”
-            keep_max_level = 5
+        # 最终细修：去掉远离主体的“小碎片”
+        try:
+            pruned = self._prune_far_small_fragments(mask, spacing=spacing)
+            if np.any(pruned > 0):
+                before = self._evaluate_mask_quality(mask)
+                after = self._evaluate_mask_quality(pruned)
+                # 仅在连通性不变差时接受
+                if after["score"] >= before["score"] - 0.02:
+                    mask = pruned
+                    print(
+                        f"远离碎片清理后: components={int(after['components'])}, "
+                        f"largest_ratio={after['largest_ratio']:.3f}"
+                    )
+        except Exception as e:
+            print(f"远离碎片清理失败，继续使用当前掩码: {e}")
 
+        # 结构识别缓存
+        try:
+            self.analyze_vessel_structure(mask, spacing=spacing)
             print(f"血管结构识别完成: 非零体素={np.count_nonzero(mask)}")
             print(f"  PV体素: {np.sum(mask == 1)}")
             print(f"  HV体素: {np.sum(mask == 2)}")
@@ -981,22 +1547,93 @@ class AISegmentationInterface:
                         spacing=spacing,
                         metadata=metadata,
                     )
+                elif infer_mode == "stable":
+                    mask = self._segment_pytorch_stable(
+                        image_data=image_data,
+                        original_shape=original_shape,
+                        spacing=spacing,
+                        metadata=metadata,
+                    )
                 else:
+                    # auto模式：双路径推理并融合，再统一后处理
+                    stable_raw = None
+                    legacy_raw = None
+
                     try:
-                        mask = self._segment_pytorch_stable(
+                        stable_raw = self._segment_pytorch_stable(
                             image_data=image_data,
                             original_shape=original_shape,
                             spacing=spacing,
                             metadata=metadata,
+                            apply_postprocess=False,
                         )
-                    except Exception as stable_err:
-                        print(f"稳定推理失败，回退旧链路: {stable_err}")
-                        mask = self._segment_pytorch_legacy(
+                    except Exception as e:
+                        print(f"stable路径失败: {e}")
+
+                    try:
+                        legacy_raw = self._segment_pytorch_legacy(
                             image_data=image_data,
                             original_shape=original_shape,
                             spacing=spacing,
                             metadata=metadata,
+                            apply_postprocess=False,
                         )
+                    except Exception as e:
+                        print(f"legacy路径失败: {e}")
+
+                    if stable_raw is None and legacy_raw is None:
+                        raise RuntimeError("stable与legacy两条推理路径均失败")
+
+                    fused_raw = self._fuse_pytorch_masks(
+                        stable_mask=stable_raw,
+                        legacy_mask=legacy_raw,
+                        spacing=spacing,
+                    )
+                    if fused_raw is None:
+                        fused_raw = stable_raw if stable_raw is not None else legacy_raw
+
+                    # 对候选结果分别后处理并评分，自动选择更接近“连贯主体血管树”的结果
+                    candidate_raw = {
+                        "fused": fused_raw,
+                        "stable": stable_raw,
+                        "legacy": legacy_raw,
+                    }
+                    candidate_proc: Dict[str, np.ndarray] = {}
+                    candidate_quality: Dict[str, Dict[str, float]] = {}
+                    max_vox = 1.0
+
+                    for name, raw_mask in candidate_raw.items():
+                        if raw_mask is None:
+                            continue
+                        proc_mask = self.postprocess_mask(raw_mask, original_shape, spacing=spacing)
+                        candidate_proc[name] = proc_mask
+                        quality = self._evaluate_mask_quality(proc_mask)
+                        candidate_quality[name] = quality
+                        max_vox = max(max_vox, quality["voxels"])
+
+                    if not candidate_proc:
+                        raise RuntimeError("候选结果后处理后为空")
+
+                    best_name = None
+                    best_score = -1e9
+                    for name, quality in candidate_quality.items():
+                        # 轻微偏好体素更完整的结果，避免“过瘦主干”
+                        score = quality["score"] + 0.20 * (quality["voxels"] / max_vox)
+                        if score > best_score:
+                            best_score = score
+                            best_name = name
+
+                    if best_name is None:
+                        best_name = "fused" if "fused" in candidate_proc else list(candidate_proc.keys())[0]
+
+                    q = candidate_quality[best_name]
+                    print(
+                        f"auto选择结果: {best_name}, "
+                        f"components={int(q['components'])}, "
+                        f"largest_ratio={q['largest_ratio']:.3f}, "
+                        f"voxels={int(q['voxels'])}"
+                    )
+                    mask = candidate_proc[best_name]
             else:
                 raise ValueError(f"不支持的模型类型: {self.model_type}")
             

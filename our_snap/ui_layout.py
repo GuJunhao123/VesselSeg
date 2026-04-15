@@ -480,7 +480,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("医学影像分割软件")
-        self.setGeometry(100, 100, 1600, 1000)
+        # 使用更保守的默认尺寸，避免在小屏幕上被系统强制为“近似全屏”
+        self.setGeometry(120, 80, 1280, 820)
 
         # 初始化模块
         self.image_io = ImageIO()
