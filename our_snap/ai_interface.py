@@ -10,6 +10,7 @@ import onnxruntime as ort
 from typing import Optional, Tuple, Dict, Any, Mapping
 import os
 import sys
+from contextlib import nullcontext
 
 # 添加模型所在目录到路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'model'))
@@ -46,6 +47,10 @@ class AISegmentationInterface:
         self.model_input_shape = None
         self.model_output_shape = None
         self.is_model_loaded = False
+        self.last_loaded_model_path: Optional[str] = None
+        self.last_loaded_model_mtime: Optional[float] = None
+        self.last_loaded_variant: Optional[str] = None
+        self.last_loaded_type: Optional[str] = None
         
         # MobileUViT 模型参数
         self.model_variant = 'mobileuvit_l'  # 'mobileuvit' 或 'mobileuvit_l'
@@ -56,15 +61,44 @@ class AISegmentationInterface:
         # 重清理（连通域形态学强裁剪）默认关闭，避免把主体裁成大块
         heavy_flag = os.environ.get("VESSELSEG_HEAVY_CLEANUP", "0")
         self.heavy_cleanup = str(heavy_flag).strip().lower() in ("1", "true", "on", "yes")
-        # PyTorch推理模式：auto(默认，stable+legacy融合) / stable / legacy
-        infer_mode = os.environ.get("VESSELSEG_PYTORCH_INFER_MODE", "auto")
-        self.pytorch_infer_mode = str(infer_mode).strip().lower() if infer_mode is not None else "auto"
+        # 速度-质量预设：
+        # - quality(默认): 精度优先，碎片更少
+        # - fast: 速度优先
+        speed_profile = str(os.environ.get("VESSELSEG_SPEED_PROFILE", "quality")).strip().lower()
+        self.speed_profile = speed_profile if speed_profile in ("quality", "fast") else "quality"
+        default_infer_mode = "stable" if self.speed_profile == "fast" else "auto"
+        # PyTorch推理模式：auto(stable+legacy融合) / stable / legacy
+        infer_mode = os.environ.get("VESSELSEG_PYTORCH_INFER_MODE", default_infer_mode)
+        self.pytorch_infer_mode = str(infer_mode).strip().lower() if infer_mode is not None else default_infer_mode
         # 启用ROI聚焦推理，降低全腹部假阳性碎片
         roi_flag = os.environ.get("VESSELSEG_ROI_FOCUS", "1")
         self.roi_focus_enabled = str(roi_flag).strip().lower() not in ("0", "false", "off", "no")
         # 稳定路径默认启用1mm各向同性重采样，降低厚层扫描带来的条带碎片
         iso_flag = os.environ.get("VESSELSEG_STABLE_ISO", "1")
         self.stable_iso_enabled = str(iso_flag).strip().lower() not in ("0", "false", "off", "no")
+        default_iso_max_vox = "18000000" if self.speed_profile == "fast" else "50000000"
+        iso_max_vox = os.environ.get("VESSELSEG_STABLE_ISO_MAX_VOXELS", default_iso_max_vox)
+        try:
+            self.stable_iso_max_voxels = max(2_000_000, int(iso_max_vox))
+        except Exception:
+            self.stable_iso_max_voxels = 18_000_000 if self.speed_profile == "fast" else 50_000_000
+        default_sw_overlap = "0.35" if self.speed_profile == "fast" else "0.6"
+        sw_overlap = os.environ.get("VESSELSEG_SW_OVERLAP", default_sw_overlap)
+        try:
+            self.sw_overlap = float(sw_overlap)
+        except Exception:
+            self.sw_overlap = 0.35
+        self.sw_overlap = float(min(0.8, max(0.05, self.sw_overlap)))
+        sw_batch = os.environ.get("VESSELSEG_SW_BATCH", "")
+        if str(sw_batch).strip():
+            try:
+                self.sw_batch_size = max(1, int(sw_batch))
+            except Exception:
+                self.sw_batch_size = 1
+        else:
+            self.sw_batch_size = 2 if torch.cuda.is_available() else 1
+        amp_flag = os.environ.get("VESSELSEG_USE_AMP", "1")
+        self.use_amp = str(amp_flag).strip().lower() not in ("0", "false", "off", "no")
         # 保存最近一次血管结构分析结果
         self.last_vessel_analysis: Dict[str, Any] = {}
     
@@ -81,10 +115,29 @@ class AISegmentationInterface:
         try:
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"模型文件不存在: {model_path}")
+            model_path = os.path.abspath(model_path)
+            model_mtime = float(os.path.getmtime(model_path))
             
             # 根据文件扩展名判断模型类型
             ext = os.path.splitext(model_path)[1].lower()
-            
+            current_type = "onnx" if ext == ".onnx" else ("pytorch" if ext in [".pth", ".pt"] else None)
+            if current_type is None:
+                raise ValueError(f"不支持的模型格式: {ext}")
+
+            # 已加载同一模型/同一变体时直接复用，避免重复加载权重导致的卡顿
+            if (
+                self.is_model_loaded
+                and self.last_loaded_model_path == model_path
+                and self.last_loaded_model_mtime == model_mtime
+                and self.last_loaded_type == current_type
+                and (
+                    current_type != "pytorch"
+                    or self.last_loaded_variant == self.model_variant
+                )
+            ):
+                print("模型已加载且未变化，复用现有模型")
+                return True
+             
             if ext == '.onnx':
                 # 加载 ONNX 模型
                 self.model_session = ort.InferenceSession(
@@ -178,6 +231,11 @@ class AISegmentationInterface:
                 
                 self.pytorch_model.to(device)
                 self.pytorch_model.eval()
+                if device.type == "cuda":
+                    try:
+                        torch.backends.cudnn.benchmark = True
+                    except Exception:
+                        pass
                 
                 self.model_input_shape = (1, 1, 96, 96, 96)  # 与 pred4.py 一致
                 self.model_output_shape = (1, 3, 96, 96, 96)  # 与 pred4.py 一致
@@ -193,6 +251,10 @@ class AISegmentationInterface:
                 raise ValueError(f"不支持的模型格式: {ext}")
             
             self.is_model_loaded = True
+            self.last_loaded_model_path = model_path
+            self.last_loaded_model_mtime = model_mtime
+            self.last_loaded_variant = self.model_variant if self.model_type == "pytorch" else None
+            self.last_loaded_type = self.model_type
             return True
             
         except Exception as e:
@@ -206,7 +268,11 @@ class AISegmentationInterface:
         Args:
             variant: 'mobileuvit' 或 'mobileuvit_l'
         """
+        old_variant = self.model_variant
         self.model_variant = variant
+        if old_variant != variant and self.model_type == "pytorch":
+            # 变体切换后需重新加载权重
+            self.is_model_loaded = False
         print(f"模型变体已设置为: {variant}")
     
     def set_decomposition_method(self, method: str):
@@ -997,8 +1063,8 @@ class AISegmentationInterface:
         patch_size = (96, 96, 96)
         inferer = SlidingWindowInferer(
             roi_size=patch_size,
-            sw_batch_size=1,
-            overlap=0.6,
+            sw_batch_size=self.sw_batch_size,
+            overlap=self.sw_overlap,
             mode="gaussian",
         )
 
@@ -1018,7 +1084,7 @@ class AISegmentationInterface:
             try:
                 voxel_count = int(np.prod(np.array(input_arr.shape, dtype=np.int64)))
                 # 粗略限制，避免极端数据重采样后爆内存
-                if voxel_count <= 50_000_000:
+                if voxel_count <= self.stable_iso_max_voxels:
                     infer_arr = self._resample_volume(
                         input_arr,
                         src_spacing=src_spacing,
@@ -1034,9 +1100,15 @@ class AISegmentationInterface:
         input_tensor = torch.from_numpy(infer_arr).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            output = inferer(input_tensor, self.pytorch_model)
-            logits = self._extract_logits(output)
-            pred_label = torch.argmax(logits, dim=1).cpu().numpy()
+            amp_ctx = (
+                torch.cuda.amp.autocast(enabled=True)
+                if (device.type == "cuda" and self.use_amp)
+                else nullcontext()
+            )
+            with amp_ctx:
+                output = inferer(input_tensor, self.pytorch_model)
+                logits = self._extract_logits(output)
+                pred_label = torch.argmax(logits, dim=1).cpu().numpy()
 
         roi_mask = pred_label[0].astype(np.uint8)
 
@@ -1124,15 +1196,21 @@ class AISegmentationInterface:
 
             inferer = SlidingWindowInferer(
                 roi_size=patch_size,
-                sw_batch_size=1,
-                overlap=0.6,
+                sw_batch_size=self.sw_batch_size,
+                overlap=self.sw_overlap,
                 mode="gaussian",
             )
 
             with torch.no_grad():
-                output = inferer(input_tensor, self.pytorch_model)
-                logits = self._extract_logits(output)
-                pred_label = torch.argmax(logits, dim=1).cpu().numpy()
+                amp_ctx = (
+                    torch.cuda.amp.autocast(enabled=True)
+                    if (device.type == "cuda" and self.use_amp)
+                    else nullcontext()
+                )
+                with amp_ctx:
+                    output = inferer(input_tensor, self.pytorch_model)
+                    logits = self._extract_logits(output)
+                    pred_label = torch.argmax(logits, dim=1).cpu().numpy()
 
             orig_nii = nib.load(tmp_path)
             pred_nii_cropped = nib.Nifti1Image(
@@ -1537,7 +1615,8 @@ class AISegmentationInterface:
                 infer_mode = self.pytorch_infer_mode
                 print(
                     f"使用参数: 模型变体={self.model_variant}, "
-                    f"血管分解方法={self.decomposition_method}, 推理模式={infer_mode}"
+                    f"血管分解方法={self.decomposition_method}, 推理模式={infer_mode}, "
+                    f"速度预设={self.speed_profile}"
                 )
 
                 if infer_mode == "legacy":
