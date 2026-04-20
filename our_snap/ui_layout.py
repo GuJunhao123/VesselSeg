@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QInputDialog, QTextEdit, QSplitter, QScrollArea,
     QFrame, QApplication
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QIcon, QFont
 from typing import Optional
 
@@ -354,6 +354,10 @@ class LabelViewerWindow(QWidget):
         self.base_image_data = None
         self.base_spacing = None
         self.current_label_data = None
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._do_refresh_3d)
+        self._needs_refresh_when_shown = False
 
         self._init_ui()
 
@@ -381,17 +385,43 @@ class LabelViewerWindow(QWidget):
         top_bar.addWidget(btn_update_3d)
         layout.addLayout(top_bar)
 
+        # 与主界面保持一致：双窗口也使用同款3D视图后端。
         self.four_view = FourViewWidget()
         layout.addWidget(self.four_view, stretch=1)
 
-    def _refresh_3d_safely(self):
-        """刷新3D视图（失败时静默，避免打断主流程）。"""
+    def _do_refresh_3d(self):
+        """真正执行3D刷新。"""
         try:
             self.four_view.refresh_3d_view()
         except Exception:
             pass
 
-    def set_base_image(self, image_data, spacing=None):
+    def _refresh_3d_safely(self):
+        """刷新3D视图（窗口未显示时延后，避免崩溃）。"""
+        if not self.isVisible():
+            self._needs_refresh_when_shown = True
+            return
+        self._needs_refresh_when_shown = False
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._needs_refresh_when_shown:
+            self._refresh_3d_safely()
+
+    def closeEvent(self, event):
+        """关闭时尽量释放3D资源，降低多窗口OpenGL残留风险。"""
+        try:
+            if hasattr(self, "four_view") and self.four_view is not None:
+                view_3d = getattr(self.four_view, "view_3d", None)
+                if view_3d is not None:
+                    view_3d.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def set_base_image(self, image_data, spacing=None, refresh_3d: bool = True):
         """设置基础影像（两个窗口保持一致）。"""
         if image_data is None:
             return
@@ -404,9 +434,10 @@ class LabelViewerWindow(QWidget):
             self.current_label_data = np.zeros(self.base_image_data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
 
-        self._refresh_3d_safely()
+        if refresh_3d:
+            self._refresh_3d_safely()
 
-    def set_label_data(self, label_data, source_text: str = "") -> bool:
+    def set_label_data(self, label_data, source_text: str = "", refresh_3d: bool = True) -> bool:
         """设置标签数据。"""
         if self.base_image_data is None:
             QMessageBox.warning(self, "提示", "请先在主窗口加载影像。")
@@ -428,7 +459,8 @@ class LabelViewerWindow(QWidget):
         if source_text:
             self.source_label.setText(f"标签来源: {source_text}")
 
-        self._refresh_3d_safely()
+        if refresh_3d:
+            self._refresh_3d_safely()
         return True
 
     def _on_load_label_file(self):
@@ -1164,7 +1196,7 @@ class MainWindow(QMainWindow):
                 lambda _obj=None: setattr(self, 'ai_label_window', None)
             )
 
-    def _sync_dual_windows_base_image(self, reset_labels: bool = False):
+    def _sync_dual_windows_base_image(self, reset_labels: bool = False, refresh_3d: bool = True):
         """把主窗口当前影像同步到两个独立窗口。"""
         if self.current_image_data is None:
             return
@@ -1174,10 +1206,10 @@ class MainWindow(QMainWindow):
         for window in windows:
             if window is None:
                 continue
-            window.set_base_image(self.current_image_data, spacing)
+            window.set_base_image(self.current_image_data, spacing, refresh_3d=refresh_3d)
             if reset_labels:
                 empty_label = np.zeros(self.current_image_data.shape, dtype=np.uint8)
-                window.set_label_data(empty_label, source_text="已清空")
+                window.set_label_data(empty_label, source_text="已清空", refresh_3d=refresh_3d)
 
     def _set_doctor_compare_label(self, label_data, source_text: str = ""):
         """更新医生标签窗口内容，并缓存最近一次医生标签。"""
@@ -1185,8 +1217,12 @@ class MainWindow(QMainWindow):
             return
         self.last_doctor_label_data = np.asarray(label_data).astype(np.uint8).copy()
         if self.doctor_label_window is not None:
-            self._sync_dual_windows_base_image(reset_labels=False)
-            self.doctor_label_window.set_label_data(self.last_doctor_label_data, source_text=source_text)
+            self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
+            self.doctor_label_window.set_label_data(
+                self.last_doctor_label_data,
+                source_text=source_text,
+                refresh_3d=self.doctor_label_window.isVisible(),
+            )
 
     def _set_ai_compare_label(self, label_data, source_text: str = ""):
         """更新AI标签窗口内容，并缓存最近一次AI标签。"""
@@ -1194,8 +1230,12 @@ class MainWindow(QMainWindow):
             return
         self.last_ai_label_data = np.asarray(label_data).astype(np.uint8).copy()
         if self.ai_label_window is not None:
-            self._sync_dual_windows_base_image(reset_labels=False)
-            self.ai_label_window.set_label_data(self.last_ai_label_data, source_text=source_text)
+            self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
+            self.ai_label_window.set_label_data(
+                self.last_ai_label_data,
+                source_text=source_text,
+                refresh_3d=self.ai_label_window.isVisible(),
+            )
 
     def _on_open_dual_label_windows(self):
         """打开医生标签窗口 + AI标签窗口。"""
@@ -1204,15 +1244,28 @@ class MainWindow(QMainWindow):
             return
 
         self._ensure_dual_label_windows()
-        self._sync_dual_windows_base_image(reset_labels=False)
+        # 先同步数据，不在隐藏状态下触发3D渲染。
+        self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
 
         if self.last_doctor_label_data is not None:
-            self.doctor_label_window.set_label_data(self.last_doctor_label_data, source_text="医生标签(最近加载)")
+            self.doctor_label_window.set_label_data(
+                self.last_doctor_label_data,
+                source_text="doctor_label_recent",
+                refresh_3d=False,
+            )
 
         if self.last_ai_label_data is not None:
-            self.ai_label_window.set_label_data(self.last_ai_label_data, source_text="AI标签(最近生成)")
+            self.ai_label_window.set_label_data(
+                self.last_ai_label_data,
+                source_text="ai_label_recent",
+                refresh_3d=False,
+            )
         elif self.current_label_data is not None and np.any(self.current_label_data):
-            self.ai_label_window.set_label_data(self.current_label_data, source_text="主窗口当前标签")
+            self.ai_label_window.set_label_data(
+                self.current_label_data,
+                source_text="main_window_label",
+                refresh_3d=False,
+            )
 
         self.doctor_label_window.show()
         self.ai_label_window.show()
@@ -1225,6 +1278,8 @@ class MainWindow(QMainWindow):
         self.doctor_label_window.raise_()
         self.ai_label_window.raise_()
         self.doctor_label_window.activateWindow()
+        self.doctor_label_window._refresh_3d_safely()
+        self.ai_label_window._refresh_3d_safely()
 
     def _on_load_label(self):
         """加载标签"""

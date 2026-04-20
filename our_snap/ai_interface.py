@@ -1015,6 +1015,78 @@ class AISegmentationInterface:
             raise RuntimeError(f"模型输出维度异常: {tuple(logits.shape)}")
         return logits
 
+    def _run_pytorch_infer_once(
+        self,
+        inferer: "SlidingWindowInferer",
+        input_tensor: "torch.Tensor",
+        device: "torch.device",
+        amp_enabled: bool,
+    ) -> np.ndarray:
+        """执行一次推理，返回argmax后的标签体。"""
+        with torch.no_grad():
+            amp_ctx = (
+                torch.cuda.amp.autocast(enabled=True)
+                if (device.type == "cuda" and amp_enabled)
+                else nullcontext()
+            )
+            with amp_ctx:
+                output = inferer(input_tensor, self.pytorch_model)
+                logits = self._extract_logits(output)
+                finite_ok = bool(torch.isfinite(logits).all().item())
+                if not finite_ok:
+                    raise RuntimeError("logits含NaN/Inf")
+                pred_label = torch.argmax(logits, dim=1).to(dtype=torch.uint8).cpu().numpy()
+        return pred_label
+
+    def _infer_pred_with_guard(
+        self,
+        inferer: "SlidingWindowInferer",
+        input_tensor: "torch.Tensor",
+        device: "torch.device",
+        path_name: str,
+    ) -> np.ndarray:
+        """
+        推理保护：
+        - 优先使用当前配置（CUDA+AMP）；
+        - 若输出全背景或数值异常，自动回退到FP32重算一次。
+        """
+        prefer_amp = bool(device.type == "cuda" and self.use_amp)
+        attempts = []
+        if prefer_amp:
+            attempts.append(("cuda_amp", True))
+        attempts.append(("fp32", False))
+
+        last_pred = None
+        last_exc = None
+        for idx, (tag, amp_enabled) in enumerate(attempts):
+            try:
+                pred_label = self._run_pytorch_infer_once(
+                    inferer=inferer,
+                    input_tensor=input_tensor,
+                    device=device,
+                    amp_enabled=amp_enabled,
+                )
+            except Exception as e:
+                last_exc = e
+                print(f"{path_name}推理({tag})失败: {e}")
+                continue
+
+            fg_vox = int(np.count_nonzero(pred_label))
+            print(f"{path_name}推理({tag})前景体素={fg_vox}")
+            last_pred = pred_label
+            if fg_vox > 0:
+                return pred_label
+
+            # 当前尝试为全背景且仍有回退路径时，继续下一次尝试
+            if idx < len(attempts) - 1:
+                print(f"{path_name}推理({tag})全背景，自动回退重试")
+
+        if last_pred is not None:
+            return last_pred
+        if last_exc is not None:
+            raise RuntimeError(f"{path_name}推理失败: {last_exc}")
+        raise RuntimeError(f"{path_name}推理失败: 未获得有效输出")
+
     def _prepare_stable_infer_input(
         self,
         image_data: np.ndarray,
@@ -1099,16 +1171,12 @@ class AISegmentationInterface:
 
         input_tensor = torch.from_numpy(infer_arr).unsqueeze(0).unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            amp_ctx = (
-                torch.cuda.amp.autocast(enabled=True)
-                if (device.type == "cuda" and self.use_amp)
-                else nullcontext()
-            )
-            with amp_ctx:
-                output = inferer(input_tensor, self.pytorch_model)
-                logits = self._extract_logits(output)
-                pred_label = torch.argmax(logits, dim=1).cpu().numpy()
+        pred_label = self._infer_pred_with_guard(
+            inferer=inferer,
+            input_tensor=input_tensor,
+            device=device,
+            path_name="stable",
+        )
 
         roi_mask = pred_label[0].astype(np.uint8)
 
@@ -1201,16 +1269,12 @@ class AISegmentationInterface:
                 mode="gaussian",
             )
 
-            with torch.no_grad():
-                amp_ctx = (
-                    torch.cuda.amp.autocast(enabled=True)
-                    if (device.type == "cuda" and self.use_amp)
-                    else nullcontext()
-                )
-                with amp_ctx:
-                    output = inferer(input_tensor, self.pytorch_model)
-                    logits = self._extract_logits(output)
-                    pred_label = torch.argmax(logits, dim=1).cpu().numpy()
+            pred_label = self._infer_pred_with_guard(
+                inferer=inferer,
+                input_tensor=input_tensor,
+                device=device,
+                path_name="legacy",
+            )
 
             orig_nii = nib.load(tmp_path)
             pred_nii_cropped = nib.Nifti1Image(
@@ -1383,6 +1447,7 @@ class AISegmentationInterface:
 
         mask = output_data.astype(np.uint8)
         mask = np.where((mask == 1) | (mask == 2), mask, 0).astype(np.uint8)
+        base_mask = mask.copy()
 
         # 调整尺寸（如果需要），使用最近邻保持多标签
         if mask.shape != original_shape:
@@ -1391,6 +1456,7 @@ class AISegmentationInterface:
                 zoom_factors = [float(orig) / float(cur) for orig, cur in zip(original_shape, mask.shape)]
                 mask = zoom(mask.astype(np.float32), zoom_factors, order=0, mode="nearest")
                 mask = np.rint(mask).astype(np.uint8)
+                base_mask = mask.copy()
             except Exception as e:
                 print(f"掩码尺寸回采样失败: {e}")
 
@@ -1554,6 +1620,11 @@ class AISegmentationInterface:
                     )
         except Exception as e:
             print(f"远离碎片清理失败，继续使用当前掩码: {e}")
+
+        # 误删保护：若后处理把非空预测裁成全空，则回退到基础掩码
+        if not np.any(mask > 0) and np.any(base_mask > 0):
+            print("后处理触发误删保护：结果全空，回退到基础掩码")
+            mask = base_mask.copy()
 
         # 结构识别缓存
         try:

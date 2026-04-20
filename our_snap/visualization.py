@@ -1252,12 +1252,13 @@ class ThreeDViewer(QWidget):
     
     view_updated = pyqtSignal()
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, force_matplotlib: bool = False):
         super().__init__(parent)
         self.image_data = None
         self.label_data = None
         self.image_spacing = None
         self.structure_data = None
+        self.force_matplotlib = bool(force_matplotlib)
 
         self.crosshair_3d = [0, 0, 0]
         self.setMinimumSize(300, 300)
@@ -1266,14 +1267,16 @@ class ThreeDViewer(QWidget):
         size_policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         size_policy.setHeightForWidth(True)
         self.setSizePolicy(size_policy)
-        try:
-            import pyvista as pv
-            from pyvistaqt import QtInteractor
-            self.use_pyvista = True
-            self.pv = pv
-        except ImportError as e:
-            self.use_pyvista = False
-            print(f"警告：PyVista/PyVistaQt不可用，将使用matplotlib作为备选: {e}")
+        self.use_pyvista = False
+        if not self.force_matplotlib:
+            try:
+                import pyvista as pv
+                from pyvistaqt import QtInteractor
+                self.use_pyvista = True
+                self.pv = pv
+            except ImportError as e:
+                self.use_pyvista = False
+                print(f"警告：PyVista/PyVistaQt不可用，将使用matplotlib作为备选: {e}")
 
         # 渲染缓存：避免每次刷新都重新做marching cubes
         self._mesh_cache_signature = None
@@ -1994,59 +1997,123 @@ class ThreeDViewer(QWidget):
             return
         
         h, w, d = self.image_data.shape
+        sx, sy, sz = self._normalize_spacing()
+        # 与PyVista保持一致的物理坐标范围：
+        # x <- axis2(z), y <- axis1(y), z <- axis0(x)
+        x_max = float(d) * sz
+        y_max = float(w) * sy
+        z_max = float(h) * sx
         
+        rendered = False
+        all_min = None
+        all_max = None
         if self.label_data is not None and np.any(self.label_data > 0):
             try:
                 from skimage import measure
-                label_binary = (self.label_data > 0).astype(float)
-                
-                verts, faces, normals, values = measure.marching_cubes(
-                    label_binary, level=0.5, spacing=(1.0, 1.0, 1.0), allow_degenerate=False
-                )
-                
-                if len(verts) > 0 and len(faces) > 0:
-                    max_faces = 5000
-                    if len(faces) > max_faces:
-                        step = len(faces) // max_faces
-                        faces = faces[::step]
-                    
-                    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-                    mesh = Poly3DCollection(verts[faces], alpha=0.8, facecolor='red', 
-                                          edgecolor='none', linewidths=0)
+                label_styles = {
+                    1: ("#ff4d4f", 0.90),  # PV
+                    2: ("#4096ff", 0.88),  # HV
+                }
+
+                for label_id, (color, opacity) in label_styles.items():
+                    label_mask = (self.label_data == label_id)
+                    voxels = int(np.count_nonzero(label_mask))
+                    if voxels < 8:
+                        continue
+
+                    # 使用marching_cubes的step_size做“规则降采样”，保持连贯形态，避免随机碎片
+                    if voxels > 2_500_000:
+                        step_size = 4
+                    elif voxels > 800_000:
+                        step_size = 3
+                    elif voxels > 180_000:
+                        step_size = 2
+                    else:
+                        step_size = 1
+
+                    # 采用与PyVista一致的轴顺序与spacing，避免“扁平化”
+                    mask_xyz = np.transpose(label_mask.astype(np.uint8), (2, 1, 0))
+                    verts, faces, _normals, _values = measure.marching_cubes(
+                        mask_xyz,
+                        level=0.5,
+                        spacing=(sz, sy, sx),
+                        allow_degenerate=False,
+                        step_size=step_size,
+                    )
+                    if len(verts) == 0 or len(faces) == 0:
+                        continue
+
+                    mesh = Poly3DCollection(
+                        verts[faces],
+                        alpha=opacity,
+                        facecolor=color,
+                        edgecolor='none',
+                        linewidths=0,
+                    )
                     self.ax.add_collection3d(mesh)
-                    
-                    margin = 10
-                    self.ax.set_xlim(verts[:, 0].min() - margin, verts[:, 0].max() + margin)
-                    self.ax.set_ylim(verts[:, 1].min() - margin, verts[:, 1].max() + margin)
-                    self.ax.set_zlim(verts[:, 2].min() - margin, verts[:, 2].max() + margin)
+                    rendered = True
+
+                    vmin = verts.min(axis=0)
+                    vmax = verts.max(axis=0)
+                    if all_min is None:
+                        all_min = vmin
+                        all_max = vmax
+                    else:
+                        all_min = np.minimum(all_min, vmin)
+                        all_max = np.maximum(all_max, vmax)
             except Exception as e:
                 print(f"matplotlib渲染失败：{e}")
-        
-        # 设置坐标轴
-        self.ax.set_xlim(0, h)
-        self.ax.set_ylim(0, w)
-        self.ax.set_zlim(0, d)
-        
-        self.ax.set_xlabel('X', color='white')
-        self.ax.set_ylabel('Y', color='white')
-        self.ax.set_zlabel('Z', color='white')
-        self.ax.tick_params(colors='white')
-        
-        origin = [0, 0, 0]
-        axis_length = min(h, w, d) * 0.3
-        
-        self.ax.plot([origin[0], axis_length], [origin[1], origin[1]], [origin[2], origin[2]], 
-                    'b-', linewidth=2, alpha=0.8)
-        self.ax.plot([origin[0], origin[0]], [origin[1], axis_length], [origin[2], origin[2]], 
-                    'b-', linewidth=2, alpha=0.8)
-        self.ax.plot([origin[0], origin[0]], [origin[1], origin[1]], [origin[2], axis_length], 
-                    'b-', linewidth=2, alpha=0.8)
-        
-        marker_size = axis_length * 0.05
-        self.ax.scatter([origin[0]], [origin[1]], [origin[2]], 
-                       c='#00FF00', s=marker_size*100, marker='s', alpha=0.9)
-        
-        self.ax.view_init(elev=20, azim=45)
+
+        # 设置坐标轴范围（有模型时聚焦到模型边界；否则显示全视野）
+        if rendered and all_min is not None and all_max is not None:
+            margin = 8.0
+            self.ax.set_xlim(max(0.0, float(all_min[0]) - margin), min(x_max, float(all_max[0]) + margin))
+            self.ax.set_ylim(max(0.0, float(all_min[1]) - margin), min(y_max, float(all_max[1]) + margin))
+            self.ax.set_zlim(max(0.0, float(all_min[2]) - margin), min(z_max, float(all_max[2]) + margin))
+        else:
+            self.ax.set_xlim(0.0, x_max)
+            self.ax.set_ylim(0.0, y_max)
+            self.ax.set_zlim(0.0, z_max)
+
+        # 关闭网格与坐标轴标注，贴近PyVista风格
+        self.ax.grid(False)
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        self.ax.set_zticks([])
+        self.ax.set_xlabel("")
+        self.ax.set_ylabel("")
+        self.ax.set_zlabel("")
+        try:
+            self.ax.xaxis.pane.fill = False
+            self.ax.yaxis.pane.fill = False
+            self.ax.zaxis.pane.fill = False
+            self.ax.xaxis.pane.set_edgecolor((0, 0, 0, 0))
+            self.ax.yaxis.pane.set_edgecolor((0, 0, 0, 0))
+            self.ax.zaxis.pane.set_edgecolor((0, 0, 0, 0))
+        except Exception:
+            pass
+        try:
+            self.ax.set_box_aspect((max(1.0, x_max), max(1.0, y_max), max(1.0, z_max)))
+        except Exception:
+            pass
+
+        # 以模型中心绘制十字准星（蓝线+绿点）
+        if rendered and all_min is not None and all_max is not None:
+            center = 0.5 * (all_min + all_max)
+            span = float(np.max(all_max - all_min))
+        else:
+            center = np.array([x_max * 0.5, y_max * 0.5, z_max * 0.5], dtype=np.float64)
+            span = float(min(x_max, y_max, z_max))
+        line_length = max(12.0, 0.35 * max(1.0, span))
+        half = line_length * 0.5
+        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        self.ax.plot([cx - half, cx + half], [cy, cy], [cz, cz], color="#0080FF", linewidth=2.0, alpha=0.95)
+        self.ax.plot([cx, cx], [cy - half, cy + half], [cz, cz], color="#0080FF", linewidth=2.0, alpha=0.95)
+        self.ax.plot([cx, cx], [cy, cy], [cz - half, cz + half], color="#0080FF", linewidth=2.0, alpha=0.95)
+        self.ax.scatter([cx], [cy], [cz], c="#00FF00", s=240, marker="o", alpha=0.95, depthshade=False)
+
+        # 固定接近PyVista的等轴角度
+        self.ax.view_init(elev=24, azim=225)
         self.ax.set_proj_type('ortho')
         
         self.canvas.draw()
@@ -2068,6 +2135,26 @@ class ThreeDViewer(QWidget):
                 self.ax.set_proj_type('ortho')
                 self.canvas.draw()
 
+    def closeEvent(self, event):
+        """释放VTK/QtInteractor资源，避免窗口关闭后上下文残留。"""
+        if getattr(self, "use_pyvista", False):
+            plotter = getattr(self, "plotter", None)
+            if plotter is not None:
+                try:
+                    rw = getattr(plotter, "ren_win", None)
+                    if rw is None:
+                        rw = getattr(plotter, "render_window", None)
+                    if rw is not None and hasattr(rw, "Finalize"):
+                        rw.Finalize()
+                except Exception:
+                    pass
+                try:
+                    plotter.close()
+                except Exception:
+                    pass
+                self.plotter = None
+        super().closeEvent(event)
+
 
 class FourViewWidget(QWidget):
     """2×2布局视图组件"""
@@ -2077,12 +2164,13 @@ class FourViewWidget(QWidget):
     # 信号：切片改变 (view_type, slice_idx)
     slice_changed = pyqtSignal(str, int)
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, force_matplotlib_3d: bool = False):
         super().__init__(parent)
         self.image_data = None
         self.label_data = None
         self.image_spacing = None  # 保存spacing信息
         self.seed_points = []
+        self.force_matplotlib_3d = bool(force_matplotlib_3d)
         
         # 当前十字线位置（3D空间坐标）
         self.crosshair_3d = [0, 0, 0]  # [x, y, z]
@@ -2110,7 +2198,7 @@ class FourViewWidget(QWidget):
         # 创建视图
         self.axial_view = SliceViewer('axial')  # 行0列0：轴位
         self.sagittal_view = SliceViewer('sagittal')  # 行0列1：矢状位
-        self.view_3d = ThreeDViewer()  # 行1列0：3D视图（左下角）
+        self.view_3d = ThreeDViewer(force_matplotlib=self.force_matplotlib_3d)  # 行1列0：3D视图（左下角）
         self.coronal_view = SliceViewer('coronal')  # 行1列1：冠状位
         
         # 设置3D视图的宽高比策略（保持接近1:1）
