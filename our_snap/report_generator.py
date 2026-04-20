@@ -225,10 +225,14 @@ class ReportGenerator:
                 elements.append(Paragraph('手术切割模拟', self.styles['CustomSection']))
                 cs = report_data['cut_stats']
                 if cs.get('available'):
+                    cut_vessels = cs.get('cut_vessels', {}) if isinstance(cs.get('cut_vessels', {}), dict) else {}
                     cut_data = [
                         ['剩余肝体积', f"{cs.get('remaining_ml', 0.0):.2f} ml"],
                         ['切除体积', f"{cs.get('resected_ml', 0.0):.2f} ml"],
                         ['剩余比例', f"{cs.get('remaining_ratio', 0.0) * 100:.1f}%"],
+                        ['切除率', f"{cs.get('resection_rate', cs.get('resected_ratio', 0.0) * 100):.1f}%"],
+                        ['风险等级', f"{cs.get('risk_assessment', 'N/A')}"],
+                        ['切断分支总数', f"{int(cut_vessels.get('total_count', 0))}"],
                         ['门静脉切断预警', '是' if cs.get('severed_pv') else '否'],
                         ['肝静脉切断预警', '是' if cs.get('severed_hv') else '否'],
                     ]
@@ -375,8 +379,14 @@ class ReportGenerator:
             cs = report_data['cut_stats']
             summary.append('\n切割模拟:')
             if cs.get('available'):
+                cut_vessels = cs.get('cut_vessels', {}) if isinstance(cs.get('cut_vessels', {}), dict) else {}
                 summary.append(f"  剩余体积: {cs.get('remaining_ml', 0.0):.2f} ml")
                 summary.append(f"  切除体积: {cs.get('resected_ml', 0.0):.2f} ml")
+                summary.append(
+                    f"  切除率: {cs.get('resection_rate', cs.get('resected_ratio', 0.0) * 100):.1f}%"
+                )
+                summary.append(f"  风险等级: {cs.get('risk_assessment', 'N/A')}")
+                summary.append(f"  切断分支总数: {int(cut_vessels.get('total_count', 0))}")
                 summary.append(f"  门静脉切断预警: {'是' if cs.get('severed_pv') else '否'}")
                 summary.append(f"  肝静脉切断预警: {'是' if cs.get('severed_hv') else '否'}")
             else:

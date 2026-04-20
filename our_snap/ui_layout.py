@@ -26,7 +26,7 @@ from typing import Optional
 
 # === 引入你的自定义模块 ===
 from image_io import ImageIO
-from visualization import FourViewWidget
+from visualization import FourViewWidget, ThreeDViewer
 from segmentation import ActiveContourSegmentation
 from ai_interface import AISegmentationInterface
 from database_index import find_patient_dirs_522, build_patient_index_522, SeriesEntry
@@ -72,11 +72,11 @@ class SegmentationWorker(QThread):
                     edge_weight=self.params['edge_weight']
                 )
 
-            # 兜底：若主算法输出为空，自动尝试一轮更稳健的region competition
+            # 兜底：若主算法输出为空，尝试更保守参数，避免外扩
             if mask is None or not np.any(mask):
-                fallback_iters = max(int(self.params.get('iterations', 100)), 120)
-                fallback_smooth = max(float(self.params.get('smoothness', 1.0)), 1.0)
-                fallback_expand = max(float(self.params.get('expansion_force', 1.0)), 1.2)
+                fallback_iters = min(max(int(self.params.get('iterations', 70)), 60), 100)
+                fallback_smooth = max(float(self.params.get('smoothness', 1.6)), 1.6)
+                fallback_expand = min(float(self.params.get('expansion_force', 0.25)), 0.35)
                 mask = self.algorithm.region_competition(
                     iterations=fallback_iters,
                     smoothness=fallback_smooth,
@@ -385,8 +385,8 @@ class LabelViewerWindow(QWidget):
         top_bar.addWidget(btn_update_3d)
         layout.addLayout(top_bar)
 
-        # 与主界面保持一致：双窗口也使用同款3D视图后端。
-        self.four_view = FourViewWidget()
+        # 双窗口对比在Windows下容易出现多OpenGL上下文冲突，固定使用matplotlib后端更稳。
+        self.four_view = FourViewWidget(force_matplotlib_3d=True)
         layout.addWidget(self.four_view, stretch=1)
 
     def _do_refresh_3d(self):
@@ -506,6 +506,137 @@ class LabelViewerWindow(QWidget):
             QMessageBox.warning(self, "提示", f"刷新3D失败:\n{e}")
 
 
+class Standalone3DWindow(QWidget):
+    """独立3D血管树窗口。"""
+
+    def __init__(self, title: str = "独立3D血管树窗口", force_matplotlib_3d: bool = False, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle(title)
+        self.setMinimumSize(900, 700)
+
+        self.image_data = None
+        self.label_data = None
+        self.spacing = None
+        self.structure_map = None
+        self._needs_refresh_when_shown = False
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._do_refresh_3d)
+
+        self._init_ui(force_matplotlib_3d=force_matplotlib_3d)
+
+    def _init_ui(self, force_matplotlib_3d: bool):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        top_bar = QHBoxLayout()
+        title = QLabel("独立3D血管树")
+        top_bar.addWidget(title)
+
+        self.info_label = QLabel("未加载数据")
+        self.info_label.setWordWrap(True)
+        top_bar.addWidget(self.info_label, stretch=1)
+
+        btn_update = QPushButton("更新3D")
+        btn_update.clicked.connect(self._on_update_3d)
+        top_bar.addWidget(btn_update)
+
+        btn_reset_camera = QPushButton("重置视角")
+        btn_reset_camera.clicked.connect(self._on_reset_camera)
+        top_bar.addWidget(btn_reset_camera)
+
+        layout.addLayout(top_bar)
+
+        self.view_3d = ThreeDViewer(parent=self, force_matplotlib=bool(force_matplotlib_3d))
+        layout.addWidget(self.view_3d, stretch=1)
+
+    def _do_refresh_3d(self):
+        try:
+            self.view_3d.refresh_view()
+        except Exception:
+            pass
+
+    def _refresh_3d_safely(self):
+        if not self.isVisible():
+            self._needs_refresh_when_shown = True
+            return
+        self._needs_refresh_when_shown = False
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._needs_refresh_when_shown:
+            self._refresh_3d_safely()
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "view_3d") and self.view_3d is not None:
+                self.view_3d.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def set_data(
+        self,
+        image_data,
+        label_data,
+        spacing=None,
+        structure_map=None,
+        crosshair=None,
+        refresh_3d: bool = True,
+        reset_camera: bool = False,
+    ):
+        if image_data is None:
+            return
+
+        self.image_data = np.asarray(image_data)
+        self.spacing = spacing
+        self.structure_map = structure_map
+
+        if label_data is None:
+            self.label_data = np.zeros(self.image_data.shape, dtype=np.uint8)
+        else:
+            arr = np.asarray(label_data).astype(np.uint8)
+            if arr.shape != self.image_data.shape:
+                self.label_data = np.zeros(self.image_data.shape, dtype=np.uint8)
+            else:
+                self.label_data = arr
+
+        self.view_3d.set_image_data(self.image_data, self.spacing)
+        self.view_3d.set_label_data(self.label_data)
+        self.view_3d.set_structure_data(self.structure_map)
+
+        if crosshair is not None and len(crosshair) >= 3:
+            try:
+                self.view_3d.set_crosshair_3d(float(crosshair[0]), float(crosshair[1]), float(crosshair[2]))
+            except Exception:
+                pass
+
+        pv_vox = int(np.sum(self.label_data == 1))
+        hv_vox = int(np.sum(self.label_data == 2))
+        nz_vox = int(np.sum(self.label_data > 0))
+        self.info_label.setText(f"PV体素: {pv_vox} | HV体素: {hv_vox} | 非零标签体素: {nz_vox}")
+
+        if reset_camera:
+            self.view_3d.reset_camera()
+        if refresh_3d:
+            self._refresh_3d_safely()
+
+    def _on_update_3d(self):
+        self._refresh_3d_safely()
+
+    def _on_reset_camera(self):
+        try:
+            self.view_3d.reset_camera()
+        except Exception:
+            pass
+        self._refresh_3d_safely()
+
+
 class MainWindow(QMainWindow):
     """主窗口"""
 
@@ -554,6 +685,7 @@ class MainWindow(QMainWindow):
         self.ai_label_window = None
         self.last_doctor_label_data = None
         self.last_ai_label_data = None
+        self.vessel_tree_window = None
 
         # 当前病人/检查/序列信息（从DICOM或数据库获取）
         self.current_patient_info = {}
@@ -924,6 +1056,11 @@ class MainWindow(QMainWindow):
         btn_quant_analysis.clicked.connect(self._on_quantitative_analysis)
         quant_analysis_layout.addWidget(btn_quant_analysis)
 
+        btn_liver_partition = QPushButton("🧭 独立肝段划分")
+        btn_liver_partition.setFixedHeight(32)
+        btn_liver_partition.clicked.connect(self._on_liver_segment_partition)
+        quant_analysis_layout.addWidget(btn_liver_partition)
+
         quant_analysis_group.setLayout(quant_analysis_layout)
         content_layout.addWidget(quant_analysis_group)
 
@@ -932,7 +1069,7 @@ class MainWindow(QMainWindow):
         three_d_visualization_layout = QVBoxLayout()
         three_d_visualization_layout.setSpacing(5)
 
-        btn_3d_visualization = QPushButton("🎨 显示3D血管树")
+        btn_3d_visualization = QPushButton("🎨 打开独立3D窗口")
         btn_3d_visualization.setFixedHeight(32)
         btn_3d_visualization.clicked.connect(self._on_3d_visualization)
         three_d_visualization_layout.addWidget(btn_3d_visualization)
@@ -1001,7 +1138,10 @@ class MainWindow(QMainWindow):
         panel.setLayout(layout)
 
         # 创建2×2视图组件
-        self.four_view = FourViewWidget()
+        force_mpl_3d = str(os.environ.get("VESSELSEG_FORCE_MPL_3D", "0")).strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        self.four_view = FourViewWidget(force_matplotlib_3d=force_mpl_3d)
         self.four_view.crosshair_changed.connect(self._on_crosshair_changed)
         self.four_view.slice_changed.connect(self._on_slice_changed)
         layout.addWidget(self.four_view)
@@ -1080,6 +1220,8 @@ class MainWindow(QMainWindow):
         algo_layout.addWidget(QLabel("算法类型:"))
         self.algo_combo = QComboBox()
         self.algo_combo.addItems(["Region Competition", "Edge-Based"])
+        # 防外扩默认：优先使用Edge-Based
+        self.algo_combo.setCurrentIndex(1)
         algo_layout.addWidget(self.algo_combo)
 
         # 迭代次数
@@ -1087,7 +1229,8 @@ class MainWindow(QMainWindow):
         self.iterations_spin = QSpinBox()
         self.iterations_spin.setMinimum(10)
         self.iterations_spin.setMaximum(1000)
-        self.iterations_spin.setValue(100)
+        # 防外扩默认：降低迭代次数
+        self.iterations_spin.setValue(70)
         algo_layout.addWidget(self.iterations_spin)
 
         # 平滑度
@@ -1095,7 +1238,8 @@ class MainWindow(QMainWindow):
         self.smoothness_spin = QDoubleSpinBox()
         self.smoothness_spin.setMinimum(0.1)
         self.smoothness_spin.setMaximum(10.0)
-        self.smoothness_spin.setValue(1.0)
+        # 防外扩默认：提高平滑项，抑制毛刺和外扩
+        self.smoothness_spin.setValue(1.6)
         self.smoothness_spin.setSingleStep(0.1)
         algo_layout.addWidget(self.smoothness_spin)
 
@@ -1104,7 +1248,8 @@ class MainWindow(QMainWindow):
         self.expansion_spin = QDoubleSpinBox()
         self.expansion_spin.setMinimum(-5.0)
         self.expansion_spin.setMaximum(5.0)
-        self.expansion_spin.setValue(1.0)
+        # 防外扩默认：Region Competition的扩张力设为保守值
+        self.expansion_spin.setValue(0.25)
         self.expansion_spin.setSingleStep(0.1)
         algo_layout.addWidget(self.expansion_spin)
 
@@ -1195,6 +1340,66 @@ class MainWindow(QMainWindow):
             self.ai_label_window.destroyed.connect(
                 lambda _obj=None: setattr(self, 'ai_label_window', None)
             )
+
+    def _ensure_vessel_tree_window(self):
+        """确保独立3D血管树窗口存在。"""
+        # 独立窗口与主界面3D窗口保持同款后端与显示效果。
+        force_matplotlib_3d = False
+        try:
+            main_is_pyvista = bool(getattr(self.four_view.view_3d, "use_pyvista", False))
+            force_matplotlib_3d = not main_is_pyvista
+        except Exception:
+            force_matplotlib_3d = False
+
+        # 如果已存在但后端不一致，重建窗口以保持和主界面一致。
+        if self.vessel_tree_window is not None:
+            try:
+                win_is_pyvista = bool(getattr(self.vessel_tree_window.view_3d, "use_pyvista", False))
+                want_pyvista = not force_matplotlib_3d
+                if win_is_pyvista == want_pyvista:
+                    return
+            except Exception:
+                return
+            try:
+                self.vessel_tree_window.close()
+            except Exception:
+                pass
+            self.vessel_tree_window = None
+
+        self.vessel_tree_window = Standalone3DWindow(
+            title="独立3D血管树窗口",
+            force_matplotlib_3d=force_matplotlib_3d,
+            parent=None,
+        )
+        self.vessel_tree_window.destroyed.connect(
+            lambda _obj=None: setattr(self, 'vessel_tree_window', None)
+        )
+
+    def _sync_vessel_tree_window(self, refresh_3d: bool = True, reset_camera: bool = False):
+        """同步主窗口当前数据到独立3D血管树窗口。"""
+        if self.vessel_tree_window is None or self.current_image_data is None:
+            return
+
+        spacing = self._get_current_spacing()
+        structure_map = None
+        if getattr(self, 'last_vessel_analysis', None):
+            structure_map = self.last_vessel_analysis.get("structure_map")
+
+        crosshair = None
+        try:
+            crosshair = getattr(self.four_view, "crosshair_3d", None)
+        except Exception:
+            crosshair = None
+
+        self.vessel_tree_window.set_data(
+            image_data=self.current_image_data,
+            label_data=self.current_label_data,
+            spacing=spacing,
+            structure_map=structure_map,
+            crosshair=crosshair,
+            refresh_3d=refresh_3d,
+            reset_camera=reset_camera,
+        )
 
     def _sync_dual_windows_base_image(self, reset_labels: bool = False, refresh_3d: bool = True):
         """把主窗口当前影像同步到两个独立窗口。"""
@@ -1606,6 +1811,13 @@ class MainWindow(QMainWindow):
                 structure_map = self.last_vessel_analysis.get("structure_map")
             self.four_view.view_3d.set_structure_data(structure_map)
             self.four_view.view_3d.refresh_view()
+
+            if self.vessel_tree_window is not None:
+                self._sync_vessel_tree_window(
+                    refresh_3d=self.vessel_tree_window.isVisible(),
+                    reset_camera=False,
+                )
+
             self.statusBar().showMessage("3D视图已更新", 3000)
             if notify:
                 QMessageBox.information(self, "成功", "3D视图已更新（左下角视窗）。")
@@ -1670,7 +1882,8 @@ class MainWindow(QMainWindow):
             'iterations': int(self.iterations_spin.value()),
             'smoothness': float(self.smoothness_spin.value()),
             'expansion_force': float(self.expansion_spin.value()),
-            'edge_weight': 1.0,
+            # 防外扩默认：降低边缘吸引权重，避免过度填充
+            'edge_weight': 0.85,
         }
 
         # 进度对话框
@@ -2199,21 +2412,132 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("量化分析失败")
             QMessageBox.critical(self, "错误", f"量化分析失败:\n{e}")
 
-    def _on_3d_visualization(self):
-        """显示3D血管树"""
+    def _on_liver_segment_partition(self):
+        """独立执行肝段自动划分（不依赖完整量化分析流程）。"""
         if self.current_image_data is None or self.current_label_data is None:
             QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
             return
 
         try:
-            ok = self._on_update_3d_view_clicked(notify=False)
-            if ok:
-                self.statusBar().showMessage("3D血管树已在主界面左下角显示", 4000)
-                QMessageBox.information(
+            from liver_segmentation import run_liver_segmentation
+
+            self.statusBar().showMessage("正在执行独立肝段划分...")
+
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+
+            portal_vein_mask = (self.current_label_data == 1)
+            if not np.any(portal_vein_mask):
+                QMessageBox.warning(
                     self,
-                    "3D可视化",
-                    "3D血管树已更新并显示在主界面左下角视图。\n\n提示：可先点击任意2D切片定位，再执行切割平面模拟。"
+                    "提示",
+                    "当前标签中未检测到门静脉(PV, 标签1)，无法执行肝段划分。"
                 )
+                self.statusBar().showMessage("独立肝段划分中止：缺少PV标签", 3000)
+                return
+
+            liver_mask = (self.current_label_data == 3)
+            liver_source = "标签3（肝脏）"
+            if not np.any(liver_mask):
+                try:
+                    from scipy import ndimage
+                    vessel_union = (self.current_label_data == 1) | (self.current_label_data == 2)
+                    if np.any(vessel_union):
+                        liver_mask = ndimage.binary_dilation(vessel_union, iterations=20)
+                        liver_source = "血管标签膨胀近似"
+                    else:
+                        liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+                        liver_source = "全体素近似（未检测到可用肝脏标签）"
+                except Exception:
+                    liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+                    liver_source = "全体素近似（回退）"
+
+            seg_result = run_liver_segmentation(
+                pv_mask=portal_vein_mask,
+                liver_mask=liver_mask,
+                spacing=spacing,
+            )
+            segment_map = np.asarray(
+                seg_result.get("segment_map", np.zeros_like(self.current_label_data))
+            ).astype(np.uint8)
+            segment_volumes = seg_result.get("segment_volumes", {})
+            segment_centroids = seg_result.get("segment_centroids", {})
+            total_liver = float(sum(float(v) for v in segment_volumes.values()))
+
+            if not hasattr(self, 'quantitative_results') or not isinstance(self.quantitative_results, dict):
+                self.quantitative_results = {}
+
+            # 为报告复用保留兼容字段
+            volumes = dict(segment_volumes)
+            volumes["total_liver"] = total_liver
+            self.quantitative_results['volumes'] = volumes
+            self.quantitative_results['couinaud_segmentation'] = segment_map
+            self.quantitative_results['segment_volumes'] = dict(segment_volumes)
+            self.quantitative_results['segment_centroids'] = dict(segment_centroids)
+            if getattr(self, 'last_cut_stats', None):
+                self.quantitative_results['cut_stats'] = self.last_cut_stats
+
+            result_text = "独立肝段划分结果:\n\n"
+            result_text += f"肝脏掩码来源: {liver_source}\n"
+            result_text += f"总肝体积: {total_liver:.2f} ml\n\n"
+            result_text += "各肝段体积:\n"
+            for i in range(1, 9):
+                key = f"segment_{i}"
+                result_text += f"段 {i}: {float(segment_volumes.get(key, 0.0)):.2f} ml\n"
+
+            result_text += "\n各肝段中心点 (x, y, z):\n"
+            for i in range(1, 9):
+                key = f"segment_{i}"
+                center = segment_centroids.get(key, (float("nan"), float("nan"), float("nan")))
+                try:
+                    cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+                    if np.isfinite(cx) and np.isfinite(cy) and np.isfinite(cz):
+                        result_text += f"段 {i}: ({cx:.1f}, {cy:.1f}, {cz:.1f})\n"
+                    else:
+                        result_text += f"段 {i}: (N/A)\n"
+                except Exception:
+                    result_text += f"段 {i}: (N/A)\n"
+
+            self._show_long_text_dialog("独立肝段划分", result_text)
+            self.statusBar().showMessage("独立肝段划分完成", 4000)
+
+        except Exception as e:
+            self.statusBar().showMessage("独立肝段划分失败", 3000)
+            QMessageBox.critical(self, "错误", f"独立肝段划分失败:\n{e}")
+
+    def _on_3d_visualization(self):
+        """打开独立3D血管树窗口。"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像并进行分割")
+            return
+
+        try:
+            self._ensure_vessel_tree_window()
+            self._sync_vessel_tree_window(refresh_3d=False, reset_camera=True)
+
+            was_visible = self.vessel_tree_window.isVisible()
+            self.vessel_tree_window.show()
+            if not was_visible:
+                target_x = max(self.x() + self.width() + 20, 0)
+                target_y = max(self.y() + 40, 0)
+
+                # 防止弹窗跑到屏幕外，导致“看起来没打开”。
+                screen = QApplication.primaryScreen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    win_w = max(int(self.vessel_tree_window.width()), int(self.vessel_tree_window.minimumWidth()))
+                    win_h = max(int(self.vessel_tree_window.height()), int(self.vessel_tree_window.minimumHeight()))
+                    max_x = geo.x() + max(geo.width() - win_w, 0)
+                    max_y = geo.y() + max(geo.height() - win_h, 0)
+                    target_x = min(max(target_x, geo.x()), max_x)
+                    target_y = min(max(target_y, geo.y()), max_y)
+                self.vessel_tree_window.move(target_x, target_y)
+
+            self.vessel_tree_window.raise_()
+            self.vessel_tree_window.activateWindow()
+            self.vessel_tree_window._refresh_3d_safely()
+            self.statusBar().showMessage("独立3D血管树窗口已打开", 4000)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"3D可视化失败:\n{e}")
 
@@ -2294,12 +2618,18 @@ class MainWindow(QMainWindow):
                 source_desc = "体积统计依据：非零标签近似（未检测到肝脏标签）"
 
             if stats.get("available"):
+                cut_vessels = stats.get("cut_vessels", {}) if isinstance(stats.get("cut_vessels", {}), dict) else {}
+                total_cut = int(cut_vessels.get("total_count", 0))
+                risk = str(stats.get("risk_assessment", "N/A"))
                 summary = (
                     f"切割模拟完成\n\n"
                     f"{source_desc}\n"
                     f"剩余体积: {stats.get('remaining_ml', 0.0):.2f} ml\n"
                     f"切除体积: {stats.get('resected_ml', 0.0):.2f} ml\n"
                     f"剩余比例: {stats.get('remaining_ratio', 0.0) * 100:.1f}%\n\n"
+                    f"切除率: {stats.get('resection_rate', stats.get('resected_ratio', 0.0) * 100):.1f}%\n"
+                    f"风险等级: {risk}\n"
+                    f"切断分支数: {total_cut}\n\n"
                     f"切断识别:\n"
                     f"- 门静脉(PV): {'是' if stats.get('severed_pv') else '否'}\n"
                     f"- 肝静脉(HV): {'是' if stats.get('severed_hv') else '否'}"

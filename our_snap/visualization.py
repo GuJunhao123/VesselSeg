@@ -1538,6 +1538,16 @@ class ThreeDViewer(QWidget):
             "severed_hv": False,
             "pv_cut_voxels": 0,
             "hv_cut_voxels": 0,
+            # New unified simulator fields
+            "resection_rate": 0.0,
+            "risk_assessment": "LOW",
+            "cut_vessels": {
+                "hv_count": 0,
+                "pv_count": 0,
+                "total_count": 0,
+                "critical_vessels": [],
+            },
+            "cut_plane_visualization": {},
         }
         if self.label_data is None:
             return result
@@ -1547,8 +1557,6 @@ class ThreeDViewer(QWidget):
         if n_norm < 1e-8:
             return result
         n = n / n_norm
-        o = np.asarray(origin, dtype=np.float64)
-        plane_offset = float(np.dot(n, o))
 
         sx, sy, sz = self._normalize_spacing()
         voxel_ml = (sx * sy * sz) / 1000.0
@@ -1564,46 +1572,130 @@ class ThreeDViewer(QWidget):
             target_mask = None
 
         if target_mask is not None and np.any(target_mask):
-            coords = np.argwhere(target_mask)
-            # PyVista坐标: x<-axis2, y<-axis1, z<-axis0
-            px = coords[:, 2].astype(np.float64) * sz
-            py = coords[:, 1].astype(np.float64) * sy
-            pz = coords[:, 0].astype(np.float64) * sx
-            signed = n[0] * px + n[1] * py + n[2] * pz - plane_offset
+            # Build vessel label map for simulator: 1=PV, 2=HV, 0=others/background
+            vessel_map = np.zeros_like(self.label_data, dtype=np.uint8)
+            vessel_map[self.label_data == 1] = 1
+            vessel_map[self.label_data == 2] = 2
 
-            keep = signed <= 0.0
-            cut = ~keep
-            keep_count = int(np.count_nonzero(keep))
-            cut_count = int(np.count_nonzero(cut))
-            total = keep_count + cut_count
+            # NOTE:
+            # - cut plane origin/normal are in the current 3D viewer (PyVista) coordinates:
+            #   x<-axis2, y<-axis1, z<-axis0
+            # - surgery_simulator assumes x<-axis2, y<-axis1, z<-axis0 with spacing=(sx,sy,sz)
+            #   therefore we pass spacing as (sz, sy, sx) to stay consistent with current viewer coords.
+            try:
+                try:
+                    from surgery_simulator import run_surgery_simulation
+                except ModuleNotFoundError:
+                    from our_snap.surgery_simulator import run_surgery_simulation
 
-            result["available"] = True
-            result["remaining_ml"] = keep_count * voxel_ml
-            result["resected_ml"] = cut_count * voxel_ml
-            result["total_ml"] = total * voxel_ml
-            if total > 0:
-                result["remaining_ratio"] = keep_count / total
-                result["resected_ratio"] = cut_count / total
+                sim = run_surgery_simulation(
+                    liver_mask=target_mask.astype(np.uint8),
+                    vessel_mask=vessel_map,
+                    cut_plane_params={
+                        "point": tuple(float(v) for v in origin),
+                        "normal": tuple(float(v) for v in n.tolist()),
+                        "point_is_mm": True,
+                    },
+                    spacing=(sz, sy, sx),
+                )
 
-        def _calc_vessel_cut(label_id: int):
-            vessel = (self.label_data == label_id)
-            if not np.any(vessel):
-                return False, 0
-            coords = np.argwhere(vessel)
-            px = coords[:, 2].astype(np.float64) * sz
-            py = coords[:, 1].astype(np.float64) * sy
-            pz = coords[:, 0].astype(np.float64) * sx
-            signed = n[0] * px + n[1] * py + n[2] * pz - plane_offset
-            on_a = int(np.count_nonzero(signed <= 0.0))
-            on_b = int(np.count_nonzero(signed > 0.0))
-            return (on_a > 0 and on_b > 0), min(on_a, on_b)
+                remaining_ml = float(sim.get("remaining_volume_ml", 0.0))
+                resected_ml = float(sim.get("resected_volume_ml", 0.0))
+                total_ml = remaining_ml + resected_ml
+                remaining_ratio = (remaining_ml / total_ml) if total_ml > 1e-8 else 0.0
+                resected_ratio = (resected_ml / total_ml) if total_ml > 1e-8 else 0.0
 
-        pv_cut, pv_vox = _calc_vessel_cut(1)
-        hv_cut, hv_vox = _calc_vessel_cut(2)
-        result["severed_pv"] = pv_cut
-        result["severed_hv"] = hv_cut
-        result["pv_cut_voxels"] = pv_vox
-        result["hv_cut_voxels"] = hv_vox
+                result["available"] = True
+                result["remaining_ml"] = remaining_ml
+                result["resected_ml"] = resected_ml
+                result["total_ml"] = total_ml
+                result["remaining_ratio"] = remaining_ratio
+                result["resected_ratio"] = resected_ratio
+                result["resection_rate"] = float(sim.get("resection_rate", resected_ratio * 100.0))
+                result["risk_assessment"] = str(sim.get("risk_assessment", "LOW"))
+                result["cut_vessels"] = sim.get(
+                    "cut_vessels",
+                    {"hv_count": 0, "pv_count": 0, "total_count": 0, "critical_vessels": []},
+                )
+                result["cut_plane_visualization"] = sim.get("cut_plane_visualization", {})
+
+                hv_count = int(result["cut_vessels"].get("hv_count", 0))
+                pv_count = int(result["cut_vessels"].get("pv_count", 0))
+                result["severed_hv"] = hv_count > 0
+                result["severed_pv"] = pv_count > 0
+
+            except Exception as e:
+                print(f"调用surgery_simulator失败，回退旧统计逻辑: {e}")
+
+                o = np.asarray(origin, dtype=np.float64)
+                plane_offset = float(np.dot(n, o))
+                coords = np.argwhere(target_mask)
+                # PyVista坐标: x<-axis2, y<-axis1, z<-axis0
+                px = coords[:, 2].astype(np.float64) * sz
+                py = coords[:, 1].astype(np.float64) * sy
+                pz = coords[:, 0].astype(np.float64) * sx
+                signed = n[0] * px + n[1] * py + n[2] * pz - plane_offset
+                keep = signed <= 0.0
+                cut = ~keep
+                keep_count = int(np.count_nonzero(keep))
+                cut_count = int(np.count_nonzero(cut))
+                total = keep_count + cut_count
+
+                result["available"] = True
+                result["remaining_ml"] = keep_count * voxel_ml
+                result["resected_ml"] = cut_count * voxel_ml
+                result["total_ml"] = total * voxel_ml
+                if total > 0:
+                    result["remaining_ratio"] = keep_count / total
+                    result["resected_ratio"] = cut_count / total
+                    result["resection_rate"] = result["resected_ratio"] * 100.0
+
+                def _calc_vessel_cut(label_id: int):
+                    vessel = (self.label_data == label_id)
+                    if not np.any(vessel):
+                        return False, 0
+                    c = np.argwhere(vessel)
+                    vx = c[:, 2].astype(np.float64) * sz
+                    vy = c[:, 1].astype(np.float64) * sy
+                    vz = c[:, 0].astype(np.float64) * sx
+                    sd = n[0] * vx + n[1] * vy + n[2] * vz - plane_offset
+                    on_a = int(np.count_nonzero(sd <= 0.0))
+                    on_b = int(np.count_nonzero(sd > 0.0))
+                    return (on_a > 0 and on_b > 0), min(on_a, on_b)
+
+                pv_cut, pv_vox = _calc_vessel_cut(1)
+                hv_cut, hv_vox = _calc_vessel_cut(2)
+                result["severed_pv"] = pv_cut
+                result["severed_hv"] = hv_cut
+                result["pv_cut_voxels"] = pv_vox
+                result["hv_cut_voxels"] = hv_vox
+                result["cut_vessels"] = {
+                    "hv_count": int(1 if hv_cut else 0),
+                    "pv_count": int(1 if pv_cut else 0),
+                    "total_count": int((1 if hv_cut else 0) + (1 if pv_cut else 0)),
+                    "critical_vessels": [],
+                }
+
+            # Compatibility: keep legacy cut voxel estimate even with new simulator output
+            o = np.asarray(origin, dtype=np.float64)
+            plane_offset = float(np.dot(n, o))
+
+            def _legacy_cut_vox(label_id: int) -> int:
+                vessel = (self.label_data == label_id)
+                if not np.any(vessel):
+                    return 0
+                c = np.argwhere(vessel)
+                vx = c[:, 2].astype(np.float64) * sz
+                vy = c[:, 1].astype(np.float64) * sy
+                vz = c[:, 0].astype(np.float64) * sx
+                sd = n[0] * vx + n[1] * vy + n[2] * vz - plane_offset
+                on_a = int(np.count_nonzero(sd <= 0.0))
+                on_b = int(np.count_nonzero(sd > 0.0))
+                return int(min(on_a, on_b))
+
+            result["pv_cut_voxels"] = int(_legacy_cut_vox(1))
+            result["hv_cut_voxels"] = int(_legacy_cut_vox(2))
+
         self.last_cut_stats = result
         return result
 
