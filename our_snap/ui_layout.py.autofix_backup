@@ -1,0 +1,3542 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+涓荤晫闈㈠竷灞€妯″潡 (闆嗘垚鐥呬緥褰掓。鍔熻兘)
+鍔熻兘锛氬疄鐜扮晫闈㈠竷灞€锛屽乏渚у伐鍏锋爮锛屼腑闂磋鍥撅紝鍙充晶鍙傛暟锛屼互鍙婄梾渚嬪綊妗?鍥炴函
+"""
+from case_data_service import CaseDataService
+import numpy as np
+import os
+import shutil
+import tempfile
+import pandas as pd
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QFileDialog, QMessageBox, QLabel, QSlider, QSpinBox, QDoubleSpinBox,
+    QGroupBox, QColorDialog, QComboBox, QProgressDialog,
+    QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QLineEdit,
+    QSizePolicy, QDialog, QFormLayout, QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QInputDialog, QTextEdit, QSplitter, QScrollArea,
+    QFrame, QApplication
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QColor, QIcon, QFont
+from typing import Optional
+
+# === 寮曞叆浣犵殑鑷畾涔夋ā鍧?===
+from image_io import ImageIO
+from visualization import FourViewWidget, ThreeDViewer
+from segmentation import ActiveContourSegmentation
+from ai_interface import AISegmentationInterface
+from database_index import find_patient_dirs_522, build_patient_index_522, SeriesEntry
+from excel_reader import ExcelDataReader
+
+# === [鏂板] 寮曞叆鏁版嵁搴撶鐞嗘ā鍧?===
+try:
+    from database import DatabaseManager
+
+    DB_AVAILABLE = True
+except ImportError:
+    print("Warning: database.py not found. Archiving features will be disabled.")
+    DB_AVAILABLE = False
+
+
+class SegmentationWorker(QThread):
+    """鍒嗗壊绠楁硶宸ヤ綔绾跨▼ - 閬垮厤鐣岄潰鍐荤粨"""
+    finished = pyqtSignal(np.ndarray)
+    error = pyqtSignal(str)
+
+    def __init__(self, algorithm, image_data, seed_points, params):
+        super().__init__()
+        self.algorithm = algorithm
+        self.image_data = image_data
+        self.seed_points = seed_points
+        self.params = params
+
+    def run(self):
+        try:
+            self.algorithm.set_image(self.image_data)
+            self.algorithm.set_seed_points(self.seed_points)
+
+            if self.params['method'] == 'region_competition':
+                mask = self.algorithm.region_competition(
+                    iterations=self.params['iterations'],
+                    smoothness=self.params['smoothness'],
+                    expansion_force=self.params['expansion_force']
+                )
+            else:  # edge_based
+                mask = self.algorithm.edge_based(
+                    iterations=self.params['iterations'],
+                    smoothness=self.params['smoothness'],
+                    edge_weight=self.params['edge_weight']
+                )
+
+            # 鍏滃簳锛氳嫢涓荤畻娉曡緭鍑轰负绌猴紝灏濊瘯鏇翠繚瀹堝弬鏁帮紝閬垮厤澶栨墿
+            if mask is None or not np.any(mask):
+                fallback_iters = min(max(int(self.params.get('iterations', 70)), 60), 100)
+                fallback_smooth = max(float(self.params.get('smoothness', 1.6)), 1.6)
+                fallback_expand = min(float(self.params.get('expansion_force', 0.25)), 0.35)
+                mask = self.algorithm.region_competition(
+                    iterations=fallback_iters,
+                    smoothness=fallback_smooth,
+                    expansion_force=fallback_expand
+                )
+
+            self.finished.emit(mask)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PatientIndexWorker(QThread):
+    """鍗曠梾浜虹储寮曟壂鎻忕嚎绋嬶紙鎳掑姞杞斤級"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, patient_dir: str):
+        super().__init__()
+        self.patient_dir = patient_dir
+
+    def run(self):
+        try:
+            entries = build_patient_index_522(
+                self.patient_dir,
+                stop_checker=self.isInterruptionRequested,
+            )
+            self.finished.emit(entries)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class CaseHistoryDialog(QDialog):
+    """[鏂板] 鐥呬緥鍘嗗彶璁板綍鎼滅储寮圭獥"""
+    case_selected = pyqtSignal(str, str)  # signal(original_path, mask_path)
+
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db = db_manager
+        self.setWindowTitle("鐥呬緥鍘嗗彶妗ｆ (鏃ュ織鏂囦欢)")
+        self.setMinimumSize(600, 400)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout()
+
+        # 鎼滅储鍖?        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("鎼滅储 (濮撳悕/缂栧彿):"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("杈撳叆鍏抽敭璇嶅洖杞︽悳绱?..")
+        self.search_input.returnPressed.connect(self._on_search)
+        search_layout.addWidget(self.search_input)
+
+        btn_search = QPushButton("鎼滅储")
+        btn_search.clicked.connect(self._on_search)
+        search_layout.addWidget(btn_search)
+        layout.addLayout(search_layout)
+
+        # 鍒楄〃鍖?        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
+        layout.addWidget(self.list_widget)
+
+        # 鎻愮ず
+        layout.addWidget(QLabel("鎻愮ず: 鍙屽嚮鍒楄〃椤逛互鍔犺浇鍘嗗彶鐥呬緥"))
+
+        self.setLayout(layout)
+        # 鍒濆鍔犺浇鎵€鏈夎褰?        self._on_search()
+
+    def _on_search(self):
+        keyword = self.search_input.text().strip()
+        self.list_widget.clear()
+
+        try:
+            # 璋冪敤 database.py 涓殑鎼滅储鏂规硶
+            if hasattr(self.db, 'get_patient_history'):
+                records = self.db.get_patient_history(keyword)
+            else:
+                # 鍏煎鏃х増 database.py 鐨?get_all_records
+                records = self.db.get_all_records()
+                if keyword:
+                    records = [r for r in records if
+                               keyword in str(r.get('patient_name', '')) or keyword in str(r.get('patient_code', ''))]
+
+            if not records:
+                self.list_widget.addItem("鏈壘鍒扮浉鍏宠褰?)
+                return
+
+            for row in records:
+                # 鍏煎瀛楀吀鎴朢ow瀵硅薄
+                p_name = row.get('patient_name') or "鏈煡"
+                p_code = row.get('patient_code') or "N/A"
+                c_date = row.get('created_at')
+                note = row.get('diagnosis_note') or ""
+
+                if isinstance(c_date, str):
+                    date_str = c_date
+                elif c_date:
+                    date_str = c_date.strftime("%Y-%m-%d %H:%M")
+                else:
+                    date_str = "鏈煡鏃堕棿"
+
+                display_text = f"[{date_str}] {p_name} ({p_code}) - {note}"
+
+                item = QListWidgetItem(display_text)
+                # 瀛樺偍璺緞鏁版嵁
+                item.setData(Qt.UserRole, row.get('original_path'))
+                item.setData(Qt.UserRole + 1, row.get('mask_path'))
+                self.list_widget.addItem(item)
+
+        except Exception as e:
+            self.list_widget.addItem(f"鏌ヨ鍑洪敊: {e}")
+
+    def _on_item_double_clicked(self, item):
+        orig_path = item.data(Qt.UserRole)
+        mask_path = item.data(Qt.UserRole + 1)
+
+        if orig_path and os.path.exists(orig_path):
+            self.case_selected.emit(orig_path, mask_path)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "閿欒", f"鍘熷鏂囦欢涓嶅瓨鍦?\n{orig_path}")
+
+
+class DatabaseDialog(QDialog):
+    """鏁版嵁搴撳璇濇 - 鐢ㄤ簬娴忚鍜岄€夋嫨DICOM搴忓垪"""
+
+    def __init__(self, db_root: str, parent=None):
+        super().__init__(parent)
+        self.db_root = db_root
+        self.selected_entry = None
+        self.setWindowTitle("鏁版嵁搴撴祻瑙堝櫒")
+        self.setMinimumSize(800, 600)
+        self._init_ui()
+        self._load_patient_dirs()
+
+    def _init_ui(self):
+        """鍒濆鍖朥I"""
+        layout = QVBoxLayout()
+
+        # 椤堕儴淇℃伅
+        info_label = QLabel(f"鏁版嵁搴撹矾寰? {self.db_root}")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # 鍒涘缓鍒嗗壊鍣?        splitter = QSplitter(Qt.Horizontal)
+
+        # 宸︿晶锛氱梾浜哄垪琛?        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(QLabel("鐥呬汉鍒楄〃:"))
+        self.patient_list = QListWidget()
+        self.patient_list.itemClicked.connect(self._on_patient_selected)
+        left_layout.addWidget(self.patient_list)
+        left_panel.setLayout(left_layout)
+        splitter.addWidget(left_panel)
+
+        # 鍙充晶锛氬簭鍒楀垪琛?        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(QLabel("搴忓垪鍒楄〃:"))
+        self.series_list = QListWidget()
+        self.series_list.itemDoubleClicked.connect(self._on_series_double_clicked)
+        right_layout.addWidget(self.series_list)
+        right_panel.setLayout(right_layout)
+        splitter.addWidget(right_panel)
+
+        # 璁剧疆鍒嗗壊鍣ㄦ瘮渚?        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
+
+        # 搴曢儴鎸夐挳
+        button_layout = QHBoxLayout()
+        btn_load = QPushButton("鍔犺浇閫変腑搴忓垪")
+        btn_load.clicked.connect(self._on_load_clicked)
+        button_layout.addWidget(btn_load)
+
+        btn_cancel = QPushButton("鍙栨秷")
+        btn_cancel.clicked.connect(self.reject)
+        button_layout.addWidget(btn_cancel)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def _load_patient_dirs(self):
+        """鍔犺浇鐥呬汉鐩綍鍒楄〃"""
+        self.patient_list.clear()
+        try:
+            patient_dirs = find_patient_dirs_522(self.db_root)
+            for patient_dir in patient_dirs:
+                patient_name = os.path.basename(patient_dir)
+                item = QListWidgetItem(patient_name)
+                item.setData(Qt.UserRole, patient_dir)
+                self.patient_list.addItem(item)
+        except Exception as e:
+            QMessageBox.warning(self, "閿欒", f"鍔犺浇鐥呬汉鍒楄〃澶辫触:\n{e}")
+
+    def _on_patient_selected(self, item):
+        """鐥呬汉閫夋嫨鏀瑰彉"""
+        patient_dir = item.data(Qt.UserRole)
+        self._load_series_list(patient_dir)
+
+    def _load_series_list(self, patient_dir: str):
+        """鍔犺浇搴忓垪鍒楄〃"""
+        self.series_list.clear()
+        try:
+            # 鍒涘缓杩涘害瀵硅瘽妗?            progress = QProgressDialog("姝ｅ湪鎵弿搴忓垪...", "鍙栨秷", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+
+            # 鍒涘缓宸ヤ綔绾跨▼鎵弿搴忓垪
+            worker = PatientIndexWorker(patient_dir)
+            worker.finished.connect(self._on_series_scan_finished)
+            worker.error.connect(self._on_series_scan_error)
+
+            # 淇濆瓨杩涘害瀵硅瘽妗嗗紩鐢?            self._scan_progress = progress
+
+            worker.start()
+
+        except Exception as e:
+            QMessageBox.warning(self, "閿欒", f"鍔犺浇搴忓垪鍒楄〃澶辫触:\n{e}")
+
+    def _on_series_scan_finished(self, entries):
+        """搴忓垪鎵弿瀹屾垚"""
+        if hasattr(self, '_scan_progress'):
+            self._scan_progress.close()
+
+        for entry in entries:
+            item = QListWidgetItem(entry.display_name)
+            item.setData(Qt.UserRole, entry)
+            item.setToolTip(entry.tooltip_text)
+            self.series_list.addItem(item)
+
+    def _on_series_scan_error(self, error_msg):
+        """搴忓垪鎵弿閿欒"""
+        if hasattr(self, '_scan_progress'):
+            self._scan_progress.close()
+        QMessageBox.warning(self, "閿欒", f"搴忓垪鎵弿澶辫触:\n{error_msg}")
+
+    def _on_series_double_clicked(self, item):
+        """鍙屽嚮搴忓垪椤?""
+        self.selected_entry = item.data(Qt.UserRole)
+        self.accept()
+
+    def _on_load_clicked(self):
+        """鍔犺浇鎸夐挳鐐瑰嚮"""
+        current_item = self.series_list.currentItem()
+        if current_item:
+            self.selected_entry = current_item.data(Qt.UserRole)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛閫夋嫨涓€涓簭鍒?)
+
+    def get_selected_entry(self):
+        """鑾峰彇閫変腑鐨勫簭鍒楁潯鐩?""
+        return self.selected_entry
+
+
+class LabelViewerWindow(QWidget):
+    """鐙珛鏍囩鏌ョ湅绐楀彛锛堢敤浜庡尰鐢熸爣绛?AI鏍囩骞惰瀵规瘮锛夈€?""
+
+    def __init__(self, title: str, role_text: str, force_matplotlib_3d: bool = False, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle(title)
+        self.setMinimumSize(900, 700)
+
+        self.role_text = role_text
+        self.force_matplotlib_3d = bool(force_matplotlib_3d)
+        self.image_io = ImageIO()
+        self.base_image_data = None
+        self.base_spacing = None
+        self.base_metadata = None
+        self.current_label_data = None
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._do_refresh_3d)
+        self._needs_refresh_when_shown = False
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel(self.role_text))
+        self.source_label = QLabel("鏍囩鏉ユ簮: 鏈缃?)
+        self.source_label.setWordWrap(True)
+        top_bar.addWidget(self.source_label, stretch=1)
+
+        btn_load = QPushButton("鍔犺浇鏍囩鏂囦欢")
+        btn_load.clicked.connect(self._on_load_label_file)
+        top_bar.addWidget(btn_load)
+
+        btn_clear = QPushButton("娓呯┖鏍囩")
+        btn_clear.clicked.connect(self._on_clear_label)
+        top_bar.addWidget(btn_clear)
+
+        btn_update_3d = QPushButton("鏇存柊3D")
+        btn_update_3d.clicked.connect(self._on_update_3d)
+        top_bar.addWidget(btn_update_3d)
+        layout.addLayout(top_bar)
+
+        # 涓庝富鐣岄潰淇濇寔鍚屾鍚庣锛圥yVista 鎴?matplotlib锛夛紝閬垮厤鏄剧ず椋庢牸涓嶄竴鑷淬€?        self.four_view = FourViewWidget(force_matplotlib_3d=self.force_matplotlib_3d)
+        layout.addWidget(self.four_view, stretch=1)
+
+    def _do_refresh_3d(self):
+        """鐪熸鎵ц3D鍒锋柊銆?""
+        try:
+            self.four_view.refresh_3d_view()
+        except Exception:
+            pass
+
+    def _refresh_3d_safely(self):
+        """鍒锋柊3D瑙嗗浘锛堢獥鍙ｆ湭鏄剧ず鏃跺欢鍚庯紝閬垮厤宕╂簝锛夈€?""
+        if not self.isVisible():
+            self._needs_refresh_when_shown = True
+            return
+        self._needs_refresh_when_shown = False
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._needs_refresh_when_shown:
+            self._refresh_3d_safely()
+
+    def closeEvent(self, event):
+        """鍏抽棴鏃跺敖閲忛噴鏀?D璧勬簮锛岄檷浣庡绐楀彛OpenGL娈嬬暀椋庨櫓銆?""
+        try:
+            if hasattr(self, "four_view") and self.four_view is not None:
+                view_3d = getattr(self.four_view, "view_3d", None)
+                if view_3d is not None:
+                    view_3d.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def set_base_image(self, image_data, spacing=None, metadata=None, refresh_3d: bool = True):
+        """璁剧疆鍩虹褰卞儚锛堜袱涓獥鍙ｄ繚鎸佷竴鑷达級銆?""
+        if image_data is None:
+            return
+
+        self.base_image_data = np.asarray(image_data)
+        self.base_spacing = spacing
+        self.base_metadata = metadata if isinstance(metadata, dict) else None
+        self.four_view.set_image_data(self.base_image_data, spacing)
+
+        if self.current_label_data is None or self.current_label_data.shape != self.base_image_data.shape:
+            self.current_label_data = np.zeros(self.base_image_data.shape, dtype=np.uint8)
+            self.four_view.set_label_data(self.current_label_data)
+
+        if refresh_3d:
+            self._refresh_3d_safely()
+
+    def set_label_data(self, label_data, source_text: str = "", refresh_3d: bool = True) -> bool:
+        """璁剧疆鏍囩鏁版嵁銆?""
+        if self.base_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍦ㄤ富绐楀彛鍔犺浇褰卞儚銆?)
+            return False
+        if label_data is None:
+            return False
+
+        arr = np.asarray(label_data).astype(np.uint8)
+        if arr.shape != self.base_image_data.shape:
+            QMessageBox.warning(
+                self,
+                "閿欒",
+                f"鏍囩灏哄涓庡奖鍍忎笉鍖归厤\n褰卞儚灏哄: {self.base_image_data.shape}\n鏍囩灏哄: {arr.shape}",
+            )
+            return False
+
+        self.current_label_data = np.copy(arr)
+        self.four_view.set_label_data(self.current_label_data)
+        if source_text:
+            self.source_label.setText(f"鏍囩鏉ユ簮: {source_text}")
+
+        if refresh_3d:
+            self._refresh_3d_safely()
+        return True
+
+    def _on_load_label_file(self):
+        """浠庢枃浠跺姞杞芥爣绛俱€?""
+        if self.base_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍦ㄤ富绐楀彛鍔犺浇褰卞儚銆?)
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "鍔犺浇鏍囩",
+            "",
+            "NIfTI鏂囦欢 (*.nii *.nii.gz);;NRRD鏂囦欢 (*.nrrd);;鎵€鏈夋枃浠?(*.*)",
+        )
+        if not filepath:
+            return
+
+        try:
+            label_data = self.image_io.load_label_map(
+                filepath,
+                reference_metadata=self.base_metadata,
+                reference_shape=self.base_image_data.shape if self.base_image_data is not None else None,
+                force_align=True,
+            )
+            if label_data is None:
+                QMessageBox.warning(self, "閿欒", "鏍囩鍔犺浇澶辫触")
+                return
+            if self.set_label_data(label_data, source_text=os.path.basename(filepath)):
+                QMessageBox.information(self, "鎴愬姛", "鏍囩鍔犺浇鎴愬姛")
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鍔犺浇鏍囩澶辫触:\n{e}")
+
+    def _on_clear_label(self):
+        """娓呯┖褰撳墠绐楀彛鏍囩銆?""
+        if self.base_image_data is None:
+            return
+
+        self.current_label_data = np.zeros(self.base_image_data.shape, dtype=np.uint8)
+        self.four_view.set_label_data(self.current_label_data)
+        self.source_label.setText("鏍囩鏉ユ簮: 宸叉竻绌?)
+        self._refresh_3d_safely()
+
+    def _on_update_3d(self):
+        """鎵嬪姩鍒锋柊3D銆?""
+        try:
+            self.four_view.refresh_3d_view()
+        except Exception as e:
+            QMessageBox.warning(self, "鎻愮ず", f"鍒锋柊3D澶辫触:\n{e}")
+
+
+class Standalone3DWindow(QWidget):
+    """鐙珛3D琛€绠℃爲绐楀彛銆?""
+
+    def __init__(self, title: str = "鐙珛3D琛€绠℃爲绐楀彛", force_matplotlib_3d: bool = False, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle(title)
+        self.setMinimumSize(900, 700)
+
+        self.image_data = None
+        self.label_data = None
+        self.spacing = None
+        self.structure_map = None
+        self._needs_refresh_when_shown = False
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._do_refresh_3d)
+
+        self._init_ui(force_matplotlib_3d=force_matplotlib_3d)
+
+    def _init_ui(self, force_matplotlib_3d: bool):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        top_bar = QHBoxLayout()
+        title = QLabel("鐙珛3D琛€绠℃爲")
+        top_bar.addWidget(title)
+
+        self.info_label = QLabel("鏈姞杞芥暟鎹?)
+        self.info_label.setWordWrap(True)
+        top_bar.addWidget(self.info_label, stretch=1)
+
+        btn_update = QPushButton("鏇存柊3D")
+        btn_update.clicked.connect(self._on_update_3d)
+        top_bar.addWidget(btn_update)
+
+        btn_reset_camera = QPushButton("閲嶇疆瑙嗚")
+        btn_reset_camera.clicked.connect(self._on_reset_camera)
+        top_bar.addWidget(btn_reset_camera)
+
+        layout.addLayout(top_bar)
+
+        self.view_3d = ThreeDViewer(parent=self, force_matplotlib=bool(force_matplotlib_3d))
+        layout.addWidget(self.view_3d, stretch=1)
+
+    def _do_refresh_3d(self):
+        try:
+            self.view_3d.refresh_view()
+        except Exception:
+            pass
+
+    def _refresh_3d_safely(self):
+        if not self.isVisible():
+            self._needs_refresh_when_shown = True
+            return
+        self._needs_refresh_when_shown = False
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._needs_refresh_when_shown:
+            self._refresh_3d_safely()
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "view_3d") and self.view_3d is not None:
+                self.view_3d.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def set_data(
+        self,
+        image_data,
+        label_data,
+        spacing=None,
+        structure_map=None,
+        crosshair=None,
+        refresh_3d: bool = True,
+        reset_camera: bool = False,
+    ):
+        if image_data is None:
+            return
+
+        self.image_data = np.asarray(image_data)
+        self.spacing = spacing
+        self.structure_map = structure_map
+
+        if label_data is None:
+            self.label_data = np.zeros(self.image_data.shape, dtype=np.uint8)
+        else:
+            arr = np.asarray(label_data).astype(np.uint8)
+            if arr.shape != self.image_data.shape:
+                self.label_data = np.zeros(self.image_data.shape, dtype=np.uint8)
+            else:
+                self.label_data = arr
+
+        self.view_3d.set_image_data(self.image_data, self.spacing)
+        self.view_3d.set_label_data(self.label_data)
+        self.view_3d.set_structure_data(self.structure_map)
+
+        if crosshair is not None and len(crosshair) >= 3:
+            try:
+                self.view_3d.set_crosshair_3d(float(crosshair[0]), float(crosshair[1]), float(crosshair[2]))
+            except Exception:
+                pass
+
+        pv_vox = int(np.sum(self.label_data == 1))
+        hv_vox = int(np.sum(self.label_data == 2))
+        nz_vox = int(np.sum(self.label_data > 0))
+        self.info_label.setText(f"PV浣撶礌: {pv_vox} | HV浣撶礌: {hv_vox} | 闈為浂鏍囩浣撶礌: {nz_vox}")
+
+        if reset_camera:
+            self.view_3d.reset_camera()
+        if refresh_3d:
+            self._refresh_3d_safely()
+
+    def _on_update_3d(self):
+        self._refresh_3d_safely()
+
+    def _on_reset_camera(self):
+        try:
+            self.view_3d.reset_camera()
+        except Exception:
+            pass
+        self._refresh_3d_safely()
+
+
+class MainWindow(QMainWindow):
+    """涓荤獥鍙?""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("鍖诲褰卞儚鍒嗗壊杞欢")
+        # 浣跨敤鏇翠繚瀹堢殑榛樿灏哄锛岄伩鍏嶅湪灏忓睆骞曚笂琚郴缁熷己鍒朵负鈥滆繎浼煎叏灞忊€?        self.setGeometry(120, 80, 1280, 820)
+
+        # 鍒濆鍖栨ā鍧?        self.image_io = ImageIO()
+        self.segmentation = ActiveContourSegmentation()
+        self.ai_interface = None  # 寤惰繜鍒濆鍖栵紝鍔犲揩鍚姩閫熷害
+
+        # 鍚庡彴棰勫姞杞紸I妯″瀷
+        self._preload_ai_model()
+
+        # === [鏂板] 鍒濆鍖栨暟鎹簱绠＄悊鍣?===
+        self.db = None
+        if DB_AVAILABLE:
+            try:
+                from database import DatabaseManager
+                self.db = DatabaseManager()
+                print("DatabaseManager initialized successfully.")
+            except Exception as e:
+                print(f"Failed to initialize DatabaseManager: {e}")
+
+        # 鍒濆鍖栨暟鎹湇鍔?        self.data_service = CaseDataService()
+
+        # 鏁版嵁瀛樺偍
+        self.current_image_data = None
+        self.current_label_data = None
+        self.current_metadata = None
+        self.current_image_path = None  # 褰撳墠鍥惧儚鏂囦欢璺緞锛堢敤浜庢樉绀篖ayer鍚嶇О锛?        self.current_entry = None  # 褰撳墠搴忓垪鐨凷eriesEntry锛堝鏋滄槸浠庢暟鎹簱鍔犺浇鐨勶級
+        self.seed_points = []
+        self.label_list = []  # 鏍囩鍒楄〃
+        self.active_label_id = 1  # 娲诲姩鏍囩ID
+        self.ai_model_variant = 'mobileuvit_l'
+        self.ai_decomposition_method = 'percentile_50'
+        self.last_vessel_analysis = {}
+        self.last_cut_stats = {}
+        self._last_seed = None
+        self.doctor_label_window = None
+        self.ai_label_window = None
+        self.last_doctor_label_data = None
+        self.last_ai_label_data = None
+        self.vessel_tree_window = None
+
+        # 褰撳墠鐥呬汉/妫€鏌?搴忓垪淇℃伅锛堜粠DICOM鎴栨暟鎹簱鑾峰彇锛?        self.current_patient_info = {}
+
+        # 淇濆瓨涓婃閫夋嫨鐨勬暟鎹簱璺緞
+        self.last_db_root = None
+
+        # 鎾ら攢/閲嶅仛鍘嗗彶
+        self.undo_history = []  # 鎾ら攢鍘嗗彶鏍?        self.redo_history = []  # 閲嶅仛鍘嗗彶鏍?        self.max_history_size = 50  # 鏈€澶у巻鍙茶褰曟暟
+
+        # UI鍒濆鍖?        self._init_ui()
+
+    def _init_ui(self):
+        """鍒濆鍖朥I甯冨眬"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
+        central_widget.setLayout(main_layout)
+
+        # ========== 宸︿晶锛氬伐鍏锋爮鍖猴紙浣跨敤婊氬姩鍖哄煙锛?==========
+        left_panel = self._create_left_panel()
+        main_layout.addWidget(left_panel, stretch=1)
+
+        # ========== 涓棿锛?脳2瑙嗗浘鍖?==========
+        center_panel = self._create_center_panel()
+        main_layout.addWidget(center_panel, stretch=4)
+
+        # ========== 鍙充晶锛氬弬鏁拌缃尯锛堜娇鐢ㄦ粴鍔ㄥ尯鍩燂級 ==========
+        right_panel = self._create_right_panel()
+        main_layout.addWidget(right_panel, stretch=1)
+
+    def _create_left_panel(self) -> QWidget:
+        """鍒涘缓宸︿晶宸ュ叿鏍忥紙甯︽粴鍔ㄥ尯鍩燂紝瑙ｅ喅鍐呭杩囧闂锛?""
+        # 鍒涘缓涓€涓鍣╳idget
+        container = QWidget()
+        container.setMinimumWidth(280)
+        container.setMaximumWidth(350)
+
+        # 涓诲竷灞€
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # 鍒涘缓婊氬姩鍖哄煙
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # 婊氬姩鍖哄煙鐨勫唴瀹箇idget
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(5, 5, 5, 5)
+        content_layout.setSpacing(8)
+
+        # ===== 1. Main Toolbar =====
+        main_toolbar_group = QGroupBox("Main Toolbar")
+        main_toolbar_layout = QVBoxLayout()
+        main_toolbar_layout.setSpacing(5)
+
+        # 宸ュ叿鎸夐挳缁?- 浣跨敤缃戞牸甯冨眬閬垮厤閲嶅彔
+        from PyQt5.QtWidgets import QGridLayout
+        tools_grid = QGridLayout()
+        tools_grid.setSpacing(3)
+
+        # Pointer锛堟寚閽堝伐鍏凤級
+        self.btn_pointer = QPushButton("鈫?)
+        self.btn_pointer.setToolTip("Pointer Tool")
+        self.btn_pointer.setCheckable(True)
+        self.btn_pointer.setChecked(True)
+        self.btn_pointer.setFixedSize(35, 35)
+        self.btn_pointer.clicked.connect(lambda: self._on_tool_selected('pointer'))
+        tools_grid.addWidget(self.btn_pointer, 0, 0)
+
+        # Zoom锛堢缉鏀惧伐鍏凤級
+        self.btn_zoom = QPushButton("馃攳")
+        self.btn_zoom.setToolTip("Zoom Tool")
+        self.btn_zoom.setCheckable(True)
+        self.btn_zoom.setFixedSize(35, 35)
+        self.btn_zoom.clicked.connect(lambda: self._on_tool_selected('zoom'))
+        tools_grid.addWidget(self.btn_zoom, 0, 1)
+
+        # Pan锛堝钩绉诲伐鍏凤級
+        self.btn_pan = QPushButton("鉁?)
+        self.btn_pan.setToolTip("Pan Tool")
+        self.btn_pan.setCheckable(True)
+        self.btn_pan.setFixedSize(35, 35)
+        self.btn_pan.clicked.connect(lambda: self._on_tool_selected('pan'))
+        tools_grid.addWidget(self.btn_pan, 0, 2)
+
+        # Brush锛堢敾绗斿伐鍏凤級
+        self.btn_brush = QPushButton("馃枌")
+        self.btn_brush.setToolTip("Brush Tool")
+        self.btn_brush.setCheckable(True)
+        self.btn_brush.setFixedSize(35, 35)
+        self.btn_brush.clicked.connect(lambda: self._on_tool_selected('brush'))
+        tools_grid.addWidget(self.btn_brush, 1, 0)
+
+        # Eraser锛堟鐨摝宸ュ叿锛?        self.btn_eraser = QPushButton("馃Ч")
+        self.btn_eraser.setToolTip("Eraser Tool")
+        self.btn_eraser.setCheckable(True)
+        self.btn_eraser.setFixedSize(35, 35)
+        self.btn_eraser.clicked.connect(lambda: self._on_tool_selected('eraser'))
+        tools_grid.addWidget(self.btn_eraser, 1, 1)
+
+        # Save Screenshot锛堜繚瀛樻埅鍥撅級
+        self.btn_screenshot = QPushButton("馃摲")
+        self.btn_screenshot.setToolTip("Save Screenshot")
+        self.btn_screenshot.setFixedSize(35, 35)
+        self.btn_screenshot.clicked.connect(self._on_save_screenshot)
+        tools_grid.addWidget(self.btn_screenshot, 1, 2)
+
+        main_toolbar_layout.addLayout(tools_grid)
+
+        # 鎾ら攢/閲嶅仛鎸夐挳
+        undo_redo_layout = QHBoxLayout()
+        undo_redo_layout.setSpacing(5)
+        self.btn_undo = QPushButton("鈫?Undo")
+        self.btn_undo.setToolTip("Undo (Ctrl+Z)")
+        self.btn_undo.setFixedHeight(30)
+        self.btn_undo.clicked.connect(self._on_undo)
+        undo_redo_layout.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("鈫?Redo")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y)")
+        self.btn_redo.setFixedHeight(30)
+        self.btn_redo.clicked.connect(self._on_redo)
+        undo_redo_layout.addWidget(self.btn_redo)
+        main_toolbar_layout.addLayout(undo_redo_layout)
+
+        # 鐢荤瑪澶у皬璁剧疆
+        brush_size_layout = QHBoxLayout()
+        brush_size_layout.setSpacing(5)
+        brush_size_layout.addWidget(QLabel("鐢荤瑪澶у皬:"))
+        self.brush_size_spin = QSpinBox()
+        self.brush_size_spin.setMinimum(1)
+        self.brush_size_spin.setMaximum(50)
+        self.brush_size_spin.setValue(3)
+        self.brush_size_spin.valueChanged.connect(self._on_brush_size_changed)
+        brush_size_layout.addWidget(self.brush_size_spin)
+        brush_size_layout.addStretch()
+        main_toolbar_layout.addLayout(brush_size_layout)
+
+        # 鏂囦欢鎿嶄綔鎸夐挳
+        btn_load_image = QPushButton("馃搨 鍔犺浇褰卞儚")
+        btn_load_image.setFixedHeight(32)
+        btn_load_image.clicked.connect(self._on_load_image)
+        main_toolbar_layout.addWidget(btn_load_image)
+
+        btn_load_dicom_folder = QPushButton("馃搧 鍔犺浇DICOM鏂囦欢澶?)
+        btn_load_dicom_folder.setFixedHeight(32)
+        btn_load_dicom_folder.clicked.connect(self._on_load_dicom_folder)
+        main_toolbar_layout.addWidget(btn_load_dicom_folder)
+
+        btn_load_label = QPushButton("馃彿锔?鍔犺浇鏍囩")
+        btn_load_label.setFixedHeight(32)
+        btn_load_label.clicked.connect(self._on_load_label)
+        main_toolbar_layout.addWidget(btn_load_label)
+
+        btn_save_label = QPushButton("馃捑 淇濆瓨鏍囩")
+        btn_save_label.setFixedHeight(32)
+        btn_save_label.clicked.connect(self._on_save_label)
+        main_toolbar_layout.addWidget(btn_save_label)
+
+        btn_compare_labels = QPushButton("馃獰 鍙岀獥鍙ｆ爣绛惧姣?)
+        btn_compare_labels.setFixedHeight(32)
+        btn_compare_labels.clicked.connect(self._on_open_dual_label_windows)
+        main_toolbar_layout.addWidget(btn_compare_labels)
+
+        main_toolbar_group.setLayout(main_toolbar_layout)
+        content_layout.addWidget(main_toolbar_group)
+
+        # 褰撳墠宸ュ叿妯″紡
+        self.current_tool_mode = 'pointer'
+        self.seed_mode_enabled = False
+
+        # ===== 2. Cursor Inspector =====
+        cursor_group = QGroupBox("鍏夋爣淇℃伅")
+        cursor_layout = QVBoxLayout()
+        cursor_layout.setSpacing(5)
+
+        # Cursor position
+        self.cursor_pos_label = QLabel("浣嶇疆 (x,y,z): --")
+        self.cursor_pos_label.setWordWrap(True)
+        cursor_layout.addWidget(self.cursor_pos_label)
+
+        # Intensity under cursor
+        self.cursor_intensity_label = QLabel("鍍忕礌鍊?")
+        self.cursor_layer_label = QLabel("  鍥惧眰: --")
+        self.cursor_intensity_value_label = QLabel("  寮哄害: --")
+        cursor_layout.addWidget(self.cursor_intensity_label)
+        cursor_layout.addWidget(self.cursor_layer_label)
+        cursor_layout.addWidget(self.cursor_intensity_value_label)
+
+        # Label under cursor
+        self.cursor_label_label = QLabel("鏍囩鍊?")
+        self.cursor_label_value_label = QLabel("  鏍囩: --")
+        self.btn_clear_label = QPushButton("娓呴櫎鏍囩")
+        self.btn_clear_label.setFixedHeight(30)
+        self.btn_clear_label.clicked.connect(self._on_clear_label)
+        cursor_layout.addWidget(self.cursor_label_label)
+        cursor_layout.addWidget(self.cursor_label_value_label)
+        cursor_layout.addWidget(self.btn_clear_label)
+
+        cursor_group.setLayout(cursor_layout)
+        content_layout.addWidget(cursor_group)
+
+        # ===== 3. Patient Info =====
+        patient_group = QGroupBox("鐥呬汉淇℃伅")
+        patient_layout = QVBoxLayout()
+        patient_layout.setSpacing(3)
+
+        self.pi_id_label = QLabel("ID: --")
+        self.pi_name_label = QLabel("濮撳悕: --")
+        self.pi_sex_label = QLabel("鎬у埆: --")
+        self.pi_birth_label = QLabel("鍑虹敓鏃ユ湡: --")
+        self.pi_study_date_label = QLabel("妫€鏌ユ棩鏈? --")
+        self.pi_modality_label = QLabel("妯℃€? --")
+        self.pi_series_label = QLabel("搴忓垪: --")
+
+        for w in [
+            self.pi_id_label,
+            self.pi_name_label,
+            self.pi_sex_label,
+            self.pi_birth_label,
+            self.pi_study_date_label,
+            self.pi_modality_label,
+            self.pi_series_label,
+        ]:
+            w.setWordWrap(True)
+            patient_layout.addWidget(w)
+
+        patient_group.setLayout(patient_layout)
+        content_layout.addWidget(patient_group)
+
+        # ===== 4. Segmentation Labels =====
+        labels_group = QGroupBox("鍒嗗壊鏍囩")
+        labels_layout = QVBoxLayout()
+        labels_layout.setSpacing(5)
+
+        # Active label锛堟椿鍔ㄦ爣绛撅級
+        active_label_layout = QHBoxLayout()
+        active_label_layout.setSpacing(5)
+        self.active_label_color_widget = QWidget()
+        self.active_label_color_widget.setFixedSize(20, 20)
+        self.active_label_color_widget.setStyleSheet("background-color: red; border: 1px solid black;")
+        active_label_layout.addWidget(self.active_label_color_widget)
+        self.active_label_name_label = QLabel("娲诲姩鏍囩: Label 1")
+        active_label_layout.addWidget(self.active_label_name_label)
+        active_label_layout.addStretch()
+        labels_layout.addLayout(active_label_layout)
+
+        # Paint over锛堢粯鍒惰鐩栨爣绛撅級
+        self.paint_over_label = QLabel("缁樺埗瑕嗙洊: Label 1")
+        labels_layout.addWidget(self.paint_over_label)
+
+        # Overall label opacity锛堟爣绛鹃€忔槑搴︽粦鍧楋級
+        opacity_layout = QHBoxLayout()
+        opacity_layout.setSpacing(5)
+        opacity_layout.addWidget(QLabel("鏍囩閫忔槑搴?"))
+        self.label_opacity_slider = QSlider(Qt.Horizontal)
+        self.label_opacity_slider.setMinimum(0)
+        self.label_opacity_slider.setMaximum(100)
+        self.label_opacity_slider.setValue(50)
+        self.label_opacity_slider.valueChanged.connect(self._on_label_opacity_changed)
+        opacity_layout.addWidget(self.label_opacity_slider)
+        self.label_opacity_value_label = QLabel("50%")
+        self.label_opacity_value_label.setMinimumWidth(40)
+        opacity_layout.addWidget(self.label_opacity_value_label)
+        labels_layout.addLayout(opacity_layout)
+
+        # 鏍囩鍒楄〃
+        self.label_list_widget = QListWidget()
+        self.label_list_widget.setMaximumHeight(100)
+        self.label_list_widget.itemSelectionChanged.connect(self._on_label_selection_changed)
+        labels_layout.addWidget(self.label_list_widget)
+
+        # 鏍囩鎿嶄綔鎸夐挳 - 姘村钩甯冨眬
+        label_buttons_layout = QHBoxLayout()
+        label_buttons_layout.setSpacing(5)
+
+        btn_add_label = QPushButton("娣诲姞鏍囩")
+        btn_add_label.setFixedHeight(30)
+        btn_add_label.clicked.connect(self._on_add_label)
+        label_buttons_layout.addWidget(btn_add_label)
+
+        btn_delete_label = QPushButton("鍒犻櫎鏍囩")
+        btn_delete_label.setFixedHeight(30)
+        btn_delete_label.clicked.connect(self._on_delete_label)
+        label_buttons_layout.addWidget(btn_delete_label)
+
+        btn_label_color = QPushButton("鏍囩棰滆壊")
+        btn_label_color.setFixedHeight(30)
+        btn_label_color.clicked.connect(self._on_label_color)
+        label_buttons_layout.addWidget(btn_label_color)
+
+        labels_layout.addLayout(label_buttons_layout)
+
+        labels_group.setLayout(labels_layout)
+        content_layout.addWidget(labels_group)
+
+        # 鍒濆鍖栨椿鍔ㄦ爣绛?        self.active_label_id = 1
+
+        # ===== 5. 3D鎿嶄綔鎸夐挳 =====
+        toolbar_3d_group = QGroupBox("3D鎿嶄綔")
+        toolbar_3d_layout = QVBoxLayout()
+        toolbar_3d_layout.setSpacing(5)
+
+        # Update锛堟洿鏂?D瑙嗗浘锛?        btn_update_3d = QPushButton("馃攧 鏇存柊3D瑙嗗浘")
+        btn_update_3d.setFixedHeight(32)
+        btn_update_3d.clicked.connect(self._on_update_3d_view_clicked)
+        toolbar_3d_layout.addWidget(btn_update_3d)
+
+        # 绉嶅瓙鐐圭浉鍏虫寜閽?- 姘村钩甯冨眬
+        seed_layout = QHBoxLayout()
+        seed_layout.setSpacing(5)
+        self.btn_add_seed = QPushButton("鉃?娣诲姞绉嶅瓙鐐?)
+        self.btn_add_seed.setFixedHeight(32)
+        self.btn_add_seed.setCheckable(True)
+        self.btn_add_seed.clicked.connect(self._on_toggle_seed_mode)
+        seed_layout.addWidget(self.btn_add_seed)
+
+        self.btn_clear_seeds = QPushButton("馃棏锔?娓呴櫎绉嶅瓙鐐?)
+        self.btn_clear_seeds.setFixedHeight(32)
+        self.btn_clear_seeds.clicked.connect(self._on_clear_seeds)
+        seed_layout.addWidget(self.btn_clear_seeds)
+        toolbar_3d_layout.addLayout(seed_layout)
+
+        # 绉嶅瓙鐐规暟閲忔樉绀?        self.seed_count_label = QLabel("绉嶅瓙鐐规暟閲? 0")
+        toolbar_3d_layout.addWidget(self.seed_count_label)
+
+        # 鍒嗗壊鐩稿叧鎸夐挳
+        btn_label_stats = QPushButton("馃搳 鏍囩缁熻")
+        btn_label_stats.setFixedHeight(32)
+        btn_label_stats.clicked.connect(self._on_label_statistics)
+        toolbar_3d_layout.addWidget(btn_label_stats)
+
+        btn_segment_3d = QPushButton("鉁傦笍 3D鍒嗗壊")
+        btn_segment_3d.setFixedHeight(32)
+        btn_segment_3d.clicked.connect(self._on_segment_3d)
+        toolbar_3d_layout.addWidget(btn_segment_3d)
+
+        btn_ai_seg = QPushButton("馃 AI鑷姩鍒嗗壊")
+        btn_ai_seg.setFixedHeight(32)
+        btn_ai_seg.clicked.connect(self._on_ai_segmentation)
+        toolbar_3d_layout.addWidget(btn_ai_seg)
+
+        toolbar_3d_group.setLayout(toolbar_3d_layout)
+        content_layout.addWidget(toolbar_3d_group)
+
+        # ===== 6. 閲忓寲鍒嗘瀽 =====
+        quant_analysis_group = QGroupBox("閲忓寲鍒嗘瀽")
+        quant_analysis_layout = QVBoxLayout()
+        quant_analysis_layout.setSpacing(5)
+
+        btn_quant_analysis = QPushButton("馃搱 杩愯閲忓寲鍒嗘瀽")
+        btn_quant_analysis.setFixedHeight(32)
+        btn_quant_analysis.clicked.connect(self._on_quantitative_analysis)
+        quant_analysis_layout.addWidget(btn_quant_analysis)
+
+        btn_liver_partition = QPushButton("馃Л 鐙珛鑲濇鍒掑垎")
+        btn_liver_partition.setFixedHeight(32)
+        btn_liver_partition.clicked.connect(self._on_liver_segment_partition)
+        quant_analysis_layout.addWidget(btn_liver_partition)
+
+        quant_analysis_group.setLayout(quant_analysis_layout)
+        content_layout.addWidget(quant_analysis_group)
+
+        # ===== 7. 3D鍙鍖?=====
+        three_d_visualization_group = QGroupBox("3D鍙鍖?)
+        three_d_visualization_layout = QVBoxLayout()
+        three_d_visualization_layout.setSpacing(5)
+
+        btn_3d_visualization = QPushButton("馃帹 鎵撳紑鐙珛3D绐楀彛")
+        btn_3d_visualization.setFixedHeight(32)
+        btn_3d_visualization.clicked.connect(self._on_3d_visualization)
+        three_d_visualization_layout.addWidget(btn_3d_visualization)
+
+        btn_cutting_plane = QPushButton("鉁傦笍 娣诲姞鍒囧壊骞抽潰")
+        btn_cutting_plane.setFixedHeight(32)
+        btn_cutting_plane.clicked.connect(self._on_add_cutting_plane)
+        three_d_visualization_layout.addWidget(btn_cutting_plane)
+
+        three_d_visualization_group.setLayout(three_d_visualization_layout)
+        content_layout.addWidget(three_d_visualization_group)
+
+        # ===== 8. 鎶ュ憡鐢熸垚 =====
+        report_group = QGroupBox("鎶ュ憡鐢熸垚")
+        report_layout = QVBoxLayout()
+        report_layout.setSpacing(5)
+
+        btn_generate_report = QPushButton("馃搫 鐢熸垚PDF鎶ュ憡")
+        btn_generate_report.setFixedHeight(32)
+        btn_generate_report.clicked.connect(self._on_generate_report)
+        report_layout.addWidget(btn_generate_report)
+
+        report_group.setLayout(report_layout)
+        content_layout.addWidget(report_group)
+
+        # ===== 9. 鏁版嵁搴撳鎺ワ紙522鑼冨紡锛?=====
+        btn_open_db_dialog = QPushButton("馃梽锔?鎵撳紑鏁版嵁搴?(522)")
+        btn_open_db_dialog.setFixedHeight(32)
+        btn_open_db_dialog.clicked.connect(self._on_open_db_dialog)
+        content_layout.addWidget(btn_open_db_dialog)
+
+        # ===== 10. 鐥呬緥褰掓。/PACS绯荤粺 =====
+        archive_group = QGroupBox("鐥呬緥褰掓。")
+        archive_layout = QVBoxLayout()
+        archive_layout.setSpacing(5)
+
+        self.btn_save_case_db = QPushButton("馃捑 淇濆瓨鐥呬緥鍒板簱")
+        self.btn_save_case_db.setFixedHeight(32)
+        self.btn_save_case_db.clicked.connect(self._on_save_case_to_db)
+        archive_layout.addWidget(self.btn_save_case_db)
+
+        self.btn_search_case_db = QPushButton("馃攳 鎼滅储鍘嗗彶鐥呬緥")
+        self.btn_search_case_db.setFixedHeight(32)
+        self.btn_search_case_db.clicked.connect(self._on_search_case_history)
+        archive_layout.addWidget(self.btn_search_case_db)
+
+        archive_group.setLayout(archive_layout)
+        content_layout.addWidget(archive_group)
+
+        # 娣诲姞寮规€х┖闂达紝璁╁唴瀹瑰彲浠ユ粴鍔ㄥ埌搴曢儴
+        content_layout.addStretch()
+
+        # 璁剧疆婊氬姩鍖哄煙鐨勫唴瀹?        scroll_area.setWidget(content_widget)
+
+        # 灏嗘粴鍔ㄥ尯鍩熸坊鍔犲埌涓诲竷灞€
+        main_layout.addWidget(scroll_area)
+
+        return container
+
+    def _create_center_panel(self) -> QWidget:
+        """鍒涘缓涓棿2脳2瑙嗗浘鍖?""
+        panel = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)
+        panel.setLayout(layout)
+
+        # 鍒涘缓2脳2瑙嗗浘缁勪欢
+        force_mpl_3d = str(os.environ.get("VESSELSEG_FORCE_MPL_3D", "0")).strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        self.four_view = FourViewWidget(force_matplotlib_3d=force_mpl_3d)
+        self.four_view.crosshair_changed.connect(self._on_crosshair_changed)
+        self.four_view.slice_changed.connect(self._on_slice_changed)
+        layout.addWidget(self.four_view)
+
+        return panel
+
+    def _create_right_panel(self) -> QWidget:
+        """鍒涘缓鍙充晶鍙傛暟璁剧疆鍖猴紙鍒嗗壊绠楁硶鍙傛暟 + 绐楀绐椾綅锛?""
+        container = QWidget()
+        container.setMaximumWidth(250)
+        container.setMinimumWidth(220)
+
+        # 涓诲竷灞€
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # 鍒涘缓婊氬姩鍖哄煙
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # 婊氬姩鍖哄煙鐨勫唴瀹箇idget
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(5, 5, 5, 5)
+        content_layout.setSpacing(8)
+
+        # 绐楀绐椾綅鍙傛暟缁?        window_group = QGroupBox("绐楀绐椾綅")
+        window_layout = QVBoxLayout()
+        window_layout.setSpacing(5)
+
+        # 绐楀
+        window_layout.addWidget(QLabel("绐楀:"))
+        self.window_width_spin = QDoubleSpinBox()
+        self.window_width_spin.setMinimum(1.0)
+        self.window_width_spin.setMaximum(4000.0)
+        self.window_width_spin.setValue(400.0)
+        self.window_width_spin.setSingleStep(10.0)
+        self.window_width_spin.valueChanged.connect(self._on_window_width_changed)
+        window_layout.addWidget(self.window_width_spin)
+
+        # 绐椾綅
+        window_layout.addWidget(QLabel("绐椾綅:"))
+        self.window_level_spin = QDoubleSpinBox()
+        self.window_level_spin.setMinimum(-2000.0)
+        self.window_level_spin.setMaximum(2000.0)
+        self.window_level_spin.setValue(0.0)
+        self.window_level_spin.setSingleStep(10.0)
+        self.window_level_spin.valueChanged.connect(self._on_window_level_changed)
+        window_layout.addWidget(self.window_level_spin)
+
+        # 鑷姩绐楀绐椾綅鎸夐挳
+        btn_auto_window = QPushButton("鑷姩")
+        btn_auto_window.setFixedHeight(30)
+        btn_auto_window.clicked.connect(self._on_auto_window)
+        window_layout.addWidget(btn_auto_window)
+
+        # 榛樿绐楀绐椾綅鎸夐挳
+        btn_default_window = QPushButton("榛樿")
+        btn_default_window.setFixedHeight(30)
+        btn_default_window.clicked.connect(self._on_default_window)
+        window_layout.addWidget(btn_default_window)
+
+        window_group.setLayout(window_layout)
+        content_layout.addWidget(window_group)
+
+        # 鍒嗗壊绠楁硶鍙傛暟缁?        algo_group = QGroupBox("鍒嗗壊绠楁硶鍙傛暟")
+        algo_layout = QVBoxLayout()
+        algo_layout.setSpacing(5)
+
+        # 绠楁硶閫夋嫨
+        algo_layout.addWidget(QLabel("绠楁硶绫诲瀷:"))
+        self.algo_combo = QComboBox()
+        self.algo_combo.addItems(["Region Competition", "Edge-Based"])
+        # 闃插鎵╅粯璁わ細浼樺厛浣跨敤Edge-Based
+        self.algo_combo.setCurrentIndex(1)
+        algo_layout.addWidget(self.algo_combo)
+
+        # 杩唬娆℃暟
+        algo_layout.addWidget(QLabel("杩唬娆℃暟:"))
+        self.iterations_spin = QSpinBox()
+        self.iterations_spin.setMinimum(10)
+        self.iterations_spin.setMaximum(1000)
+        # 闃插鎵╅粯璁わ細闄嶄綆杩唬娆℃暟
+        self.iterations_spin.setValue(70)
+        algo_layout.addWidget(self.iterations_spin)
+
+        # 骞虫粦搴?        algo_layout.addWidget(QLabel("骞虫粦搴?"))
+        self.smoothness_spin = QDoubleSpinBox()
+        self.smoothness_spin.setMinimum(0.1)
+        self.smoothness_spin.setMaximum(10.0)
+        # 闃插鎵╅粯璁わ細鎻愰珮骞虫粦椤癸紝鎶戝埗姣涘埡鍜屽鎵?        self.smoothness_spin.setValue(1.6)
+        self.smoothness_spin.setSingleStep(0.1)
+        algo_layout.addWidget(self.smoothness_spin)
+
+        # 鎵╁紶鍔涳紙浠匯egion Competition锛?        algo_layout.addWidget(QLabel("鎵╁紶鍔?"))
+        self.expansion_spin = QDoubleSpinBox()
+        self.expansion_spin.setMinimum(-5.0)
+        self.expansion_spin.setMaximum(5.0)
+        # 闃插鎵╅粯璁わ細Region Competition鐨勬墿寮犲姏璁句负淇濆畧鍊?        self.expansion_spin.setValue(0.25)
+        self.expansion_spin.setSingleStep(0.1)
+        algo_layout.addWidget(self.expansion_spin)
+
+        algo_group.setLayout(algo_layout)
+        content_layout.addWidget(algo_group)
+
+        content_layout.addStretch()
+
+        # 璁剧疆婊氬姩鍖哄煙鐨勫唴瀹?        scroll_area.setWidget(content_widget)
+
+        # 灏嗘粴鍔ㄥ尯鍩熸坊鍔犲埌涓诲竷灞€
+        main_layout.addWidget(scroll_area)
+
+        return container
+
+    # ========== 鏂囦欢鎿嶄綔妲藉嚱鏁?==========
+
+    def _on_save_screenshot(self):
+        """淇濆瓨鎴浘"""
+        try:
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "淇濆瓨鎴浘", "",
+                "PNG鏂囦欢 (*.png);;JPEG鏂囦欢 (*.jpg);;鎵€鏈夋枃浠?(*.*)"
+            )
+            if filepath:
+                # 瀹炵幇鎴浘淇濆瓨閫昏緫
+                # 杩欓噷鍙互浣跨敤Qt鐨勬埅鍥惧姛鑳?                screen = self.four_view.grab()
+                screen.save(filepath)
+                QMessageBox.information(self, "鎴愬姛", "鎴浘淇濆瓨鎴愬姛")
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"淇濆瓨鎴浘鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _on_brush_size_changed(self, value):
+        """鐢荤瑪澶у皬鏀瑰彉"""
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_brush_size(value)
+            self.four_view.coronal_view.set_brush_size(value)
+            self.four_view.sagittal_view.set_brush_size(value)
+
+    def _on_undo(self):
+        """鎾ら攢鎿嶄綔"""
+        if self.undo_history:
+            # 淇濆瓨褰撳墠鐘舵€佸埌閲嶅仛鏍?            if self.current_label_data is not None:
+                self.redo_history.append(np.copy(self.current_label_data))
+                # 闄愬埗閲嶅仛鏍堝ぇ灏?                if len(self.redo_history) > self.max_history_size:
+                    self.redo_history.pop(0)
+
+            # 浠庢挙閿€鏍堟仮澶?            self.current_label_data = self.undo_history.pop()
+            self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
+
+    def _on_redo(self):
+        """閲嶅仛鎿嶄綔"""
+        if self.redo_history:
+            # 淇濆瓨褰撳墠鐘舵€佸埌鎾ら攢鏍?            if self.current_label_data is not None:
+                self.undo_history.append(np.copy(self.current_label_data))
+                # 闄愬埗鎾ら攢鏍堝ぇ灏?                if len(self.undo_history) > self.max_history_size:
+                    self.undo_history.pop(0)
+
+            # 浠庨噸鍋氭爤鎭㈠
+            self.current_label_data = self.redo_history.pop()
+            self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
+
+    def _get_current_spacing(self):
+        """鑾峰彇褰撳墠浣撴暟鎹?spacing銆?""
+        if self.current_metadata and 'spacing' in self.current_metadata:
+            return self.current_metadata['spacing']
+        return None
+
+    def _ensure_dual_label_windows(self):
+        """纭繚鍖荤敓/AI涓や釜鐙珛鏍囩绐楀彛瀛樺湪銆?""
+        # 鍙岀獥鍙ｅ悗绔窡闅忎富鐣岄潰3D鍚庣锛屼繚璇佹樉绀烘晥鏋滀竴鑷淬€?        force_matplotlib_3d = False
+        try:
+            main_is_pyvista = bool(getattr(self.four_view.view_3d, "use_pyvista", False))
+            force_matplotlib_3d = not main_is_pyvista
+        except Exception:
+            force_matplotlib_3d = False
+
+        want_pyvista = not force_matplotlib_3d
+
+        def _window_backend_matches(window_obj) -> bool:
+            if window_obj is None:
+                return False
+            try:
+                win_is_pyvista = bool(getattr(window_obj.four_view.view_3d, "use_pyvista", False))
+                return win_is_pyvista == want_pyvista
+            except Exception:
+                return True
+
+        # 鏃х獥鍙ｅ悗绔笉鍖归厤鏃堕噸寤猴紝闃叉缁х画浣跨敤鈥滄墎骞斥€濆悗绔€?        if self.doctor_label_window is not None and not _window_backend_matches(self.doctor_label_window):
+            try:
+                self.doctor_label_window.close()
+            except Exception:
+                pass
+            self.doctor_label_window = None
+
+        if self.ai_label_window is not None and not _window_backend_matches(self.ai_label_window):
+            try:
+                self.ai_label_window.close()
+            except Exception:
+                pass
+            self.ai_label_window = None
+
+        if self.doctor_label_window is None:
+            self.doctor_label_window = LabelViewerWindow(
+                "鍖荤敓鏍囩绐楀彛",
+                "鍖荤敓鏍囩",
+                force_matplotlib_3d=force_matplotlib_3d,
+                parent=None,
+            )
+            self.doctor_label_window.destroyed.connect(
+                lambda _obj=None: setattr(self, 'doctor_label_window', None)
+            )
+
+        if self.ai_label_window is None:
+            self.ai_label_window = LabelViewerWindow(
+                "AI鏍囩绐楀彛",
+                "AI鏍囩",
+                force_matplotlib_3d=force_matplotlib_3d,
+                parent=None,
+            )
+            self.ai_label_window.destroyed.connect(
+                lambda _obj=None: setattr(self, 'ai_label_window', None)
+            )
+
+    def _ensure_vessel_tree_window(self):
+        """纭繚鐙珛3D琛€绠℃爲绐楀彛瀛樺湪銆?""
+        # 鐙珛绐楀彛涓庝富鐣岄潰3D绐楀彛淇濇寔鍚屾鍚庣涓庢樉绀烘晥鏋溿€?        force_matplotlib_3d = False
+        try:
+            main_is_pyvista = bool(getattr(self.four_view.view_3d, "use_pyvista", False))
+            force_matplotlib_3d = not main_is_pyvista
+        except Exception:
+            force_matplotlib_3d = False
+
+        # 濡傛灉宸插瓨鍦ㄤ絾鍚庣涓嶄竴鑷达紝閲嶅缓绐楀彛浠ヤ繚鎸佸拰涓荤晫闈竴鑷淬€?        if self.vessel_tree_window is not None:
+            try:
+                win_is_pyvista = bool(getattr(self.vessel_tree_window.view_3d, "use_pyvista", False))
+                want_pyvista = not force_matplotlib_3d
+                if win_is_pyvista == want_pyvista:
+                    return
+            except Exception:
+                return
+            try:
+                self.vessel_tree_window.close()
+            except Exception:
+                pass
+            self.vessel_tree_window = None
+
+        self.vessel_tree_window = Standalone3DWindow(
+            title="鐙珛3D琛€绠℃爲绐楀彛",
+            force_matplotlib_3d=force_matplotlib_3d,
+            parent=None,
+        )
+        self.vessel_tree_window.destroyed.connect(
+            lambda _obj=None: setattr(self, 'vessel_tree_window', None)
+        )
+
+    def _sync_vessel_tree_window(self, refresh_3d: bool = True, reset_camera: bool = False):
+        """鍚屾涓荤獥鍙ｅ綋鍓嶆暟鎹埌鐙珛3D琛€绠℃爲绐楀彛銆?""
+        if self.vessel_tree_window is None or self.current_image_data is None:
+            return
+
+        spacing = self._get_current_spacing()
+        structure_map = None
+        if getattr(self, 'last_vessel_analysis', None):
+            structure_map = self.last_vessel_analysis.get("structure_map")
+
+        crosshair = None
+        try:
+            crosshair = getattr(self.four_view, "crosshair_3d", None)
+        except Exception:
+            crosshair = None
+
+        self.vessel_tree_window.set_data(
+            image_data=self.current_image_data,
+            label_data=self.current_label_data,
+            spacing=spacing,
+            structure_map=structure_map,
+            crosshair=crosshair,
+            refresh_3d=refresh_3d,
+            reset_camera=reset_camera,
+        )
+
+    def _sync_dual_windows_base_image(self, reset_labels: bool = False, refresh_3d: bool = True):
+        """鎶婁富绐楀彛褰撳墠褰卞儚鍚屾鍒颁袱涓嫭绔嬬獥鍙ｃ€?""
+        if self.current_image_data is None:
+            return
+
+        spacing = self._get_current_spacing()
+        windows = [self.doctor_label_window, self.ai_label_window]
+        for window in windows:
+            if window is None:
+                continue
+            window.set_base_image(
+                self.current_image_data,
+                spacing,
+                metadata=self.current_metadata,
+                refresh_3d=refresh_3d,
+            )
+            if reset_labels:
+                empty_label = np.zeros(self.current_image_data.shape, dtype=np.uint8)
+                window.set_label_data(empty_label, source_text="宸叉竻绌?, refresh_3d=refresh_3d)
+
+    def _set_doctor_compare_label(self, label_data, source_text: str = ""):
+        """鏇存柊鍖荤敓鏍囩绐楀彛鍐呭锛屽苟缂撳瓨鏈€杩戜竴娆″尰鐢熸爣绛俱€?""
+        if label_data is None:
+            return
+        self.last_doctor_label_data = np.asarray(label_data).astype(np.uint8).copy()
+        if self.doctor_label_window is not None:
+            self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
+            self.doctor_label_window.set_label_data(
+                self.last_doctor_label_data,
+                source_text=source_text,
+                refresh_3d=self.doctor_label_window.isVisible(),
+            )
+
+    def _set_ai_compare_label(self, label_data, source_text: str = ""):
+        """鏇存柊AI鏍囩绐楀彛鍐呭锛屽苟缂撳瓨鏈€杩戜竴娆I鏍囩銆?""
+        if label_data is None:
+            return
+        self.last_ai_label_data = np.asarray(label_data).astype(np.uint8).copy()
+        if self.ai_label_window is not None:
+            self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
+            self.ai_label_window.set_label_data(
+                self.last_ai_label_data,
+                source_text=source_text,
+                refresh_3d=self.ai_label_window.isVisible(),
+            )
+
+    def _on_open_dual_label_windows(self):
+        """鎵撳紑鍖荤敓鏍囩绐楀彛 + AI鏍囩绐楀彛銆?""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚锛屽啀鎵撳紑鍙岀獥鍙ｅ姣斻€?)
+            return
+
+        self._ensure_dual_label_windows()
+        # 鍏堝悓姝ユ暟鎹紝涓嶅湪闅愯棌鐘舵€佷笅瑙﹀彂3D娓叉煋銆?        self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
+
+        if self.last_doctor_label_data is not None:
+            self.doctor_label_window.set_label_data(
+                self.last_doctor_label_data,
+                source_text="doctor_label_recent",
+                refresh_3d=False,
+            )
+
+        if self.last_ai_label_data is not None:
+            self.ai_label_window.set_label_data(
+                self.last_ai_label_data,
+                source_text="ai_label_recent",
+                refresh_3d=False,
+            )
+        elif self.current_label_data is not None and np.any(self.current_label_data):
+            self.ai_label_window.set_label_data(
+                self.current_label_data,
+                source_text="main_window_label",
+                refresh_3d=False,
+            )
+
+        self.doctor_label_window.show()
+        self.ai_label_window.show()
+
+        base_x = max(self.x() + 20, 0)
+        base_y = max(self.y() + 40, 0)
+        self.doctor_label_window.move(base_x, base_y)
+        self.ai_label_window.move(base_x + self.doctor_label_window.width() + 20, base_y)
+
+        self.doctor_label_window.raise_()
+        self.ai_label_window.raise_()
+        self.doctor_label_window.activateWindow()
+        self.doctor_label_window._refresh_3d_safely()
+        self.ai_label_window._refresh_3d_safely()
+
+    def _on_load_label(self):
+        """鍔犺浇鏍囩"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇涓€寮犲奖鍍?)
+            return
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "鍔犺浇鏍囩", "",
+            "NIfTI鏂囦欢 (*.nii *.nii.gz);;NRRD鏂囦欢 (*.nrrd);;鎵€鏈夋枃浠?(*.*)"
+        )
+
+        if filepath:
+            try:
+                label_data = self.image_io.load_label_map(
+                    filepath,
+                    reference_metadata=self.current_metadata,
+                    reference_shape=self.current_image_data.shape if self.current_image_data is not None else None,
+                    force_align=True,
+                )
+                if label_data is not None:
+                    # 妫€鏌ュ昂瀵告槸鍚﹀尮閰?                    if label_data.shape == self.current_image_data.shape:
+                        # 淇濆瓨褰撳墠鐘舵€佸埌鎾ら攢鏍?                        if self.current_label_data is not None:
+                            self.undo_history.append(np.copy(self.current_label_data))
+                            # 闄愬埗鎾ら攢鏍堝ぇ灏?                            if len(self.undo_history) > self.max_history_size:
+                                self.undo_history.pop(0)
+
+                        # 鏇存柊鏍囩鏁版嵁
+                        self.current_label_data = label_data
+                        self.four_view.set_label_data(label_data)
+                        self._refresh_structure_from_current_labels()
+                        # 娓呯┖閲嶅仛鏍?                        self.redo_history.clear()
+                        self._set_doctor_compare_label(label_data, source_text=os.path.basename(filepath))
+                        QMessageBox.information(self, "鎴愬姛", "鏍囩鍔犺浇鎴愬姛")
+                    else:
+                        QMessageBox.warning(self, "閿欒",
+                                            f"鏍囩灏哄涓庡奖鍍忎笉鍖归厤\n褰卞儚灏哄: {self.current_image_data.shape}\n鏍囩灏哄: {label_data.shape}")
+                else:
+                    QMessageBox.warning(self, "閿欒", "鏍囩鍔犺浇澶辫触")
+            except Exception as e:
+                QMessageBox.critical(self, "閿欒", f"鍔犺浇鏍囩鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _load_doctor_label_for_accuracy_if_needed(self):
+        """褰撻噺鍖栧垎鏋愮己灏戝尰鐢熸爣绛炬椂锛屼氦浜掑紡鍔犺浇涓€涓尰鐢熸爣绛剧敤浜庣簿搴﹁瘎浼般€?""
+        if self.current_image_data is None:
+            return None, "褰撳墠鏃犲奖鍍忔暟鎹紝鏃犳硶鍔犺浇鍖荤敓鏍囩銆?
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "閫夋嫨鍖荤敓鏍囩锛堢敤浜嶢I绮惧害璇勪及锛?,
+            "",
+            "NIfTI鏂囦欢 (*.nii *.nii.gz);;NRRD鏂囦欢 (*.nrrd);;鎵€鏈夋枃浠?(*.*)",
+        )
+        if not filepath:
+            return None, "鏈€夋嫨鍖荤敓鏍囩鏂囦欢锛屽凡璺宠繃AI绮惧害璇勪及銆?
+
+        try:
+            label_data = self.image_io.load_label_map(
+                filepath,
+                reference_metadata=self.current_metadata,
+                reference_shape=self.current_image_data.shape if self.current_image_data is not None else None,
+                force_align=True,
+            )
+        except Exception as e:
+            return None, f"鍖荤敓鏍囩鍔犺浇澶辫触: {e}"
+
+        if label_data is None:
+            return None, "鍖荤敓鏍囩鍔犺浇澶辫触銆?
+
+        if label_data.shape != self.current_image_data.shape:
+            return (
+                None,
+                f"鍖荤敓鏍囩灏哄涓嶅尮閰嶏紙褰卞儚: {self.current_image_data.shape}, 鏍囩: {label_data.shape}锛夈€?,
+            )
+
+        self._set_doctor_compare_label(label_data, source_text=os.path.basename(filepath))
+        return np.asarray(label_data).astype(np.uint8), None
+
+    def _on_save_label(self):
+        """淇濆瓨鏍囩"""
+        if self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "娌℃湁鏍囩鏁版嵁鍙繚瀛?)
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "淇濆瓨鏍囩", "",
+            "NIfTI鏂囦欢 (*.nii.gz);;NRRD鏂囦欢 (*.nrrd);;鎵€鏈夋枃浠?(*.*)"
+        )
+
+        if filepath:
+            try:
+                self.image_io.save_label_map(self.current_label_data, filepath, self.current_metadata)
+                QMessageBox.information(self, "鎴愬姛", "鏍囩淇濆瓨鎴愬姛")
+            except Exception as e:
+                QMessageBox.critical(self, "閿欒", f"淇濆瓨鏍囩鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _on_clear_label(self):
+        """娓呴櫎鏍囩"""
+        if self.current_label_data is not None:
+            # 淇濆瓨褰撳墠鐘舵€佸埌鎾ら攢鏍?            self.undo_history.append(np.copy(self.current_label_data))
+            # 闄愬埗鎾ら攢鏍堝ぇ灏?            if len(self.undo_history) > self.max_history_size:
+                self.undo_history.pop(0)
+
+            # 娓呯┖鏍囩
+            self.current_label_data = np.zeros(self.current_image_data.shape, dtype=np.uint8)
+            self.four_view.set_label_data(self.current_label_data)
+            self._reset_analysis_state()
+            # 娓呯┖閲嶅仛鏍?            self.redo_history.clear()
+            QMessageBox.information(self, "鎴愬姛", "鏍囩宸叉竻闄?)
+
+    def _on_label_opacity_changed(self, value):
+        """鏍囩閫忔槑搴︽敼鍙?""
+        opacity = value / 100.0
+        self.label_opacity_value_label.setText(f"{value}%")
+
+        # 鏇存柊鎵€鏈夎鍥剧殑鏍囩閫忔槑搴?        if hasattr(self.four_view, 'axial_view'):
+            try:
+                self.four_view.axial_view.set_label_opacity(opacity)
+                self.four_view.coronal_view.set_label_opacity(opacity)
+                self.four_view.sagittal_view.set_label_opacity(opacity)
+            except Exception as e:
+                print(f"璁剧疆鏍囩閫忔槑搴︽椂鍙戠敓閿欒: {e}")
+
+    def _on_window_width_changed(self, value):
+        """绐楀鏀瑰彉"""
+        if hasattr(self.four_view, 'axial_view'):
+            try:
+                window_level = self.window_level_spin.value()
+                self.four_view.axial_view.set_window(value, window_level)
+                self.four_view.coronal_view.set_window(value, window_level)
+                self.four_view.sagittal_view.set_window(value, window_level)
+            except Exception as e:
+                print(f"璁剧疆绐楀鏃跺彂鐢熼敊璇? {e}")
+
+    def _on_window_level_changed(self, value):
+        """绐椾綅鏀瑰彉"""
+        if hasattr(self.four_view, 'axial_view'):
+            try:
+                window_width = self.window_width_spin.value()
+                self.four_view.axial_view.set_window(window_width, value)
+                self.four_view.coronal_view.set_window(window_width, value)
+                self.four_view.sagittal_view.set_window(window_width, value)
+            except Exception as e:
+                print(f"璁剧疆绐椾綅鏃跺彂鐢熼敊璇? {e}")
+
+    def _on_auto_window(self):
+        """鑷姩璁＄畻绐楀绐椾綅"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇涓€寮犲奖鍍?)
+            return
+
+        try:
+            # 璁＄畻鍥惧儚鐨勭粺璁′俊鎭?            img_data = self.current_image_data
+            min_val = np.min(img_data)
+            max_val = np.max(img_data)
+            mean_val = np.mean(img_data)
+            std_val = np.std(img_data)
+
+            # 鑷姩璁＄畻绐楀绐椾綅
+            window_width = std_val * 4  # 4鍊嶆爣鍑嗗樊
+            window_level = mean_val
+
+            # 鏇存柊鐣岄潰
+            self.window_width_spin.setValue(window_width)
+            self.window_level_spin.setValue(window_level)
+
+            # 搴旂敤鍒拌鍥?            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_window(window_width, window_level)
+                self.four_view.coronal_view.set_window(window_width, window_level)
+                self.four_view.sagittal_view.set_window(window_width, window_level)
+
+            QMessageBox.information(self, "鎴愬姛",
+                                    f"鑷姩绐楀绐椾綅宸茶缃甛n绐楀: {window_width:.1f}\n绐椾綅: {window_level:.1f}")
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鑷姩璁＄畻绐楀绐椾綅鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _on_default_window(self):
+        """榛樿绐楀绐椾綅"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇涓€寮犲奖鍍?)
+            return
+
+        try:
+            # 璁剧疆榛樿绐楀绐椾綅
+            window_width = 400.0  # 榛樿绐楀
+            window_level = 0.0  # 榛樿绐椾綅
+
+            # 鏇存柊鐣岄潰
+            self.window_width_spin.setValue(window_width)
+            self.window_level_spin.setValue(window_level)
+
+            # 搴旂敤鍒拌鍥?            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_window(window_width, window_level)
+                self.four_view.coronal_view.set_window(window_width, window_level)
+                self.four_view.sagittal_view.set_window(window_width, window_level)
+
+            QMessageBox.information(self, "鎴愬姛",
+                                    f"榛樿绐楀绐椾綅宸茶缃甛n绐楀: {window_width:.1f}\n绐椾綅: {window_level:.1f}")
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"璁剧疆榛樿绐楀绐椾綅鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _on_label_statistics(self):
+        """鏍囩缁熻"""
+        if self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇鎴栧垱寤烘爣绛?)
+            return
+
+        try:
+            # 璁＄畻鎵€鏈夋爣绛剧殑缁熻淇℃伅
+            unique_labels = np.unique(self.current_label_data)
+            unique_labels = unique_labels[unique_labels > 0]  # 鎺掗櫎鑳屾櫙(0)
+
+            if len(unique_labels) == 0:
+                QMessageBox.information(self, "鎻愮ず", "褰撳墠娌℃湁鏍囩鏁版嵁")
+                return
+
+            stats_text = "鏍囩缁熻淇℃伅:\n\n"
+
+            for label_id in unique_labels:
+                label_mask = (self.current_label_data == label_id)
+                voxel_count = np.sum(label_mask)
+
+                # 璁＄畻鐗╃悊浣撶Н
+                if self.current_metadata and 'spacing' in self.current_metadata:
+                    spacing = self.current_metadata['spacing']
+                    voxel_volume = spacing[0] * spacing[1] * spacing[2]  # mm鲁
+                    volume_mm3 = voxel_count * voxel_volume
+                    volume_cm3 = volume_mm3 / 1000.0  # cm鲁
+                    volume_text = f"{volume_cm3:.2f} cm鲁 ({volume_mm3:.2f} mm鲁)"
+                else:
+                    volume_text = f"{voxel_count} 浣撶礌"
+
+                # 璁＄畻琛ㄩ潰绉紙杩戜技锛?                from scipy import ndimage
+                # 浣跨敤褰㈡€佸姊害璁＄畻琛ㄩ潰绉?                edges = ndimage.binary_dilation(label_mask) ^ label_mask
+                surface_pixels = np.sum(edges)
+
+                if self.current_metadata and 'spacing' in self.current_metadata:
+                    spacing = self.current_metadata['spacing']
+                    pixel_area = spacing[0] * spacing[1]  # mm虏
+                    surface_area_mm2 = surface_pixels * pixel_area
+                    surface_area_cm2 = surface_area_mm2 / 100.0  # cm虏
+                    area_text = f"{surface_area_cm2:.2f} cm虏 ({surface_area_mm2:.2f} mm虏)"
+                else:
+                    area_text = f"{surface_pixels} 鍍忕礌"
+
+                stats_text += f"鏍囩 {label_id}:\n"
+                stats_text += f"  浣撶Н: {volume_text}\n"
+                stats_text += f"  琛ㄩ潰绉? {area_text}\n"
+                stats_text += f"  浣撶礌鏁? {voxel_count}\n\n"
+
+            QMessageBox.information(self, "鏍囩缁熻", stats_text)
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"璁＄畻鏍囩缁熻鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _on_label_selection_changed(self):
+        """鏍囩閫夋嫨鏀瑰彉"""
+        selected_items = self.label_list_widget.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            label_id = int(item.data(Qt.UserRole))
+            self.active_label_id = label_id
+            self.active_label_name_label.setText(f"娲诲姩鏍囩: Label {label_id}")
+            self.paint_over_label.setText(f"缁樺埗瑕嗙洊: Label {label_id}")
+            # 鏇存柊瑙嗗浘涓殑娲诲姩鏍囩
+            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_active_label_id(label_id)
+                self.four_view.coronal_view.set_active_label_id(label_id)
+                self.four_view.sagittal_view.set_active_label_id(label_id)
+
+    def _on_add_label(self):
+        """娣诲姞鏍囩"""
+        # 鐢熸垚鏂版爣绛綢D
+        new_label_id = len(self.label_list) + 1
+        # 娣诲姞鍒版爣绛惧垪琛?        self.label_list.append(new_label_id)
+        # 鏇存柊鏍囩鍒楄〃鎺т欢
+        item = QListWidgetItem(f"Label {new_label_id}")
+        item.setData(Qt.UserRole, new_label_id)
+        self.label_list_widget.addItem(item)
+        # 閫夋嫨鏂版爣绛?        self.label_list_widget.setCurrentItem(item)
+        # 鏇存柊娲诲姩鏍囩
+        self.active_label_id = new_label_id
+        self.active_label_name_label.setText(f"娲诲姩鏍囩: Label {new_label_id}")
+        self.paint_over_label.setText(f"缁樺埗瑕嗙洊: Label {new_label_id}")
+        # 鏇存柊瑙嗗浘涓殑娲诲姩鏍囩
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_active_label_id(new_label_id)
+            self.four_view.coronal_view.set_active_label_id(new_label_id)
+            self.four_view.sagittal_view.set_active_label_id(new_label_id)
+
+    def _on_delete_label(self):
+        """鍒犻櫎鏍囩"""
+        selected_items = self.label_list_widget.selectedItems()
+        if selected_items:
+            item = selected_items[0]
+            label_id = int(item.data(Qt.UserRole))
+            # 浠庢爣绛惧垪琛ㄤ腑绉婚櫎
+            if label_id in self.label_list:
+                self.label_list.remove(label_id)
+            # 浠庡垪琛ㄦ帶浠朵腑绉婚櫎
+            self.label_list_widget.takeItem(self.label_list_widget.row(item))
+            # 濡傛灉鍒犻櫎鐨勬槸褰撳墠娲诲姩鏍囩锛岄€夋嫨绗竴涓爣绛?            if self.active_label_id == label_id:
+                if self.label_list:
+                    new_label_id = self.label_list[0]
+                    self.active_label_id = new_label_id
+                    self.active_label_name_label.setText(f"娲诲姩鏍囩: Label {new_label_id}")
+                    self.paint_over_label.setText(f"缁樺埗瑕嗙洊: Label {new_label_id}")
+                    # 鏇存柊瑙嗗浘涓殑娲诲姩鏍囩
+                    if hasattr(self.four_view, 'axial_view'):
+                        self.four_view.axial_view.set_active_label_id(new_label_id)
+                        self.four_view.coronal_view.set_active_label_id(new_label_id)
+                        self.four_view.sagittal_view.set_active_label_id(new_label_id)
+                else:
+                    # 濡傛灉娌℃湁鏍囩浜嗭紝璁剧疆涓洪粯璁ゅ€?                    self.active_label_id = 1
+                    self.active_label_name_label.setText("娲诲姩鏍囩: Label 1")
+                    self.paint_over_label.setText("缁樺埗瑕嗙洊: Label 1")
+
+    def _on_label_color(self):
+        """鏍囩棰滆壊閫夋嫨"""
+        color = QColorDialog.getColor()
+        if color.isValid():
+            # 鏇存柊娲诲姩鏍囩棰滆壊
+            color_str = color.name()
+            self.active_label_color_widget.setStyleSheet(f"background-color: {color_str}; border: 1px solid black;")
+            # 鏇存柊瑙嗗浘涓殑鏍囩棰滆壊
+            if hasattr(self.four_view, 'axial_view'):
+                self.four_view.axial_view.set_label_color(self.active_label_id, color_str)
+                self.four_view.coronal_view.set_label_color(self.active_label_id, color_str)
+                self.four_view.sagittal_view.set_label_color(self.active_label_id, color_str)
+
+    def _on_update_3d_view_clicked(self, notify: bool = True):
+        """鏇存柊涓荤晫闈㈠唴宓?D瑙嗗浘銆?""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇涓€寮犲奖鍍?)
+            return False
+
+        if not (hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d')):
+            QMessageBox.warning(self, "鎻愮ず", "鏈娴嬪埌3D瑙嗗浘缁勪欢锛岃妫€鏌ュ彲瑙嗗寲妯″潡閰嶇疆銆?)
+            return False
+
+        try:
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else None
+            self.four_view.view_3d.set_image_data(self.current_image_data, spacing)
+            self.four_view.view_3d.set_label_data(self.current_label_data)
+            structure_map = None
+            if getattr(self, 'last_vessel_analysis', None):
+                structure_map = self.last_vessel_analysis.get("structure_map")
+            self.four_view.view_3d.set_structure_data(structure_map)
+            self.four_view.view_3d.refresh_view()
+
+            if self.vessel_tree_window is not None:
+                self._sync_vessel_tree_window(
+                    refresh_3d=self.vessel_tree_window.isVisible(),
+                    reset_camera=False,
+                )
+
+            self.statusBar().showMessage("3D瑙嗗浘宸叉洿鏂?, 3000)
+            if notify:
+                QMessageBox.information(self, "鎴愬姛", "3D瑙嗗浘宸叉洿鏂帮紙宸︿笅瑙掕绐楋級銆?)
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鏇存柊3D瑙嗗浘鏃跺彂鐢熼敊璇?\n{e}")
+            return False
+
+    def _on_toggle_seed_mode(self):
+        """鍒囨崲绉嶅瓙鐐规ā寮?""
+        self.seed_mode_enabled = self.btn_add_seed.isChecked()
+        if self.seed_mode_enabled:
+            # 绉嶅瓙鐐逛緷璧栫偣鍑诲悓姝ュ崄瀛楃嚎锛屽己鍒跺垏鍒版寚閽堟ā寮忛伩鍏嶇偣浜嗘棤鏁?            self._on_tool_selected('pointer')
+            self.btn_add_seed.setText("鉁?绉嶅瓙鐐规ā寮忓紑鍚?)
+            self.btn_add_seed.setStyleSheet("background-color: #d1fae5; color: #065f46;")
+            self.statusBar().showMessage("绉嶅瓙鐐规ā寮忓凡寮€鍚細宸插垏鎹㈠埌鎸囬拡宸ュ叿锛岃鍦ㄤ笁瑙嗗浘鐐瑰嚮娣诲姞绉嶅瓙鐐?, 5000)
+        else:
+            self.btn_add_seed.setText("鉃?娣诲姞绉嶅瓙鐐?)
+            self.btn_add_seed.setStyleSheet("")
+            self.statusBar().showMessage("绉嶅瓙鐐规ā寮忓凡鍏抽棴", 2000)
+
+    def _on_clear_seeds(self):
+        """娓呴櫎绉嶅瓙鐐?""
+        self.seed_points = []
+        self._update_seed_count()
+        self.statusBar().showMessage("宸叉竻闄ゅ叏閮ㄧ瀛愮偣", 3000)
+        QMessageBox.information(self, "鎻愮ず", "绉嶅瓙鐐瑰凡娓呴櫎")
+
+    def _on_segment_3d(self):
+        """3D鍒嗗壊"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚")
+            return
+
+        # 杩囨护骞舵牎楠岀瀛愮偣锛岄伩鍏嶈秺鐣屽鑷存棤缁撴灉
+        if self.seed_points is None:
+            self.seed_points = []
+        valid_seeds = []
+        sx, sy, sz = self.current_image_data.shape
+        for seed in self.seed_points:
+            try:
+                x, y, z = int(seed[0]), int(seed[1]), int(seed[2])
+            except Exception:
+                continue
+            if 0 <= x < sx and 0 <= y < sy and 0 <= z < sz:
+                valid_seeds.append((x, y, z))
+        # 鍘婚噸淇濇寔椤哄簭
+        valid_seeds = list(dict.fromkeys(valid_seeds))
+        self.seed_points = valid_seeds
+        self._update_seed_count()
+
+        if len(self.seed_points) == 0:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛娣诲姞鑷冲皯涓€涓瀛愮偣")
+            return
+
+        # 鑾峰彇鍙傛暟
+        algo_name = self.algo_combo.currentText().strip().lower()
+        method = 'region_competition' if 'region' in algo_name else 'edge_based'
+        params = {
+            'method': method,
+            'iterations': int(self.iterations_spin.value()),
+            'smoothness': float(self.smoothness_spin.value()),
+            'expansion_force': float(self.expansion_spin.value()),
+            # 闃插鎵╅粯璁わ細闄嶄綆杈圭紭鍚稿紩鏉冮噸锛岄伩鍏嶈繃搴﹀～鍏?            'edge_weight': 0.85,
+        }
+
+        # 杩涘害瀵硅瘽妗?        progress = QProgressDialog("姝ｅ湪鎵ц3D鍒嗗壊锛岃绋嶅€?..", None, 0, 0, self)
+        progress.setWindowTitle("3D鍒嗗壊")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        # 鍚庡彴绾跨▼鎵ц锛岄伩鍏嶇晫闈㈠崱姝?        worker = SegmentationWorker(
+            algorithm=self.segmentation,
+            image_data=self.current_image_data,
+            seed_points=list(self.seed_points),
+            params=params
+        )
+        self._segment_worker = worker
+
+        worker.finished.connect(lambda mask: self._on_segment_3d_finished(mask, progress))
+        worker.error.connect(lambda err: self._on_segment_3d_error(err, progress))
+        worker.start()
+
+    def _on_segment_3d_finished(self, mask, progress_dialog: QProgressDialog):
+        """3D鍒嗗壊瀹屾垚鍥炶皟"""
+        progress_dialog.close()
+        if mask is None or not np.any(mask):
+            QMessageBox.warning(self, "鎻愮ず", "3D鍒嗗壊鏈緱鍒版湁鏁堢粨鏋?)
+            self.statusBar().showMessage("3D鍒嗗壊瀹屾垚锛屼絾鏃犳湁鏁堝尯鍩?, 3000)
+            return
+
+        # 淇濆瓨鎾ら攢鍘嗗彶
+        if self.current_label_data is not None:
+            self.undo_history.append(np.copy(self.current_label_data))
+            if len(self.undo_history) > self.max_history_size:
+                self.undo_history.pop(0)
+            self.redo_history.clear()
+
+        label_id = int(self.active_label_id) if hasattr(self, 'active_label_id') else 1
+        updated = np.copy(self.current_label_data) if self.current_label_data is not None else np.zeros_like(mask, dtype=np.uint8)
+        updated[mask > 0] = label_id
+        self.current_label_data = updated
+        self.four_view.set_label_data(updated)
+        self._refresh_structure_from_current_labels()
+
+        self.statusBar().showMessage("3D鍒嗗壊瀹屾垚", 3000)
+        QMessageBox.information(
+            self,
+            "3D鍒嗗壊瀹屾垚",
+            f"宸插畬鎴?D鍒嗗壊骞跺啓鍏ュ綋鍓嶆爣绛?Label {label_id})銆俓n鍒嗗壊浣撶礌鏁? {int(np.sum(mask > 0))}"
+        )
+
+    def _on_segment_3d_error(self, error_msg: str, progress_dialog: QProgressDialog):
+        """3D鍒嗗壊澶辫触鍥炶皟"""
+        progress_dialog.close()
+        self.statusBar().showMessage("3D鍒嗗壊澶辫触", 3000)
+        QMessageBox.critical(self, "閿欒", f"3D鍒嗗壊澶辫触:\n{error_msg}")
+
+    def _on_ai_segmentation(self):
+        """AI鑷姩鍒嗗壊"""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇涓€寮犲奖鍍?)
+            return
+
+        # 鏄剧ずAI鍒嗗壊鍙傛暟閫夋嫨瀵硅瘽妗?        if not self._show_ai_segmentation_dialog():
+            return
+
+        # 杩涘害鎻愮ず锛堥伩鍏嶇敤鎴疯浠ヤ负鏈墽琛岋級
+        progress = QProgressDialog("姝ｅ湪鍒濆鍖朅I鑷姩鍒嗗壊...", None, 0, 0, self)
+        progress.setWindowTitle("AI鑷姩鍒嗗壊")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+        self.statusBar().showMessage("姝ｅ湪鍒濆鍖朅I鍒嗗壊...")
+
+        # 纭繚AI鎺ュ彛宸插垵濮嬪寲
+        if not self.ai_interface:
+            progress.setLabelText("姝ｅ湪鍔犺浇AI妯″瀷锛岃绋嶅€?..")
+            QApplication.processEvents()
+            self.statusBar().showMessage("姝ｅ湪鍔犺浇AI妯″瀷锛岃绋嶅€?..")
+            try:
+                # 寤惰繜瀵煎叆锛屽噺灏戝惎鍔ㄦ椂鐨勬ā鍧楀姞杞?                from ai_interface import AISegmentationInterface
+                self.ai_interface = AISegmentationInterface()
+            except Exception as e:
+                self.statusBar().showMessage("AI鍒嗗壊鍒濆鍖栧け璐?)
+                QMessageBox.critical(self, "閿欒", f"AI鍒嗗壊鍒濆鍖栧け璐?\n{e}")
+                progress.close()
+                return
+
+        # 閲嶆柊鍔犺浇妯″瀷锛堜娇鐢ㄦ柊閫夋嫨鐨勫弬鏁帮級
+        try:
+            progress.setLabelText("姝ｅ湪鍔犺浇AI妯″瀷鍙傛暟...")
+            QApplication.processEvents()
+            self.statusBar().showMessage("姝ｅ湪鍔犺浇AI妯″瀷锛岃绋嶅€?..")
+            model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
+
+            # 搴旂敤鐢ㄦ埛閫夋嫨鍙傛暟
+            self.ai_interface.set_model_variant(self.ai_model_variant)
+            self.ai_interface.set_decomposition_method(self.ai_decomposition_method)
+
+            # 鍔犺浇妯″瀷
+            if not self.ai_interface.load_model(model_path):
+                self.statusBar().showMessage("AI鍒嗗壊澶辫触")
+                QMessageBox.critical(self, "閿欒", "AI妯″瀷鍔犺浇澶辫触")
+                progress.close()
+                return
+        except Exception as e:
+            self.statusBar().showMessage("AI鍒嗗壊鍒濆鍖栧け璐?)
+            QMessageBox.critical(self, "閿欒", f"AI妯″瀷鍔犺浇澶辫触:\n{e}")
+            progress.close()
+            return
+
+        # 鎵ц鍒嗗壊
+        progress.setLabelText("姝ｅ湪杩涜鍥惧儚棰勫鐞嗐€佹帹鐞嗗拰鍚庡鐞?..")
+        QApplication.processEvents()
+        self.statusBar().showMessage("姝ｅ湪鎵цAI鍒嗗壊锛岃绋嶅€?..")
+        try:
+            # 浠呭湪鎴愬姛鍚庢浛鎹㈡爣绛撅紝閬垮厤澶辫触鏃朵涪澶卞凡鏈夌粨鏋?            previous_label = np.copy(self.current_label_data) if self.current_label_data is not None else None
+
+            # 鎵ц鍒嗗壊
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+            mask = self.ai_interface.segment(
+                self.current_image_data,
+                spacing=spacing,
+                metadata=self.current_metadata,
+            )
+
+            if mask is not None:
+                # 鏇存柊褰撳墠鏍囩鏁版嵁
+                self.current_label_data = mask
+                # 鏇存柊瑙嗗浘
+                self.four_view.set_label_data(mask)
+                self.statusBar().showMessage("AI鍒嗗壊瀹屾垚")
+
+                # 淇濆瓨琛€绠＄粨鏋勮瘑鍒粨鏋滐紙涓诲共/缁嗘敮/鍒嗗弶/5绾э級
+                self._refresh_structure_from_current_labels()
+                self._set_ai_compare_label(mask, source_text="AI鑷姩鍒嗗壊缁撴灉")
+
+                # 鍙嶉绠€瑕佺粺璁?                pv_count = int(np.sum(mask == 1))
+                hv_count = int(np.sum(mask == 2))
+                pv_l5 = self.last_vessel_analysis.get("pv", {}).get("level_counts", {}).get("level_5_plus", 0)
+                hv_l5 = self.last_vessel_analysis.get("hv", {}).get("level_counts", {}).get("level_5_plus", 0)
+                QMessageBox.information(
+                    self,
+                    "AI鍒嗗壊缁撴灉",
+                    f"鍒嗗壊瀹屾垚銆俓n\n"
+                    f"闂ㄩ潤鑴?PV)浣撶礌: {pv_count}\n"
+                    f"鑲濋潤鑴?HV)浣撶礌: {hv_count}\n"
+                    f"PV 5绾у強浠ヤ笂寰皬鍒嗘敮浣撶礌: {pv_l5}\n"
+                    f"HV 5绾у強浠ヤ笂寰皬鍒嗘敮浣撶礌: {hv_l5}"
+                )
+            else:
+                if previous_label is not None:
+                    self.current_label_data = previous_label
+                    self.four_view.set_label_data(previous_label)
+                self.statusBar().showMessage("AI鍒嗗壊澶辫触")
+                QMessageBox.critical(self, "閿欒", "AI鍒嗗壊澶辫触")
+
+        except Exception as e:
+            self.statusBar().showMessage("AI鍒嗗壊杩囩▼涓彂鐢熼敊璇?)
+            QMessageBox.critical(self, "閿欒", f"AI鍒嗗壊杩囩▼涓彂鐢熼敊璇?\n{e}")
+        finally:
+            progress.close()
+
+    def _show_ai_segmentation_dialog(self):
+        """鏄剧ずAI鍒嗗壊鍙傛暟閫夋嫨瀵硅瘽妗?""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QHBoxLayout, QGroupBox, \
+            QFormLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AI鍒嗗壊鍙傛暟璁剧疆")
+        dialog.setMinimumSize(400, 250)
+
+        layout = QVBoxLayout()
+
+        # 妯″瀷鍙傛暟缁?        model_group = QGroupBox("妯″瀷鍙傛暟")
+        model_layout = QFormLayout()
+
+        # 妯″瀷鍙樹綋閫夋嫨
+        model_variant_combo = QComboBox()
+        model_variant_combo.addItems(['mobileuvit_l (澶у瀷妯″瀷 - 楂樼簿搴?', 'mobileuvit (灏忓瀷妯″瀷 - 楂橀€熷害)'])
+        model_variant_combo.setCurrentIndex(0)
+        model_layout.addRow("妯″瀷鍙樹綋:", model_variant_combo)
+
+        # 琛€绠″垎瑙ｆ柟娉曢€夋嫨
+        decomposition_combo = QComboBox()
+        decomposition_combo.addItems([
+            'percentile_50 (鎺ㄨ崘)',
+            'adaptive',
+            'fixed_1.0',
+            'fixed_1.5',
+            'fixed_2.0',
+            'fixed_2.5',
+            'median',
+            'percentile_25',
+            'percentile_75'
+        ])
+        decomposition_combo.setCurrentIndex(0)
+        model_layout.addRow("琛€绠″垎瑙ｆ柟娉?", decomposition_combo)
+
+        model_group.setLayout(model_layout)
+        layout.addWidget(model_group)
+
+        # 娣诲姞璇存槑
+        info_label = QLabel(
+            "璇存槑:\n"
+            "鈥?mobileuvit_l: 澶у瀷妯″瀷锛岀簿搴︽洿楂榎n"
+            "鈥?mobileuvit: 灏忓瀷妯″瀷锛岄€熷害鏇村揩\n"
+            "鈥?percentile_50: 浣跨敤50%鐧惧垎浣嶆暟浣滀负闃堝€糪n"
+            "鈥?adaptive: 鑷€傚簲闃堝€硷紝閫傚悎涓嶅悓鍥惧儚"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # 鎸夐挳甯冨眬
+        button_layout = QHBoxLayout()
+        btn_ok = QPushButton("寮€濮嬪垎鍓?)
+        btn_ok.clicked.connect(dialog.accept)
+        btn_cancel = QPushButton("鍙栨秷")
+        btn_cancel.clicked.connect(dialog.reject)
+        button_layout.addWidget(btn_ok)
+        button_layout.addWidget(btn_cancel)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+
+        # 鏄剧ず瀵硅瘽妗?        if dialog.exec_() == QDialog.Accepted:
+            # 鑾峰彇鐢ㄦ埛閫夋嫨鐨勫弬鏁?            model_variant = model_variant_combo.currentText().split()[0]
+            decomposition_method = decomposition_combo.currentText().split()[0]
+
+            # 鍏堜繚瀛樺弬鏁帮紱鑻I鎺ュ彛宸插垵濮嬪寲鍒欏悓姝ユ洿鏂?            self.ai_model_variant = model_variant
+            self.ai_decomposition_method = decomposition_method
+            if self.ai_interface is not None:
+                self.ai_interface.set_model_variant(model_variant)
+                self.ai_interface.set_decomposition_method(decomposition_method)
+
+            return True
+        else:
+            return False
+
+    def _load_series_entry(self, entry):
+        """浠庢暟鎹簱鏉＄洰鍔犺浇搴忓垪"""
+        try:
+            # 鏍规嵁entry涓殑file_list鍔犺浇搴忓垪
+            if entry.file_list:
+                data, metadata = self.image_io.load_dicom_series(entry.file_list)
+            else:
+                # 鍥為€€鍒扮洿鎺ュ姞杞界洰褰?                data, metadata = self.image_io.load_image(entry.series_dir)
+
+            if data is not None:
+                self.current_image_data = data
+                self.current_metadata = metadata
+                self.current_entry = entry
+                self.current_image_path = entry.series_dir
+
+                # 浼犻€抯pacing淇℃伅锛堝鏋滃彲鐢級
+                spacing = metadata.get('spacing') if metadata else None
+                self.four_view.set_image_data(data, spacing)
+
+                # 鍒濆鍖栨爣绛炬暟鎹?                self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+                self.four_view.set_label_data(self.current_label_data)
+                self.last_doctor_label_data = None
+                self.last_ai_label_data = None
+                self._sync_dual_windows_base_image(reset_labels=True)
+                self._reset_analysis_state()
+
+                # 璁剧疆娲诲姩鏍囩ID
+                self.four_view.axial_view.set_active_label_id(self.active_label_id)
+                self.four_view.coronal_view.set_active_label_id(self.active_label_id)
+                self.four_view.sagittal_view.set_active_label_id(self.active_label_id)
+
+                # 娓呯┖鍘嗗彶璁板綍
+                self.undo_history.clear()
+                self.redo_history.clear()
+
+                # 娓呯┖绉嶅瓙鐐?                self.seed_points = []
+                self._update_seed_count()
+
+                # 鍏抽棴绉嶅瓙鐐规ā寮?                self.seed_mode_enabled = False
+                self.btn_add_seed.setChecked(False)
+                self.btn_add_seed.setText("鉃?娣诲姞绉嶅瓙鐐?)
+                self.btn_add_seed.setStyleSheet("")
+
+                # 鏇存柊鐥呬汉淇℃伅鏄剧ず
+                self._update_patient_info_from_entry(entry, metadata)
+
+                QMessageBox.information(self, "鎴愬姛", f"搴忓垪鍔犺浇鎴愬姛\n灏哄: {data.shape}")
+            else:
+                QMessageBox.warning(self, "閿欒", "搴忓垪鍔犺浇澶辫触")
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鍔犺浇搴忓垪鏃跺彂鐢熼敊璇?\n{e}")
+
+    def _update_patient_info_from_entry(self, entry, metadata):
+        """浠庢暟鎹簱鏉＄洰鏇存柊鐥呬汉淇℃伅"""
+        # 浣跨敤entry涓殑淇℃伅
+        self.pi_id_label.setText(f"ID: {entry.patient_id}")
+        self.pi_name_label.setText(f"濮撳悕: {entry.patient_name or '--'}")
+        self.pi_sex_label.setText("鎬у埆: --")
+        self.pi_birth_label.setText("鍑虹敓鏃ユ湡: --")
+        self.pi_study_date_label.setText(f"妫€鏌ユ棩鏈? {entry.study_date or '--'}")
+        self.pi_modality_label.setText(f"妯℃€? {entry.modality or '--'}")
+        self.pi_series_label.setText(f"搴忓垪: {entry.series_id}")
+
+        # 淇濆瓨褰撳墠鐥呬汉淇℃伅
+        self.current_patient_info = {
+            "PatientID": entry.patient_id,
+            "PatientName": entry.patient_name or "Unknown",
+            "StudyDate": entry.study_date,
+            "Modality": entry.modality,
+            "SeriesID": entry.series_id
+        }
+
+    def _update_patient_info_from_metadata(self, metadata):
+        """浠庡厓鏁版嵁鏇存柊鐥呬汉淇℃伅"""
+        dicom_info = metadata.get('dicom_info', {})
+
+        self.pi_id_label.setText(f"ID: {dicom_info.get('PatientID', '--')}")
+        self.pi_name_label.setText(f"濮撳悕: {dicom_info.get('PatientName', '--')}")
+        self.pi_sex_label.setText(f"鎬у埆: {dicom_info.get('PatientSex', '--')}")
+        self.pi_birth_label.setText(f"鍑虹敓鏃ユ湡: {dicom_info.get('PatientBirthDate', '--')}")
+        self.pi_study_date_label.setText(f"妫€鏌ユ棩鏈? {dicom_info.get('StudyDate', '--')}")
+        self.pi_modality_label.setText(f"妯℃€? {dicom_info.get('Modality', '--')}")
+        self.pi_series_label.setText(f"搴忓垪: {dicom_info.get('SeriesNumber', '--')}")
+
+        # 淇濆瓨褰撳墠鐥呬汉淇℃伅
+        self.current_patient_info = {
+            "PatientID": dicom_info.get('PatientID', "Unknown"),
+            "PatientName": dicom_info.get('PatientName', "Unknown"),
+            "PatientSex": dicom_info.get('PatientSex'),
+            "PatientBirthDate": dicom_info.get('PatientBirthDate'),
+            "StudyDate": dicom_info.get('StudyDate'),
+            "Modality": dicom_info.get('Modality'),
+            "SeriesID": dicom_info.get('SeriesNumber')
+        }
+
+    def _on_open_db_dialog(self):
+        """鎵撳紑鏁版嵁搴撳璇濇"""
+        # 閫夋嫨鏁版嵁搴撴牴鐩綍
+        db_root = QFileDialog.getExistingDirectory(
+            self, "閫夋嫨鏁版嵁搴撴牴鐩綍",
+            self.last_db_root if self.last_db_root else ""
+        )
+
+        if not db_root:
+            return
+
+        # 淇濆瓨閫夋嫨鐨勮矾寰?        self.last_db_root = db_root
+
+        # 鍒涘缓骞舵樉绀烘暟鎹簱瀵硅瘽妗?        dialog = DatabaseDialog(db_root, self)
+        if dialog.exec_() == QDialog.Accepted:
+            # 鐢ㄦ埛閫夋嫨浜嗕竴涓簭鍒?            entry = dialog.get_selected_entry()
+            if entry:
+                self._load_series_entry(entry)
+
+    def _on_tool_selected(self, tool):
+        """閫夋嫨宸ュ叿"""
+        # 閲嶇疆鎵€鏈夊伐鍏锋寜閽?        self.btn_pointer.setChecked(False)
+        self.btn_zoom.setChecked(False)
+        self.btn_pan.setChecked(False)
+        self.btn_brush.setChecked(False)
+        self.btn_eraser.setChecked(False)
+
+        # 璁剧疆褰撳墠宸ュ叿
+        self.current_tool_mode = tool
+
+        # 婵€娲婚€変腑鐨勫伐鍏锋寜閽?        if tool == 'pointer':
+            self.btn_pointer.setChecked(True)
+        elif tool == 'zoom':
+            self.btn_zoom.setChecked(True)
+        elif tool == 'pan':
+            self.btn_pan.setChecked(True)
+        elif tool == 'brush':
+            self.btn_brush.setChecked(True)
+        elif tool == 'eraser':
+            self.btn_eraser.setChecked(True)
+
+        # 鏇存柊瑙嗗浘涓殑宸ュ叿妯″紡
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_tool_mode(tool)
+            self.four_view.coronal_view.set_tool_mode(tool)
+            self.four_view.sagittal_view.set_tool_mode(tool)
+
+    def _on_quantitative_analysis(self):
+        """杩愯閲忓寲鍒嗘瀽"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚骞惰繘琛屽垎鍓?)
+            return
+
+        try:
+            # 寤惰繜瀵煎叆锛屽噺灏戝惎鍔ㄦ椂鐨勬ā鍧楀姞杞?            from quantitative_analysis import QuantitativeAnalyzer
+
+            # 鏄剧ず鐘舵€佹爮鎻愮ず
+            self.statusBar().showMessage("姝ｅ湪杩涜閲忓寲鍒嗘瀽...")
+
+            # 鍒濆鍖栭噺鍖栧垎鏋愬櫒
+            analyzer = QuantitativeAnalyzer()
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+
+            # 鎻愬彇闂ㄩ潤鑴夊拰鑲濋潤鑴夋帺鐮?            portal_vein_mask = (self.current_label_data == 1)
+            hepatic_vein_mask = (self.current_label_data == 2)
+            vessel_union = portal_vein_mask | hepatic_vein_mask
+            if not np.any(vessel_union):
+                QMessageBox.warning(self, "鎻愮ず", "褰撳墠鏍囩涓湭妫€娴嬪埌PV/HV锛堟爣绛?/2锛夛紝璇峰厛瀹屾垚琛€绠″垎鍓层€?)
+                self.statusBar().showMessage("閲忓寲鍒嗘瀽涓锛氱己灏戣绠℃爣绛?, 3000)
+                return
+
+            # 鑲濊剰鎺╃爜浼樺厛浣跨敤鏍囩3锛岃嫢涓嶅瓨鍦ㄥ垯鐢ㄨ绠¤啫鑳€杩戜技
+            liver_mask = (self.current_label_data == 3)
+            if not np.any(liver_mask):
+                try:
+                    from scipy import ndimage
+                    if np.any(vessel_union):
+                        liver_mask = ndimage.binary_dilation(vessel_union, iterations=20)
+                    else:
+                        liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+                except Exception:
+                    liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+
+            # 鑲跨槫鎺╃爜锛氶粯璁ゆ爣绛?锛堝彲鎵╁睍锛?            tumor_mask = (self.current_label_data == 4)
+
+            # 璁＄畻鑲濊剰鍒嗘
+            segmentation = analyzer.couinaud_segmentation(
+                liver_mask,
+                portal_vein_mask,
+                hepatic_vein_mask
+            )
+
+            # 璁＄畻浣撶Н
+            volumes = analyzer.calculate_volumes(segmentation, voxel_size=spacing)
+
+            # 鎻愬彇琛€绠￠噺鍖栨寚鏍?            vascular_metrics = analyzer.extract_vascular_metrics(
+                portal_vein_mask,
+                hepatic_vein_mask,
+                voxel_size=spacing,
+                liver_mask=liver_mask,
+                vessel_analysis=getattr(self, 'last_vessel_analysis', None)
+            )
+
+            # 鑲跨槫-琛€绠¤窛绂昏瘎浼?            tumor_vessel_assessment = analyzer.assess_tumor_vessel_distance(
+                tumor_mask,
+                portal_vein_mask,
+                hepatic_vein_mask,
+                voxel_size=spacing
+            )
+
+            # 鎵嬫湳椋庨櫓璇勪及
+            risk_assessment = analyzer.assess_surgical_risk(
+                volumes,
+                vascular_metrics,
+                tumor_vessel_assessment
+            )
+
+            # AI鍒嗗壊绮惧害璇勪及锛氬姣擜I鏍囩涓庡尰鐢熸爣绛撅紙鏍囩1=PV, 鏍囩2=HV锛?            segmentation_accuracy = None
+            segmentation_accuracy_note = None
+            doctor_label_for_eval = getattr(self, 'last_doctor_label_data', None)
+            ai_label_for_eval = getattr(self, 'last_ai_label_data', None)
+            if (
+                ai_label_for_eval is None
+                and self.current_label_data is not None
+                and doctor_label_for_eval is not None
+            ):
+                current_label_candidate = np.asarray(self.current_label_data).astype(np.uint8)
+                doctor_label_candidate = np.asarray(doctor_label_for_eval).astype(np.uint8)
+                if (
+                    current_label_candidate.shape == doctor_label_candidate.shape
+                    and not np.array_equal(current_label_candidate, doctor_label_candidate)
+                ):
+                    ai_label_for_eval = current_label_candidate
+
+            if doctor_label_for_eval is None:
+                doctor_label_for_eval, load_note = self._load_doctor_label_for_accuracy_if_needed()
+                if doctor_label_for_eval is None:
+                    segmentation_accuracy_note = load_note or "鏈娴嬪埌鍖荤敓鏍囩锛岃烦杩嘇I绮惧害璇勪及銆?
+
+            if segmentation_accuracy_note is None and ai_label_for_eval is None:
+                segmentation_accuracy_note = "鏈娴嬪埌AI鏍囩锛岃烦杩嘇I绮惧害璇勪及銆?
+            elif (
+                segmentation_accuracy_note is None
+                and np.asarray(doctor_label_for_eval).shape != np.asarray(ai_label_for_eval).shape
+            ):
+                segmentation_accuracy_note = (
+                    f"鏍囩灏哄涓嶄竴鑷达紝doctor={np.asarray(doctor_label_for_eval).shape}, "
+                    f"ai={np.asarray(ai_label_for_eval).shape}锛岃烦杩嘇I绮惧害璇勪及銆?
+                )
+            elif segmentation_accuracy_note is None:
+                try:
+                    segmentation_accuracy = analyzer.evaluate_segmentation_accuracy(
+                        ai_label=np.asarray(ai_label_for_eval).astype(np.uint8),
+                        doctor_label=np.asarray(doctor_label_for_eval).astype(np.uint8),
+                        spacing=spacing,
+                        labels=None,  # 榛樿鐢卞垎鏋愬櫒閫夋嫨锛氫紭鍏堟爣绛?/2锛屼笉瀛樺湪鍒欏洖閫€鍏ㄩ儴闈為浂
+                    )
+                except Exception as metric_exc:
+                    segmentation_accuracy_note = f"AI绮惧害璇勪及澶辫触: {metric_exc}"
+
+            # 鏄剧ず鍒嗘瀽缁撴灉锛堟寜闇€姹備粎杈撳嚭涓ょ被鏍囩鍥涗釜鎸囨爣 + 鏈€缁堝尮閰嶇▼搴︼級
+            result_text = "AI鍒嗗壊鍖归厤绋嬪害鍒嗘瀽缁撴灉锛堝尰鐢熸爣绛?vs AI鏍囩锛?\n\n"
+            if segmentation_accuracy is not None and segmentation_accuracy.get("status") == "ok":
+                overall = segmentation_accuracy.get("overall", {})
+                result_text += f"Dice: {float(overall.get('dice', 0.0)):.4f}\n"
+                result_text += f"Jaccard: {float(overall.get('jaccard', 0.0)):.4f}\n"
+                overall_asd = float(overall.get("asd_mm", float("inf")))
+                overall_hd95 = float(overall.get("hd95_mm", float("inf")))
+                result_text += f"ASD: {overall_asd:.4f} mm\n" if np.isfinite(overall_asd) else "ASD: inf\n"
+                result_text += f"HD95: {overall_hd95:.4f} mm\n" if np.isfinite(overall_hd95) else "HD95: inf\n"
+                final_match = float(
+                    segmentation_accuracy.get(
+                        "final_matching_degree_percent",
+                        overall.get("matching_degree_percent", overall.get("accuracy_percent", 0.0)),
+                    )
+                )
+                result_text += f"鍖归厤绋嬪害(绮惧害): {final_match:.2f}%\n"
+                align_diag = segmentation_accuracy.get("alignment_diagnosis", {})
+                if isinstance(align_diag, dict) and align_diag.get("performed"):
+                    if bool(align_diag.get("likely_misaligned", False)):
+                        best_tf = align_diag.get("best_transform", {}) if isinstance(align_diag, dict) else {}
+                        perm = best_tf.get("perm", [0, 1, 2])
+                        flip_axes = best_tf.get("flip_axes", [])
+                        swap_12 = bool(best_tf.get("swap_labels_1_2", False))
+                        base_d = float(align_diag.get("baseline_union_dice", 0.0))
+                        best_d = float(align_diag.get("best_union_dice", base_d))
+                        result_text += "\n鏂瑰悜璇婃柇: 妫€娴嬪埌鈥滆酱鍚戞垨缈昏浆涓嶄竴鑷粹€濈殑寮轰俊鍙枫€?\n"
+                        result_text += f"Dice(鍘熷)->Dice(鏈€浼? {base_d:.4f} -> {best_d:.4f}\n"
+                        result_text += (
+                            f"寤鸿鍙樻崲: perm={perm}, flips={flip_axes if flip_axes else 'none'}, "
+                            f"label_swap_1_2={swap_12}\n"
+                        )
+                    else:
+                        result_text += "\n鏂瑰悜璇婃柇: 鏈彂鐜板己璇佹嵁鏀寔鈥滆酱鍚戞垨缈昏浆閿欦綅鈥濄€?\n"
+            else:
+                result_text += f"{segmentation_accuracy_note or '鍖归厤绋嬪害璇勪及涓嶅彲鐢ㄣ€?}\n"
+
+            self._show_long_text_dialog("閲忓寲鍒嗘瀽缁撴灉", result_text)
+
+            # 淇濆瓨鍒嗘瀽缁撴灉
+            self.quantitative_results = {
+                'volumes': volumes,
+                'vascular_metrics': vascular_metrics,
+                'tumor_vessel_assessment': tumor_vessel_assessment,
+                'risk_assessment': risk_assessment,
+                'couinaud_segmentation': segmentation.astype(np.uint8)
+            }
+            if segmentation_accuracy is not None:
+                self.quantitative_results['segmentation_accuracy'] = segmentation_accuracy
+            elif segmentation_accuracy_note:
+                self.quantitative_results['segmentation_accuracy'] = {
+                    'status': 'unavailable',
+                    'message': segmentation_accuracy_note,
+                }
+            if getattr(self, 'last_cut_stats', None):
+                self.quantitative_results['cut_stats'] = self.last_cut_stats
+
+            # 鏄剧ず鐘舵€佹爮鎻愮ず
+            self.statusBar().showMessage("閲忓寲鍒嗘瀽瀹屾垚")
+
+        except Exception as e:
+            self.statusBar().showMessage("閲忓寲鍒嗘瀽澶辫触")
+            QMessageBox.critical(self, "閿欒", f"閲忓寲鍒嗘瀽澶辫触:\n{e}")
+
+    def _on_liver_segment_partition(self):
+        """鐙珛鎵ц鑲濇鑷姩鍒掑垎锛堜笉渚濊禆瀹屾暣閲忓寲鍒嗘瀽娴佺▼锛夈€?""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚骞惰繘琛屽垎鍓?)
+            return
+
+        try:
+            from liver_segmentation import run_liver_segmentation
+
+            self.statusBar().showMessage("姝ｅ湪鎵ц鐙珛鑲濇鍒掑垎...")
+
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+
+            portal_vein_mask = (self.current_label_data == 1)
+            if not np.any(portal_vein_mask):
+                QMessageBox.warning(
+                    self,
+                    "鎻愮ず",
+                    "褰撳墠鏍囩涓湭妫€娴嬪埌闂ㄩ潤鑴?PV, 鏍囩1)锛屾棤娉曟墽琛岃倽娈靛垝鍒嗐€?
+                )
+                self.statusBar().showMessage("鐙珛鑲濇鍒掑垎涓锛氱己灏慞V鏍囩", 3000)
+                return
+
+            liver_mask = (self.current_label_data == 3)
+            liver_source = "鏍囩3锛堣倽鑴忥級"
+            if not np.any(liver_mask):
+                try:
+                    from scipy import ndimage
+                    vessel_union = (self.current_label_data == 1) | (self.current_label_data == 2)
+                    if np.any(vessel_union):
+                        liver_mask = ndimage.binary_dilation(vessel_union, iterations=20)
+                        liver_source = "琛€绠℃爣绛捐啫鑳€杩戜技"
+                    else:
+                        liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+                        liver_source = "鍏ㄤ綋绱犺繎浼硷紙鏈娴嬪埌鍙敤鑲濊剰鏍囩锛?
+                except Exception:
+                    liver_mask = np.ones_like(self.current_label_data, dtype=bool)
+                    liver_source = "鍏ㄤ綋绱犺繎浼硷紙鍥為€€锛?
+
+            seg_result = run_liver_segmentation(
+                pv_mask=portal_vein_mask,
+                liver_mask=liver_mask,
+                spacing=spacing,
+            )
+            segment_map = np.asarray(
+                seg_result.get("segment_map", np.zeros_like(self.current_label_data))
+            ).astype(np.uint8)
+            segment_volumes = seg_result.get("segment_volumes", {})
+            segment_centroids = seg_result.get("segment_centroids", {})
+            total_liver = float(sum(float(v) for v in segment_volumes.values()))
+
+            if not hasattr(self, 'quantitative_results') or not isinstance(self.quantitative_results, dict):
+                self.quantitative_results = {}
+
+            # 涓烘姤鍛婂鐢ㄤ繚鐣欏吋瀹瑰瓧娈?            volumes = dict(segment_volumes)
+            volumes["total_liver"] = total_liver
+            self.quantitative_results['volumes'] = volumes
+            self.quantitative_results['couinaud_segmentation'] = segment_map
+            self.quantitative_results['segment_volumes'] = dict(segment_volumes)
+            self.quantitative_results['segment_centroids'] = dict(segment_centroids)
+            if getattr(self, 'last_cut_stats', None):
+                self.quantitative_results['cut_stats'] = self.last_cut_stats
+
+            result_text = "鐙珛鑲濇鍒掑垎缁撴灉:\n\n"
+            result_text += f"鑲濊剰鎺╃爜鏉ユ簮: {liver_source}\n"
+            result_text += f"鎬昏倽浣撶Н: {total_liver:.2f} ml\n\n"
+            result_text += "鍚勮倽娈典綋绉?\n"
+            for i in range(1, 9):
+                key = f"segment_{i}"
+                result_text += f"娈?{i}: {float(segment_volumes.get(key, 0.0)):.2f} ml\n"
+
+            result_text += "\n鍚勮倽娈典腑蹇冪偣 (x, y, z):\n"
+            for i in range(1, 9):
+                key = f"segment_{i}"
+                center = segment_centroids.get(key, (float("nan"), float("nan"), float("nan")))
+                try:
+                    cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+                    if np.isfinite(cx) and np.isfinite(cy) and np.isfinite(cz):
+                        result_text += f"娈?{i}: ({cx:.1f}, {cy:.1f}, {cz:.1f})\n"
+                    else:
+                        result_text += f"娈?{i}: (N/A)\n"
+                except Exception:
+                    result_text += f"娈?{i}: (N/A)\n"
+
+            self._show_long_text_dialog("鐙珛鑲濇鍒掑垎", result_text)
+            self.statusBar().showMessage("鐙珛鑲濇鍒掑垎瀹屾垚", 4000)
+
+        except Exception as e:
+            self.statusBar().showMessage("鐙珛鑲濇鍒掑垎澶辫触", 3000)
+            QMessageBox.critical(self, "閿欒", f"鐙珛鑲濇鍒掑垎澶辫触:\n{e}")
+
+    def _on_3d_visualization(self):
+        """鎵撳紑鐙珛3D琛€绠℃爲绐楀彛銆?""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚骞惰繘琛屽垎鍓?)
+            return
+
+        try:
+            self._ensure_vessel_tree_window()
+            self._sync_vessel_tree_window(refresh_3d=False, reset_camera=True)
+
+            was_visible = self.vessel_tree_window.isVisible()
+            self.vessel_tree_window.show()
+            if not was_visible:
+                target_x = max(self.x() + self.width() + 20, 0)
+                target_y = max(self.y() + 40, 0)
+
+                # 闃叉寮圭獥璺戝埌灞忓箷澶栵紝瀵艰嚧鈥滅湅璧锋潵娌℃墦寮€鈥濄€?                screen = QApplication.primaryScreen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    win_w = max(int(self.vessel_tree_window.width()), int(self.vessel_tree_window.minimumWidth()))
+                    win_h = max(int(self.vessel_tree_window.height()), int(self.vessel_tree_window.minimumHeight()))
+                    max_x = geo.x() + max(geo.width() - win_w, 0)
+                    max_y = geo.y() + max(geo.height() - win_h, 0)
+                    target_x = min(max(target_x, geo.x()), max_x)
+                    target_y = min(max(target_y, geo.y()), max_y)
+                self.vessel_tree_window.move(target_x, target_y)
+
+            self.vessel_tree_window.raise_()
+            self.vessel_tree_window.activateWindow()
+            self.vessel_tree_window._refresh_3d_safely()
+            self.statusBar().showMessage("鐙珛3D琛€绠℃爲绐楀彛宸叉墦寮€", 4000)
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"3D鍙鍖栧け璐?\n{e}")
+
+    def _on_add_cutting_plane(self):
+        """娣诲姞鍒囧壊骞抽潰"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚骞惰繘琛屽垎鍓?)
+            return
+
+        if not self._on_update_3d_view_clicked(notify=False):
+            return
+
+        viewer = self.four_view.view_3d
+
+        # 1) 娉曞悜杞撮€夋嫨
+        axis_options = [
+            "X杞存硶鍚戯紙鍒嘫Z骞抽潰锛?,
+            "Y杞存硶鍚戯紙鍒嘪Z骞抽潰锛?,
+            "Z杞存硶鍚戯紙鍒嘪Y骞抽潰锛?,
+        ]
+        axis_choice, ok = QInputDialog.getItem(
+            self,
+            "鍒囧壊骞抽潰鏂瑰悜",
+            "璇烽€夋嫨鍒囧壊骞抽潰鐨勬硶鍚戞柟鍚戯細",
+            axis_options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        normal_map = {
+            axis_options[0]: (1.0, 0.0, 0.0),
+            axis_options[1]: (0.0, 1.0, 0.0),
+            axis_options[2]: (0.0, 0.0, 1.0),
+        }
+        normal = normal_map[axis_choice]
+
+        # 2) 鍋忕Щ閲?        offset_mm, ok = QInputDialog.getDouble(
+            self,
+            "鍒囧壊骞抽潰鍋忕Щ",
+            "娌挎硶鍚戝亸绉婚噺锛坢m锛屾璐熼兘鍙級锛?,
+            0.0,
+            -500.0,
+            500.0,
+            1,
+        )
+        if not ok:
+            return
+
+        # 3) 鏄惁搴旂敤妯″瀷瑁佸垏锛堣瑙変笂鍒囨帀涓€渚э級
+        apply_choice = QMessageBox.question(
+            self,
+            "鍒囧壊鏄剧ず妯″紡",
+            "鏄惁灏嗗垏鍓插钩闈㈢洿鎺ュ簲鐢ㄥ埌3D妯″瀷锛堜粎淇濈暀涓€渚ф樉绀猴級锛?,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        apply_to_mesh = (apply_choice == QMessageBox.Yes)
+
+        center = viewer.get_volume_center()
+        origin = [
+            center[0] + normal[0] * offset_mm,
+            center[1] + normal[1] * offset_mm,
+            center[2] + normal[2] * offset_mm,
+        ]
+
+        try:
+            stats = viewer.set_clip_plane(normal=normal, origin=origin, apply_to_mesh=apply_to_mesh)
+            self.last_cut_stats = stats
+            self.statusBar().showMessage("鍒囧壊骞抽潰宸叉洿鏂?, 3000)
+
+            source_desc = "鏃犲彲鐢ㄤ綋绉粺璁?
+            if stats.get("source") == "label_3_liver":
+                source_desc = "浣撶Н缁熻渚濇嵁锛氭爣绛?锛堣倽鑴忥級"
+            elif stats.get("source") == "nonzero_label_proxy":
+                source_desc = "浣撶Н缁熻渚濇嵁锛氶潪闆舵爣绛捐繎浼硷紙鏈娴嬪埌鑲濊剰鏍囩锛?
+
+            if stats.get("available"):
+                cut_vessels = stats.get("cut_vessels", {}) if isinstance(stats.get("cut_vessels", {}), dict) else {}
+                total_cut = int(cut_vessels.get("total_count", 0))
+                risk = str(stats.get("risk_assessment", "N/A"))
+                summary = (
+                    f"鍒囧壊妯℃嫙瀹屾垚\n\n"
+                    f"{source_desc}\n"
+                    f"鍓╀綑浣撶Н: {stats.get('remaining_ml', 0.0):.2f} ml\n"
+                    f"鍒囬櫎浣撶Н: {stats.get('resected_ml', 0.0):.2f} ml\n"
+                    f"鍓╀綑姣斾緥: {stats.get('remaining_ratio', 0.0) * 100:.1f}%\n\n"
+                    f"鍒囬櫎鐜? {stats.get('resection_rate', stats.get('resected_ratio', 0.0) * 100):.1f}%\n"
+                    f"椋庨櫓绛夌骇: {risk}\n"
+                    f"鍒囨柇鍒嗘敮鏁? {total_cut}\n\n"
+                    f"鍒囨柇璇嗗埆:\n"
+                    f"- 闂ㄩ潤鑴?PV): {'鏄? if stats.get('severed_pv') else '鍚?}\n"
+                    f"- 鑲濋潤鑴?HV): {'鏄? if stats.get('severed_hv') else '鍚?}"
+                )
+            else:
+                summary = (
+                    "鍒囧壊骞抽潰宸叉坊鍔狅紝浣嗗綋鍓嶆爣绛句笉瓒充互杩涜浣撶Н缁熻銆俓n"
+                    "璇峰厛瀹屾垚鍒嗗壊鎴栧姞杞芥湁鏁堟爣绛俱€?
+                )
+
+            QMessageBox.information(self, "鍒囧壊骞抽潰缁撴灉", summary)
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"娣诲姞鍒囧壊骞抽潰澶辫触:\n{e}")
+
+    def _on_generate_report(self):
+        """鐢熸垚PDF鎶ュ憡"""
+        if self.current_image_data is None or self.current_label_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇褰卞儚骞惰繘琛屽垎鍓?)
+            return
+
+        try:
+            from report_generator import ReportGenerator
+
+            # 鏄剧ず鐘舵€佹爮鎻愮ず
+            self.statusBar().showMessage("姝ｅ湪鐢熸垚PDF鎶ュ憡...")
+
+            # 鍑嗗鎶ュ憡鏁版嵁
+            report_data = {
+                'patient_id': self.current_patient_info.get('PatientID', 'N/A'),
+                'exam_date': self.current_patient_info.get('StudyDate', ''),
+                'segmentation_method': 'AI鑷姩鍒嗗壊' if self.ai_interface is not None else '鎵嬪姩/浼犵粺鍒嗗壊',
+                'model_variant': getattr(self, 'ai_model_variant', 'mobileuvit_l'),
+                'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            # 娣诲姞閲忓寲鍒嗘瀽缁撴灉
+            if hasattr(self, 'quantitative_results'):
+                report_data.update(self.quantitative_results)
+            else:
+                # 鑻ョ敤鎴锋湭鎵嬪姩鐐光€滆繍琛岄噺鍖栧垎鏋愨€濓紝鑷姩琛ヤ竴娆?                self._on_quantitative_analysis()
+                if hasattr(self, 'quantitative_results'):
+                    report_data.update(self.quantitative_results)
+
+            # 娣诲姞AI琛€绠＄粨鏋勮瘑鍒憳瑕?            if hasattr(self, 'last_vessel_analysis') and self.last_vessel_analysis:
+                report_data['vessel_analysis'] = self.last_vessel_analysis
+
+            # 娣诲姞鍒囧壊妯℃嫙缁熻
+            if hasattr(self, 'last_cut_stats') and self.last_cut_stats:
+                report_data['cut_stats'] = self.last_cut_stats
+
+            # 娣诲姞鍥惧儚
+            if self.current_image_data is not None:
+                # 鎻愬彇涓棿鍒囩墖浣滀负绀轰緥
+                middle_slice = self.current_image_data.shape[2] // 2
+                slice_data = self.current_image_data[:, :, middle_slice]
+                label_slice = self.current_label_data[:, :, middle_slice]
+                report_data['images'] = {
+                    '鑲濊剰褰卞儚 (涓棿鍒囩墖)': slice_data,
+                    '琛€绠″垎鍓叉爣绛?(涓棿鍒囩墖)': label_slice
+                }
+
+            # 鐢熸垚鎶ュ憡
+            generator = ReportGenerator()
+
+            # 閫夋嫨淇濆瓨璺緞
+            from PyQt5.QtWidgets import QFileDialog
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "淇濆瓨PDF鎶ュ憡", "", "PDF鏂囦欢 (*.pdf)"
+            )
+
+            if filepath:
+                success = generator.generate_report(report_data, filepath)
+                if success:
+                    QMessageBox.information(self, "鎴愬姛", f"PDF鎶ュ憡鐢熸垚鎴愬姛:\n{filepath}")
+                    self.statusBar().showMessage("PDF鎶ュ憡鐢熸垚鎴愬姛")
+                else:
+                    QMessageBox.critical(self, "閿欒", "PDF鎶ュ憡鐢熸垚澶辫触")
+                    self.statusBar().showMessage("PDF鎶ュ憡鐢熸垚澶辫触")
+
+        except Exception as e:
+            self.statusBar().showMessage("PDF鎶ュ憡鐢熸垚澶辫触")
+            QMessageBox.critical(self, "閿欒", f"PDF鎶ュ憡鐢熸垚澶辫触:\n{e}")
+
+    def _on_crosshair_changed(self, view_type, x, y):
+        """鍗佸瓧鍑嗙嚎鍙樺寲"""
+        if self.current_image_data is None:
+            return
+
+        try:
+            # 璁＄畻z鍧愭爣
+            z = 0
+            if view_type == 'axial':
+                if hasattr(self.four_view, 'axial_view'):
+                    z = self.four_view.axial_view.current_slice
+            elif view_type == 'coronal':
+                if hasattr(self.four_view, 'coronal_view'):
+                    z = self.four_view.coronal_view.current_slice
+            elif view_type == 'sagittal':
+                if hasattr(self.four_view, 'sagittal_view'):
+                    z = self.four_view.sagittal_view.current_slice
+
+            # 绉嶅瓙鐐规ā寮忥細鐐瑰嚮涓夎鍥炬椂璁板綍褰撳墠3D鍗佸瓧鍑嗗績瀵瑰簲浣撶礌
+            if self.seed_mode_enabled and hasattr(self, 'four_view'):
+                try:
+                    vx = int(self.four_view.sagittal_view.current_slice)
+                    vy = int(self.four_view.coronal_view.current_slice)
+                    vz = int(self.four_view.axial_view.current_slice)
+                    seed = (vx, vy, vz)
+                    # 鍘婚噸+杞诲井闃叉姈
+                    if seed != self._last_seed and seed not in self.seed_points:
+                        self.seed_points.append(seed)
+                        self._last_seed = seed
+                        self._update_seed_count()
+                        self.statusBar().showMessage(f"宸叉坊鍔犵瀛愮偣: {seed}", 1500)
+                except Exception:
+                    pass
+
+            # 鏇存柊鍏夋爣浣嶇疆鏍囩
+            self.cursor_pos_label.setText(f"浣嶇疆 (x,y,z): ({int(x)}, {int(y)}, {int(z)})")
+
+            # 鏇存柊鍏夋爣涓嬬殑寮哄害鍊?            if (0 <= x < self.current_image_data.shape[0] and
+                    0 <= y < self.current_image_data.shape[1] and
+                    0 <= z < self.current_image_data.shape[2]):
+                intensity = self.current_image_data[int(x), int(y), int(z)]
+                self.cursor_intensity_value_label.setText(f"  寮哄害: {intensity:.1f}")
+                self.cursor_layer_label.setText(f"  鍥惧眰: 褰卞儚")
+
+                # 鏇存柊鍏夋爣涓嬬殑鏍囩鍊?                if self.current_label_data is not None:
+                    label_value = self.current_label_data[int(x), int(y), int(z)]
+                    self.cursor_label_value_label.setText(f"  鏍囩: {label_value}")
+                else:
+                    self.cursor_label_value_label.setText("  鏍囩: --")
+        except Exception as e:
+            print(f"鏇存柊鍗佸瓧鍑嗙嚎鏃跺彂鐢熼敊璇? {e}")
+
+    def _on_slice_changed(self, view, slice_idx):
+        """鍒囩墖鍙樺寲"""
+        if self.current_image_data is None:
+            return
+
+        try:
+            # 娉ㄦ剰锛欶ourViewWidget 鍐呴儴宸茬粡瀹屾垚涓夎鍥捐仈鍔ㄣ€?            # 杩欓噷涓嶈鍐嶆鏀瑰姩鍏朵粬瑙嗗浘鍒囩墖锛屽惁鍒欎細閫犳垚婊氳疆鎹㈠眰鏃惰妭鐐规紓绉汇€?            if hasattr(self, 'four_view') and hasattr(self.four_view, '_current_voxel'):
+                vx, vy, vz = self.four_view._current_voxel()  # x,y,z voxel
+                self.cursor_pos_label.setText(f"浣嶇疆 (x,y,z): ({int(vx)}, {int(vy)}, {int(vz)})")
+
+                if (
+                    0 <= int(vy) < self.current_image_data.shape[0]
+                    and 0 <= int(vx) < self.current_image_data.shape[1]
+                    and 0 <= int(vz) < self.current_image_data.shape[2]
+                ):
+                    intensity = self.current_image_data[int(vy), int(vx), int(vz)]
+                    self.cursor_intensity_value_label.setText(f"  寮哄害: {float(intensity):.1f}")
+                    self.cursor_layer_label.setText("  鍥惧眰: 褰卞儚")
+                    if self.current_label_data is not None:
+                        label_value = self.current_label_data[int(vy), int(vx), int(vz)]
+                        self.cursor_label_value_label.setText(f"  鏍囩: {int(label_value)}")
+                    else:
+                        self.cursor_label_value_label.setText("  鏍囩: --")
+        except Exception as e:
+            print(f"鏇存柊鍒囩墖鏃跺彂鐢熼敊璇? {e}")
+
+    def _update_seed_count(self):
+        """鏇存柊绉嶅瓙鐐规暟閲?""
+        count = len(self.seed_points) if self.seed_points is not None else 0
+        self.seed_count_label.setText(f"绉嶅瓙鐐规暟閲? {count}")
+        if hasattr(self, 'four_view'):
+            try:
+                self.four_view.set_seed_points(self.seed_points)
+            except Exception as e:
+                print(f"鍚屾绉嶅瓙鐐归珮浜け璐? {e}")
+
+    def _show_long_text_dialog(self, title: str, text: str):
+        """鐢ㄤ簬鏄剧ず闀挎枃鏈粨鏋滐紝鏀寔婊氬姩鏌ョ湅锛岄伩鍏嶄俊鎭鎴柇銆?""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(900, 700)
+
+        layout = QVBoxLayout(dialog)
+
+        text_view = QTextEdit(dialog)
+        text_view.setReadOnly(True)
+        text_view.setLineWrapMode(QTextEdit.NoWrap)
+        text_view.setPlainText(text)
+        layout.addWidget(text_view)
+
+        btn_close = QPushButton("鍏抽棴", dialog)
+        btn_close.clicked.connect(dialog.accept)
+        layout.addWidget(btn_close, alignment=Qt.AlignRight)
+
+        dialog.exec_()
+
+    def _reset_analysis_state(self):
+        """鍦ㄦ柊鐥呬緥/娓呯┖鏍囩鏃堕噸缃瓵I缁撴瀯鍒嗘瀽鍜屽垏鍓茬姸鎬併€?""
+        self.last_vessel_analysis = {}
+        self.last_cut_stats = {}
+        if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
+            try:
+                self.four_view.view_3d.set_structure_data(None)
+                self.four_view.view_3d.remove_clip_planes()
+            except Exception:
+                pass
+
+    def _refresh_structure_from_current_labels(self):
+        """鍩轰簬褰撳墠鏍囩鏇存柊琛€绠＄粨鏋勮瘑鍒紙鏃犻渶閲嶆柊璺戞ā鍨嬶級銆?""
+        if self.current_label_data is None:
+            self._reset_analysis_state()
+            return
+        if not np.any((self.current_label_data == 1) | (self.current_label_data == 2)):
+            self._reset_analysis_state()
+            return
+        try:
+            if self.ai_interface is None:
+                from ai_interface import AISegmentationInterface
+                self.ai_interface = AISegmentationInterface()
+            spacing = self.current_metadata['spacing'] if (
+                self.current_metadata and 'spacing' in self.current_metadata
+            ) else (1.0, 1.0, 1.0)
+            self.last_vessel_analysis = self.ai_interface.analyze_vessel_structure(
+                self.current_label_data, spacing=spacing
+            )
+            if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
+                self.four_view.view_3d.set_structure_data(
+                    self.last_vessel_analysis.get("structure_map")
+                )
+        except Exception as e:
+            print(f"鍩轰簬鏍囩鏇存柊缁撴瀯璇嗗埆澶辫触: {e}")
+
+    def _preload_ai_model(self):
+        """鍚庡彴棰勫姞杞紸I妯″瀷"""
+
+        class ModelPreloadWorker(QThread):
+            finished = pyqtSignal(bool)
+
+            def __init__(self, parent):
+                super().__init__(parent)
+                self.parent = parent
+
+            def run(self):
+                try:
+                    # 寤惰繜瀵煎叆锛屽噺灏戝惎鍔ㄦ椂鐨勬ā鍧楀姞杞?                    from ai_interface import AISegmentationInterface
+
+                    # 鍒濆鍖朅I鎺ュ彛
+                    ai_interface = AISegmentationInterface()
+
+                    # 妯″瀷璺緞
+                    model_path = os.path.join(os.path.dirname(__file__), 'model', 'best_model.pth')
+
+                    # 灏濊瘯鍔犺浇妯″瀷
+                    if os.path.exists(model_path):
+                        ai_interface.load_model(model_path)
+
+                    # 淇濆瓨鍒扮埗瀵硅薄
+                    self.parent.ai_interface = ai_interface
+                    self.finished.emit(True)
+                except Exception as e:
+                    print(f"妯″瀷棰勫姞杞藉け璐? {e}")
+                    self.finished.emit(False)
+
+        # 鍒涘缓骞跺惎鍔ㄩ鍔犺浇绾跨▼
+        self.preload_worker = ModelPreloadWorker(self)
+        self.preload_worker.finished.connect(self._on_model_preloaded)
+        self.preload_worker.start()
+
+    def _on_model_preloaded(self, success):
+        """妯″瀷棰勫姞杞藉畬鎴愬洖璋?""
+        if success:
+            print("AI妯″瀷棰勫姞杞芥垚鍔?)
+        else:
+            print("AI妯″瀷棰勫姞杞藉け璐?)
+
+    def _build_entry_from_metadata(self, metadata, path):
+        """浠庡厓鏁版嵁鏋勫缓entry"""
+        return None
+
+    def _apply_patient_info(self, info):
+        """搴旂敤鐥呬汉淇℃伅"""
+        pass
+
+    def get_current_patient_code(self):
+        """鑾峰彇褰撳墠鐥呬汉浠ｇ爜"""
+        return ""
+
+    def refresh_patient_tables(self, p_code):
+        """鍒锋柊鐥呬汉琛ㄦ牸"""
+        pass
+
+    def _on_load_image(self):
+        """鍔犺浇褰卞儚"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "鍔犺浇褰卞儚", "",
+            "NIfTI鏂囦欢 (*.nii *.nii.gz);;DICOM鏂囦欢 (*.dcm);;NRRD鏂囦欢 (*.nrrd);;鎵€鏈夋枃浠?(*.*)"
+        )
+
+        if filepath:
+            try:
+                data, metadata = self.image_io.load_image(filepath)
+                if data is not None:
+                    self.current_image_data = data
+                    self.current_metadata = metadata
+                    self.current_image_path = filepath  # 淇濆瓨鏂囦欢璺緞
+                    # 灏濊瘯浠巑etadata鏋勫缓entry锛堢敤浜庡悗缁嚜鍔ㄥ畾浣嶏級
+                    self.current_entry = self._build_entry_from_metadata(metadata, filepath)
+
+                    # 浼犻€抯pacing淇℃伅锛堝鏋滃彲鐢級
+                    spacing = metadata.get('spacing') if metadata else None
+                    self.four_view.set_image_data(data, spacing)
+
+                    # 鍒濆鍖栨爣绛炬暟鎹?                    self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+                    self.four_view.set_label_data(self.current_label_data)
+                    self.last_doctor_label_data = None
+                    self.last_ai_label_data = None
+                    self._sync_dual_windows_base_image(reset_labels=True)
+                    self._reset_analysis_state()
+                    # 璁剧疆娲诲姩鏍囩ID
+                    self.four_view.axial_view.set_active_label_id(self.active_label_id)
+                    self.four_view.coronal_view.set_active_label_id(self.active_label_id)
+                    self.four_view.sagittal_view.set_active_label_id(self.active_label_id)
+                    # 娓呯┖鍘嗗彶璁板綍
+                    self.undo_history.clear()
+                    self.redo_history.clear()
+                    # 娓呯┖绉嶅瓙鐐?                    self.seed_points = []
+                    self._update_seed_count()
+                    # 鍏抽棴绉嶅瓙鐐规ā寮?                    self.seed_mode_enabled = False
+                    self.btn_add_seed.setChecked(False)
+                    self.btn_add_seed.setText("鉃?娣诲姞绉嶅瓙鐐?)
+                    self.btn_add_seed.setStyleSheet("")
+
+                    # 鏇存柊鐥呬汉淇℃伅鏄剧ず锛堣嫢鏈塂ICOM淇℃伅鍒欏睍绀猴級
+                    # 濡傛灉鏋勫缓浜唀ntry锛屼娇鐢╡ntry淇℃伅锛堟洿瀹屾暣锛夛紱鍚﹀垯鍙娇鐢╩etadata
+                    if self.current_entry:
+                        self._update_patient_info_from_entry(self.current_entry, metadata)
+                    else:
+                        self._update_patient_info_from_metadata(metadata)
+
+                    QMessageBox.information(self, "鎴愬姛", f"褰卞儚鍔犺浇鎴愬姛\n灏哄: {data.shape}")
+                else:
+                    QMessageBox.warning(self, "閿欒", "褰卞儚鍔犺浇澶辫触")
+            except Exception as e:
+                QMessageBox.critical(self, "閿欒", f"鍔犺浇褰卞儚鏃跺彂鐢熼敊璇?\n{e}")
+
+    # ========== [鏂板] 鐥呬緥褰掓。鐩稿叧鍑芥暟 ==========
+
+    def _on_save_case_to_db(self):
+        """淇濆瓨鐥呬緥鍒版棩蹇楁枃浠讹紙褰掓。锛?""
+        if not self.db:
+            QMessageBox.warning(self, "閿欒", "鏃ュ織鏂囦欢绠＄悊鍣ㄦ湭鍒濆鍖栵紝鏃犳硶淇濆瓨銆?)
+            return
+
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "鎻愮ず", "璇峰厛鍔犺浇骞跺鐞嗕竴寮犲奖鍍?)
+            return
+
+        # 1. 纭鐥呬汉ID鍜屽鍚?        p_id = self.current_patient_info.get("PatientID", "")
+        p_name = self.current_patient_info.get("PatientName", "")
+
+        # 濡傛灉鑷姩鎻愬彇涓虹┖锛岃鐢ㄦ埛杈撳叆
+        if not p_id or p_id == "--" or p_id == "Unknown":
+            text, ok = QInputDialog.getText(self, "杈撳叆鐥呬汉缂栧彿", "鏃犳硶鑷姩璇嗗埆鐥呬汉缂栧彿锛岃杈撳叆:")
+            if ok and text:
+                p_id = text
+            else:
+                return  # 鐢ㄦ埛鍙栨秷
+
+        if not p_name or p_name == "--" or p_name == "Unknown":
+            text, ok = QInputDialog.getText(self, "杈撳叆鐥呬汉濮撳悕", f"璇疯緭鍏ョ梾浜?{p_id} 鐨勫鍚?")
+            if ok and text:
+                p_name = text
+            else:
+                p_name = "Unknown"
+
+        # 2. 鑾峰彇澶囨敞
+        note, ok = QInputDialog.getText(self, "璇婃柇澶囨敞", "璇疯緭鍏ヨ瘖鏂娉?(鍙€?:")
+        if not ok:
+            note = ""
+
+        # 3. 淇濆瓨Mask鍒颁复鏃舵枃浠?        try:
+            temp_dir = tempfile.gettempdir()
+            temp_mask_path = os.path.join(temp_dir, f"temp_mask_{datetime.now().strftime('%H%M%S')}.nii.gz")
+
+            # 浣跨敤 ImageIO 淇濆瓨 mask
+            mask_data = self.current_label_data.astype(
+                np.uint8) if self.current_label_data is not None else np.zeros_like(self.current_image_data,
+                                                                                    dtype=np.uint8)
+
+            self.image_io.save_label_map(mask_data, temp_mask_path, self.current_metadata)
+
+            # 4. 璋冪敤鏃ュ織鏂囦欢淇濆瓨
+            img_path_to_save = self.current_image_path
+            is_folder = os.path.isdir(img_path_to_save)
+
+            if is_folder:
+                pass
+
+            print(f"Archiving: {p_id}, {p_name}")
+
+            success = self.db.save_record(
+                p_code=p_id,
+                p_name=p_name,
+                current_img_path=img_path_to_save,
+                mask_save_path=temp_mask_path,
+                note=note
+            )
+
+            if success:
+                QMessageBox.information(self, "鎴愬姛", f"鐥呬緥 {p_name} 宸叉垚鍔熷綊妗ｏ紒")
+            else:
+                QMessageBox.warning(self, "澶辫触", "褰掓。澶辫触锛岃妫€鏌ユ棩蹇楁垨鏂囦欢鏉冮檺銆?)
+
+            # 娓呯悊涓存椂鏂囦欢
+            if os.path.exists(temp_mask_path):
+                os.remove(temp_mask_path)
+
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"淇濆瓨杩囩▼涓彂鐢熼敊璇?\n{e}")
+
+    def _on_search_case_history(self):
+        """鎼滅储鍘嗗彶鐥呬緥"""
+        if not self.db:
+            QMessageBox.warning(self, "閿欒", "鏃ュ織鏂囦欢绠＄悊鍣ㄦ湭鍒濆鍖栥€?)
+            return
+
+        dialog = CaseHistoryDialog(self.db, self)
+        dialog.case_selected.connect(self._on_history_case_loaded)
+        dialog.exec_()
+
+    def _on_history_case_loaded(self, original_path, mask_path):
+        """浠庡巻鍙茶褰曞姞杞界梾渚嬬殑鍥炶皟"""
+        print(f"Loading history case: {original_path}, {mask_path}")
+
+        try:
+            # 1. 鍔犺浇鍘熷浘
+            # 鍒ゆ柇鍘熷浘鏄枃浠惰繕鏄枃浠跺す (DICOM)
+            if os.path.isdir(original_path):
+                # 鏄?DICOM 鏂囦欢澶?                data, metadata = self.image_io.load_image(original_path)
+            else:
+                # 鏄崟涓枃浠?(nii.gz)
+                data, metadata = self.image_io.load_image(original_path)
+
+            if data is None:
+                QMessageBox.warning(self, "閿欒", "鏃犳硶鍔犺浇鍘熷褰卞儚鏂囦欢")
+                return
+
+            self.current_image_data = data
+            self.current_metadata = metadata
+            self.current_image_path = original_path
+
+            # 浼犻€?spacing
+            spacing = metadata.get('spacing') if metadata else None
+            self.four_view.set_image_data(data, spacing)
+
+            # 2. 鍔犺浇 Mask
+            if os.path.exists(mask_path):
+                mask_data = self.image_io.load_label_map(
+                    mask_path,
+                    reference_metadata=self.current_metadata,
+                    reference_shape=data.shape if data is not None else None,
+                    force_align=True,
+                )
+                if mask_data is not None:
+                    # 纭繚灏哄鍖归厤
+                    if mask_data.shape == data.shape:
+                        self.current_label_data = mask_data
+                    else:
+                        print(f"Warning: Mask shape {mask_data.shape} mismatch image {data.shape}")
+                        self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+                else:
+                    self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+            else:
+                self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+
+            self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
+            if self.current_label_data is not None and np.any(self.current_label_data):
+                self.last_doctor_label_data = np.asarray(self.current_label_data).astype(np.uint8).copy()
+            else:
+                self.last_doctor_label_data = None
+            self.last_ai_label_data = None
+            self._sync_dual_windows_base_image(reset_labels=True)
+            if self.last_doctor_label_data is not None and self.doctor_label_window is not None:
+                self.doctor_label_window.set_label_data(self.last_doctor_label_data, source_text="鍘嗗彶鐥呬緥鏍囩")
+
+            # 鏇存柊淇℃伅鏄剧ず
+            self._update_patient_info_from_metadata(metadata)
+
+            # 浠庤矾寰勪腑鑾峰彇 p_code锛屾垨鑰呬粠鎼滅储缁撴灉涓幏鍙?            p_code = self.get_current_patient_code()
+
+            # 瑙﹀彂鏁版嵁搴撹仈鍔ㄥ睍绀?            self.refresh_patient_tables(p_code)
+
+            QMessageBox.information(self, "鎴愬姛", "鍘嗗彶鐥呬緥鍔犺浇瀹屾垚")
+
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鍔犺浇鍘嗗彶鐥呬緥澶辫触:\n{e}")
+
+    def _on_connect_database(self):
+        """
+        杩炴帴 522 鏁版嵁搴撴牴鐩綍锛堥€氬父閫夋嫨 522/data锛?
+        鏀逛负"鎳掑姞杞?绛栫暐锛氳繖閲屽彧鍒楀嚭鐥呬汉鐩綍锛屼笉鍋氬叏搴撴壂鎻忋€?        """
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "閫夋嫨鏁版嵁搴撴牴鐩綍锛堝缓璁€夋嫨 522/data锛?, ""
+        )
+        if not folder_path:
+            return
+
+        self.db_root = folder_path
+        self.db_series_list.clear()
+        self.db_entries = []
+
+        patient_dirs = find_patient_dirs_522(folder_path)
+        for pdir in patient_dirs:
+            pid = os.path.basename(pdir)
+            p_item = QTreeWidgetItem()
+            p_item.setText(0, pid)
+            p_item.setToolTip(0, f"Patient dir: {pdir}\n灞曞紑浠ュ姞杞借鐥呬汉鐨勫簭鍒楀垪琛?)
+            # UserRole 涓瓨 patient_dir锛屽苟鏍囪"鏈姞杞?
+            p_item.setData(0, Qt.UserRole, {"type": "patient", "patient_dir": pdir, "loaded": False})
+            # 鏀句竴涓崰浣嶅瓙鑺傜偣锛岃 UI 鏄剧ず鍙睍寮€绠ご
+            placeholder_item = QTreeWidgetItem(["(expand to load...)"])
+            p_item.addChild(placeholder_item)
+            self.db_series_list.addTopLevelItem(p_item)
+
+        self.db_status_label.setText(f"DB: connected ({len(patient_dirs)} patients)\n{folder_path}")
+        self.db_series_list.expandToDepth(0)
+
+    def _on_db_item_expanded(self, item: QTreeWidgetItem):
+        """鎳掑姞杞斤細灞曞紑鐥呬汉鑺傜偣鏃舵壂鎻忚鐥呬汉鐨勫簭鍒楋紙SeriesUID绮掑害锛?""
+        payload = item.data(0, Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") != "patient":
+            return
+        if payload.get("loaded"):
+            return
+
+        patient_dir = payload.get("patient_dir")
+        if not patient_dir:
+            return
+
+        # 娓呮帀鍗犱綅
+        item.takeChildren()
+
+        # 鑻ヤ笂涓€涓梾浜烘壂鎻忚繕鍦ㄨ窇锛屽厛璇锋眰涓柇
+        if self.patient_worker is not None and self.patient_worker.isRunning():
+            self.patient_worker.requestInterruption()
+
+        progress = QProgressDialog(f"姝ｅ湪鎵弿璇ョ梾浜哄簭鍒?..\n{os.path.basename(patient_dir)}", "鍙栨秷", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        self.patient_worker = PatientIndexWorker(patient_dir)
+
+        def _done(entries):
+            progress.close()
+            # 鐩存帴灏嗗簭鍒椾綔涓烘偅鑰呰妭鐐圭殑瀛愯妭鐐癸紙涓嶆樉绀篠tudy灞傜骇锛?            for e in entries:
+                leaf = QTreeWidgetItem()
+                # 绗?鍒楋細Patient ID锛堜娇鐢ㄥ簭鍒桰D鎴栨弿杩帮級
+                series_desc = (e.series_description or "").strip()
+                uid_short = (e.series_uid or "")[-8:] if e.series_uid else ""
+                series_text = f"{e.series_id or ''} {series_desc} ({uid_short})".strip()
+                if not series_text:
+                    series_text = os.path.basename(e.series_dir) if e.series_dir else "Series"
+                leaf.setText(0, series_text)
+                # 绗?鍒楋細Patient Name
+                leaf.setText(1, e.patient_name or "")
+                # 绗?鍒楋細Study ID锛堜繚鐣欎俊鎭絾涓嶄綔涓哄眰绾э級
+                leaf.setText(2, e.study_id or "")
+                # 绗?鍒楋細Study Date
+                leaf.setText(3, e.study_date or "")
+                # 绗?鍒楋細Modality
+                leaf.setText(4, e.modality or "")
+                # 绗?鍒楋細Series Description锛堣缁嗕俊鎭級
+                leaf.setText(5, series_text)
+                leaf.setData(0, Qt.UserRole, e)
+                leaf.setToolTip(0, e.tooltip_text)
+                item.addChild(leaf)
+
+            payload["loaded"] = True
+            item.setData(0, Qt.UserRole, payload)
+            item.setExpanded(True)
+
+        def _err(err):
+            progress.close()
+            QMessageBox.critical(self, "閿欒", f"鎵弿璇ョ梾浜哄簭鍒楀け璐?\n{err}")
+
+        self.patient_worker.finished.connect(_done)
+        self.patient_worker.error.connect(_err)
+        progress.canceled.connect(self.patient_worker.requestInterruption)
+        self.patient_worker.start()
+
+    def _on_view_patient_info(self):
+        """寮圭獥鏌ョ湅褰撳墠鍥惧儚鐨勭梾浜轰俊鎭?""
+        info = self.current_patient_info or {}
+        if not info:
+            QMessageBox.information(self, "淇℃伅", "褰撳墠娌℃湁宸插姞杞藉浘鍍忕殑鐥呬汉淇℃伅銆俓n璇峰厛鍔犺浇涓€涓狣ICOM搴忓垪/鍥惧儚銆?)
+            return
+
+        dialog = PatientInfoDialog(info, self)
+        dialog.exec_()
+
+    def _on_load_dicom_folder(self):
+        """
+        鍔犺浇DICOM鏂囦欢澶?
+        璇存槑锛?        - 鐢ㄤ簬澶勭悊绫讳技 522/data/.../ST*/SE*/IM* 杩欑銆屾棤鍚庣紑銆岲ICOM 鏂囦欢缁撴瀯
+        - 鐜板湪鏀寔閫夋嫨涓婂眰鐩綍锛堢梾浜?Study锛夛紝浼氳嚜鍔ㄥ悜涓嬮€掑綊鎵惧埌绗竴涓彲鍔犺浇鐨?SE 鐩綍
+        """
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "閫夋嫨DICOM鏂囦欢澶?, ""
+        )
+
+        if not folder_path:
+            return
+
+        # 灏濊瘯鐩存帴鍔犺浇閫変腑鐩綍锛屽鏋滃け璐ュ垯鍚戜笅閫掑綊鏌ユ壘鍙姞杞界殑 SE 鐩綍
+        target_dir = None
+        data = None
+        metadata = None
+
+        def try_load(dirpath: str):
+            try:
+                d, m = self.image_io.load_image(dirpath)
+                return d, m
+            except Exception:
+                return None, None
+
+        data, metadata = try_load(folder_path)
+        if data is None:
+            for dirpath, _dirnames, _filenames in os.walk(folder_path):
+                data, metadata = try_load(dirpath)
+                if data is not None:
+                    target_dir = dirpath
+                    break
+
+        if data is None:
+            QMessageBox.warning(self, "閿欒", "鏈壘鍒板彲鍔犺浇鐨凞ICOM搴忓垪\n璇烽€変腑鍏蜂綋鐨?SE 鏂囦欢澶规垨鍖呭惈 DICOM 鐨勭洰褰曘€?)
+            return
+
+        # 濡傛灉鎵惧埌浜嗛€掑綊鐩綍浣嗘湭璁剧疆 target_dir锛岃鏄庡氨鏄€変腑鐨勯偅灞?        if target_dir is None:
+            target_dir = folder_path
+
+        try:
+            self.current_image_data = data
+            self.current_metadata = metadata
+            self.current_image_path = target_dir
+            # 灏濊瘯浠巑etadata鏋勫缓entry锛堢敤浜庡悗缁嚜鍔ㄥ畾浣嶏級
+            self.current_entry = self._build_entry_from_metadata(metadata, target_dir)
+
+            # 浼犻€抯pacing淇℃伅锛堝鏋滃彲鐢級
+            spacing = metadata.get('spacing') if metadata else None
+            self.four_view.set_image_data(data, spacing)
+            # 鍒濆鍖栨爣绛炬暟鎹?            self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+            self.four_view.set_label_data(self.current_label_data)
+            self.last_doctor_label_data = None
+            self.last_ai_label_data = None
+            self._sync_dual_windows_base_image(reset_labels=True)
+            self._reset_analysis_state()
+            # 璁剧疆娲诲姩鏍囩ID
+            self.four_view.axial_view.set_active_label_id(self.active_label_id)
+            self.four_view.coronal_view.set_active_label_id(self.active_label_id)
+            self.four_view.sagittal_view.set_active_label_id(self.active_label_id)
+            # 娓呯┖鍘嗗彶璁板綍鍜岀瀛愮偣锛屼笌鏅€氬姞杞介€昏緫淇濇寔涓€鑷?            self.undo_history.clear()
+            self.redo_history.clear()
+            self.seed_points = []
+            self._update_seed_count()
+            self.seed_mode_enabled = False
+            self.btn_add_seed.setChecked(False)
+            self.btn_add_seed.setText("鉃?娣诲姞绉嶅瓙鐐?)
+            self.btn_add_seed.setStyleSheet("")
+            # 鏇存柊鐥呬汉淇℃伅鏄剧ず
+            # 濡傛灉鏋勫缓浜唀ntry锛屼娇鐢╡ntry淇℃伅锛堟洿瀹屾暣锛夛紱鍚﹀垯鍙娇鐢╩etadata
+            if self.current_entry:
+                self._update_patient_info_from_entry(self.current_entry, metadata)
+            else:
+                self._update_patient_info_from_metadata(metadata)
+
+            QMessageBox.information(self, "鎴愬姛",
+                                    f"DICOM鏂囦欢澶瑰姞杞芥垚鍔焅n瀹為檯鍔犺浇鐩綍: {target_dir}\n灏哄: {data.shape}")
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鍔犺浇DICOM鏂囦欢澶规椂鍙戠敓閿欒:\n{e}")
+
+    def _on_load_selected_db_series(self, *_args):
+        """鍔犺浇鏁版嵁搴撳垪琛ㄤ腑閫変腑鐨勫簭鍒?""
+        item = self.db_series_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "鎻愮ず", "璇峰厛鍦ㄥ垪琛ㄤ腑閫夋嫨涓€涓簭鍒?)
+            return
+
+        # QTreeWidgetItem: 鏁版嵁瀛樻斁鍦ㄧ0鍒楃殑 UserRole 涓?        entry = item.data(0, Qt.UserRole)
+        # 鍙湁鍙跺瓙鑺傜偣鎵嶄細缁戝畾 entry锛涚偣鍒扮梾浜?妫€鏌ヨ妭鐐规椂缁欏嚭鎻愮ず
+        if not entry or not hasattr(entry, "file_list"):
+            QMessageBox.information(self, "鎻愮ず", "璇峰睍寮€骞堕€夋嫨鍏蜂綋搴忓垪锛堝彾瀛愯妭鐐癸級鍐嶅姞杞?)
+            return
+
+        try:
+            # 绮剧‘鍒板崟涓?DICOM Series锛堜娇鐢ㄥ叿浣撶殑鏂囦欢鍒楄〃锛?            data, metadata = self.image_io.load_dicom_series(entry.file_list)
+            if data is not None:
+                self.current_image_data = data
+                self.current_metadata = metadata
+                # 浣跨敤"搴忓垪鎵€鍦ㄧ洰褰?浣滀负璺緞鏄剧ず淇℃伅
+                self.current_image_path = entry.series_dir
+                self.current_entry = entry  # 淇濆瓨褰撳墠搴忓垪鐨別ntry淇℃伅
+
+                spacing = metadata.get('spacing') if metadata else None
+                self.four_view.set_image_data(data, spacing)
+
+                self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
+                self.four_view.set_label_data(self.current_label_data)
+                self.last_doctor_label_data = None
+                self.last_ai_label_data = None
+                self._sync_dual_windows_base_image(reset_labels=True)
+                self._reset_analysis_state()
+
+                self.four_view.axial_view.set_active_label_id(self.active_label_id)
+                self.four_view.coronal_view.set_active_label_id(self.active_label_id)
+                self.four_view.sagittal_view.set_active_label_id(self.active_label_id)
+
+                self.undo_history.clear()
+                self.redo_history.clear()
+                self.seed_points = []
+                self._update_seed_count()
+                self.seed_mode_enabled = False
+                self.btn_add_seed.setChecked(False)
+                self.btn_add_seed.setText("鉃?娣诲姞绉嶅瓙鐐?)
+                self.btn_add_seed.setStyleSheet("")
+
+                # 浣跨敤鏁版嵁搴撲腑鐨別ntry淇℃伅锛堜紭鍏堬級鏇存柊鐥呬汉鏄剧ず
+                self._update_patient_info_from_entry(entry, metadata)
+
+                QMessageBox.information(self, "鎴愬姛", f"鏁版嵁搴撳簭鍒楀姞杞芥垚鍔焅n{entry.display_name}\n灏哄: {data.shape}")
+            else:
+                QMessageBox.warning(self, "閿欒", "鏁版嵁搴撳簭鍒楀姞杞藉け璐?)
+        except Exception as e:
+            QMessageBox.critical(self, "閿欒", f"鍔犺浇鏁版嵁搴撳簭鍒楁椂鍙戠敓閿欒:\n{e}")
+
+    def _update_patient_info_from_metadata(self, metadata: Optional[dict]):
+        """鏍规嵁ImageIO杩斿洖鐨刴etadata涓殑dicom_info鏇存柊鐥呬汉淇℃伅"""
+        info = {}
+        if metadata and isinstance(metadata, dict):
+            info = metadata.get("dicom_info") or {}
+
+        # 濡傛灉dicom_info涓虹┖鎴栦俊鎭笉瀹屾暣锛屽皾璇曚粠褰撳墠鍥惧儚璺緞涓彁鍙栧熀鏈俊鎭?        if self.current_image_path:
+            path_parts = os.path.normpath(self.current_image_path).split(os.sep)
+            # 灏濊瘯浠庤矾寰勪腑鎻愬彇鎮ｈ€匢D锛堝鏋滆繕娌℃湁锛?            if not info.get("PatientID"):
+                for part in reversed(path_parts):
+                    # 鏇村鏉剧殑鍖归厤锛?-4浣嶆暟瀛楅兘鍙兘鏄偅鑰匢D
+                    if part.isdigit() and 1 <= len(part) <= 4:
+                        info["PatientID"] = part
+                        break
+
+            # 灏濊瘯浠庤矾寰勪腑鎻愬彇Series淇℃伅锛堝鏋滆繕娌℃湁锛?            if not info.get("SeriesDescription"):
+                # 鏌ユ壘SE*鐩綍
+                for part in reversed(path_parts):
+                    if part.startswith("SE") and len(part) > 2:
+                        # 妫€鏌E鍚庨潰鐨勯儴鍒嗘槸鍚︽槸鏁板瓧
+                        suffix = part[2:]
+                        if suffix.isdigit():
+                            info["SeriesDescription"] = part
+                            break
+                        # 涔熸敮鎸丼E鍚庨潰娌℃湁鏁板瓧鐨勬儏鍐?                        elif not suffix:
+                            info["SeriesDescription"] = part
+                            break
+
+            # 灏濊瘯浠庤矾寰勪腑鎻愬彇Study淇℃伅锛堝鏋滆繕娌℃湁锛?            if not info.get("StudyID"):
+                # 鏌ユ壘ST*鐩綍
+                for part in reversed(path_parts):
+                    if part.startswith("ST") and len(part) > 2:
+                        # 妫€鏌T鍚庨潰鐨勯儴鍒嗘槸鍚︽槸鏁板瓧
+                        suffix = part[2:]
+                        if suffix.isdigit():
+                            info["StudyID"] = part
+                            break
+                        # 涔熸敮鎸丼T鍚庨潰娌℃湁鏁板瓧鐨勬儏鍐?                        elif not suffix:
+                            info["StudyID"] = part
+                            break
+
+        # 纭繚鑷冲皯鏈変竴浜涗俊鎭鎻愬彇
+        self._apply_patient_info(info)
+
+    def _update_patient_info_from_entry(self, entry: SeriesEntry, metadata: Optional[dict]):
+        """缁煎悎鏁版嵁搴揺ntry鍜宮etadata涓殑dicom_info鏇存柊鐥呬汉淇℃伅"""
+        info = {}
+        if metadata and isinstance(metadata, dict):
+            info = metadata.get("dicom_info") or {}
+            # 濡傛灉dicom_info鏄┖瀛楀吀锛岀‘淇漣nfo鏄瓧鍏歌€屼笉鏄疦one
+            if not isinstance(info, dict):
+                info = {}
+
+        # 瑕嗙洊/琛ュ厖瀛楁锛屼互鏁版嵁搴撲腑鐨勪俊鎭负浼樺厛
+        if entry:
+            if entry.patient_id:
+                info["PatientID"] = entry.patient_id
+            if entry.patient_name:
+                info["PatientName"] = entry.patient_name
+            if entry.study_date:
+                info["StudyDate"] = entry.study_date
+
+        # 搴旂敤鐥呬汉淇℃伅
+        self._apply_patient_info(info)
+
+
+class PatientInfoDialog(QDialog):
+    """鐥呬汉淇℃伅鏌ョ湅瀵硅瘽妗?""
+
+    def __init__(self, info: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("鐥呬汉淇℃伅")
+        self.setMinimumSize(400, 300)
+
+        layout = QVBoxLayout()
+
+        # 鍒涘缓琛ㄦ牸鏄剧ず淇℃伅
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["瀛楁", "鍊?])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        # 濉厖鏁版嵁
+        items = [
+            ("鐥呬汉ID", info.get("PatientID", "--")),
+            ("鐥呬汉濮撳悕", info.get("PatientName", "--")),
+            ("鎬у埆", info.get("PatientSex", "--")),
+            ("鍑虹敓鏃ユ湡", info.get("PatientBirthDate", "--")),
+            ("妫€鏌ユ棩鏈?, info.get("StudyDate", "--")),
+            ("妯℃€?, info.get("Modality", "--")),
+            ("搴忓垪鍙?, info.get("SeriesNumber", "--")),
+            ("搴忓垪鎻忚堪", info.get("SeriesDescription", "--")),
+            ("鏈烘瀯", info.get("InstitutionName", "--")),
+            ("鍖荤敓", info.get("ReferringPhysicianName", "--")),
+        ]
+
+        table.setRowCount(len(items))
+        for i, (key, value) in enumerate(items):
+            table.setItem(i, 0, QTableWidgetItem(key))
+            table.setItem(i, 1, QTableWidgetItem(str(value)))
+
+        layout.addWidget(table)
+
+        # 鍏抽棴鎸夐挳
+        btn_close = QPushButton("鍏抽棴")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+        self.setLayout(layout)

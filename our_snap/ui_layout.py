@@ -47,16 +47,17 @@ class SegmentationWorker(QThread):
     finished = pyqtSignal(np.ndarray)
     error = pyqtSignal(str)
 
-    def __init__(self, algorithm, image_data, seed_points, params):
+    def __init__(self, algorithm, image_data, seed_points, params, spacing=None):
         super().__init__()
         self.algorithm = algorithm
         self.image_data = image_data
         self.seed_points = seed_points
         self.params = params
+        self.spacing = spacing
 
     def run(self):
         try:
-            self.algorithm.set_image(self.image_data)
+            self.algorithm.set_image(self.image_data, spacing=self.spacing)
             self.algorithm.set_seed_points(self.seed_points)
 
             if self.params['method'] == 'region_competition':
@@ -343,15 +344,17 @@ class DatabaseDialog(QDialog):
 class LabelViewerWindow(QWidget):
     """独立标签查看窗口（用于医生标签/AI标签并行对比）。"""
 
-    def __init__(self, title: str, role_text: str, parent=None):
+    def __init__(self, title: str, role_text: str, parent=None, force_matplotlib_3d: bool = False):
         super().__init__(parent)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setWindowTitle(title)
         self.setMinimumSize(900, 700)
 
         self.role_text = role_text
+        self.force_matplotlib_3d = bool(force_matplotlib_3d)
         self.image_io = ImageIO()
         self.base_image_data = None
+        self.base_metadata = None
         self.base_spacing = None
         self.current_label_data = None
         self._refresh_timer = QTimer(self)
@@ -385,8 +388,7 @@ class LabelViewerWindow(QWidget):
         top_bar.addWidget(btn_update_3d)
         layout.addLayout(top_bar)
 
-        # 双窗口对比在Windows下容易出现多OpenGL上下文冲突，固定使用matplotlib后端更稳。
-        self.four_view = FourViewWidget(force_matplotlib_3d=True)
+        self.four_view = FourViewWidget(force_matplotlib_3d=self.force_matplotlib_3d)
         layout.addWidget(self.four_view, stretch=1)
 
     def _do_refresh_3d(self):
@@ -421,12 +423,13 @@ class LabelViewerWindow(QWidget):
             pass
         super().closeEvent(event)
 
-    def set_base_image(self, image_data, spacing=None, refresh_3d: bool = True):
+    def set_base_image(self, image_data, spacing=None, metadata=None, refresh_3d: bool = True):
         """设置基础影像（两个窗口保持一致）。"""
         if image_data is None:
             return
 
         self.base_image_data = np.asarray(image_data)
+        self.base_metadata = metadata if isinstance(metadata, dict) else None
         self.base_spacing = spacing
         self.four_view.set_image_data(self.base_image_data, spacing)
 
@@ -479,7 +482,12 @@ class LabelViewerWindow(QWidget):
             return
 
         try:
-            label_data = self.image_io.load_label_map(filepath)
+            label_data = self.image_io.load_label_map(
+                filepath,
+                reference_metadata=self.base_metadata,
+                reference_shape=self.base_image_data.shape if self.base_image_data is not None else None,
+                force_align=False,
+            )
             if label_data is None:
                 QMessageBox.warning(self, "错误", "标签加载失败")
                 return
@@ -642,7 +650,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("医学影像分割软件")
+        self.setWindowTitle("VesselSeg 医学影像分割工作站")
         # 使用更保守的默认尺寸，避免在小屏幕上被系统强制为“近似全屏”
         self.setGeometry(120, 80, 1280, 820)
 
@@ -697,18 +705,30 @@ class MainWindow(QMainWindow):
         self.undo_history = []  # 撤销历史栈
         self.redo_history = []  # 重做历史栈
         self.max_history_size = 50  # 最大历史记录数
+        self._structure_dirty = False
+        self._deferred_structure_timer = QTimer(self)
+        self._deferred_structure_timer.setSingleShot(True)
+        self._deferred_structure_timer.timeout.connect(self._run_deferred_structure_refresh)
+        self._pending_label_opacity = 0.5
+        self._last_applied_label_opacity = 0.5
+        self._label_opacity_timer = QTimer(self)
+        self._label_opacity_timer.setSingleShot(True)
+        self._label_opacity_timer.setInterval(24)
+        self._label_opacity_timer.timeout.connect(self._apply_pending_label_opacity)
 
         # UI初始化
         self._init_ui()
+        self._apply_professional_theme()
 
     def _init_ui(self):
         """初始化UI布局"""
         central_widget = QWidget()
+        central_widget.setObjectName("AppShell")
         self.setCentralWidget(central_widget)
 
         main_layout = QHBoxLayout()
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(5)
+        main_layout.setContentsMargins(10, 10, 10, 8)
+        main_layout.setSpacing(10)
         central_widget.setLayout(main_layout)
 
         # ========== 左侧：工具栏区（使用滚动区域） ==========
@@ -723,10 +743,185 @@ class MainWindow(QMainWindow):
         right_panel = self._create_right_panel()
         main_layout.addWidget(right_panel, stretch=1)
 
+    def _apply_professional_theme(self):
+        """Apply a restrained clinical-workstation visual theme."""
+        self.setStyleSheet("""
+            QMainWindow, QWidget#AppShell {
+                background: #0f172a;
+                color: #d7dee8;
+            }
+            QWidget#SidePanel, QWidget#RightPanel {
+                background: #111827;
+                border: 1px solid #243247;
+                border-radius: 8px;
+            }
+            QWidget#CenterPanel {
+                background: #07101d;
+                border: 1px solid #243247;
+                border-radius: 8px;
+            }
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+            QLabel {
+                color: #d7dee8;
+                font-size: 13px;
+            }
+            QGroupBox {
+                background: #182234;
+                border: 1px solid #2a3a52;
+                border-radius: 8px;
+                margin-top: 18px;
+                padding: 14px 10px 10px 10px;
+                font-weight: 600;
+                color: #eef4ff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                padding: 0 6px;
+                color: #8fb7ff;
+                background: #111827;
+            }
+            QPushButton {
+                min-height: 30px;
+                padding: 5px 10px;
+                border: 1px solid #31445f;
+                border-radius: 6px;
+                background: #202c3f;
+                color: #edf4ff;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: #293852;
+                border-color: #4f6f9f;
+            }
+            QPushButton:pressed, QPushButton:checked {
+                background: #1f6feb;
+                border-color: #58a6ff;
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background: #172033;
+                color: #64748b;
+                border-color: #263244;
+            }
+            QPushButton#PrimaryButton {
+                background: #1f6feb;
+                border-color: #58a6ff;
+                color: #ffffff;
+                font-weight: 700;
+            }
+            QPushButton#PrimaryButton:hover {
+                background: #2f81f7;
+            }
+            QPushButton#DangerButton {
+                color: #ffd9dd;
+                border-color: #74424b;
+                background: #3b1f28;
+            }
+            QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget, QTreeWidget, QTableWidget {
+                background: #0b1220;
+                color: #e6edf7;
+                border: 1px solid #2b3d56;
+                border-radius: 6px;
+                selection-background-color: #1f6feb;
+                selection-color: #ffffff;
+                padding: 4px 6px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 24px;
+            }
+            QComboBox QAbstractItemView {
+                background: #0b1220;
+                color: #e6edf7;
+                border: 1px solid #2b3d56;
+                selection-background-color: #1f6feb;
+                selection-color: #ffffff;
+                outline: none;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 28px;
+                padding: 4px 8px;
+                background: #0b1220;
+                color: #e6edf7;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background: #172a46;
+                color: #ffffff;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background: #1f6feb;
+                color: #ffffff;
+            }
+            QHeaderView::section {
+                background: #1b2638;
+                color: #dbe7f7;
+                border: none;
+                border-right: 1px solid #2b3d56;
+                padding: 5px;
+            }
+            QListWidget::item, QTreeWidget::item {
+                min-height: 24px;
+                padding: 3px 5px;
+            }
+            QListWidget::item:selected, QTreeWidget::item:selected {
+                background: #1f6feb;
+                color: #ffffff;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                border-radius: 2px;
+                background: #2b3d56;
+            }
+            QSlider::handle:horizontal {
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: #58a6ff;
+            }
+            QScrollBar:vertical {
+                background: #111827;
+                width: 10px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #334155;
+                border-radius: 5px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #475569;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                border: none;
+                background: transparent;
+                height: 0;
+            }
+            QStatusBar {
+                background: #0b1220;
+                color: #9fb0c7;
+                border-top: 1px solid #243247;
+            }
+            QProgressDialog, QMessageBox, QDialog {
+                background: #111827;
+                color: #d7dee8;
+            }
+        """)
+        self.statusBar().showMessage("就绪")
+
     def _create_left_panel(self) -> QWidget:
         """创建左侧工具栏（带滚动区域，解决内容过多问题）"""
         # 创建一个容器widget
         container = QWidget()
+        container.setObjectName("SidePanel")
         container.setMinimumWidth(280)
         container.setMaximumWidth(350)
 
@@ -744,13 +939,13 @@ class MainWindow(QMainWindow):
         # 滚动区域的内容widget
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
-        content_layout.setContentsMargins(5, 5, 5, 5)
-        content_layout.setSpacing(8)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        content_layout.setSpacing(10)
 
         # ===== 1. Main Toolbar =====
-        main_toolbar_group = QGroupBox("Main Toolbar")
+        main_toolbar_group = QGroupBox("主工具")
         main_toolbar_layout = QVBoxLayout()
-        main_toolbar_layout.setSpacing(5)
+        main_toolbar_layout.setSpacing(7)
 
         # 工具按钮组 - 使用网格布局避免重叠
         from PyQt5.QtWidgets import QGridLayout
@@ -768,19 +963,11 @@ class MainWindow(QMainWindow):
 
         # Zoom（缩放工具）
         self.btn_zoom = QPushButton("🔍")
-        self.btn_zoom.setToolTip("Zoom Tool")
+        self.btn_zoom.setToolTip("导航工具：滚轮缩放，按住左键拖动平移")
         self.btn_zoom.setCheckable(True)
         self.btn_zoom.setFixedSize(35, 35)
         self.btn_zoom.clicked.connect(lambda: self._on_tool_selected('zoom'))
         tools_grid.addWidget(self.btn_zoom, 0, 1)
-
-        # Pan（平移工具）
-        self.btn_pan = QPushButton("✋")
-        self.btn_pan.setToolTip("Pan Tool")
-        self.btn_pan.setCheckable(True)
-        self.btn_pan.setFixedSize(35, 35)
-        self.btn_pan.clicked.connect(lambda: self._on_tool_selected('pan'))
-        tools_grid.addWidget(self.btn_pan, 0, 2)
 
         # Brush（画笔工具）
         self.btn_brush = QPushButton("🖌")
@@ -803,7 +990,7 @@ class MainWindow(QMainWindow):
         self.btn_screenshot.setToolTip("Save Screenshot")
         self.btn_screenshot.setFixedSize(35, 35)
         self.btn_screenshot.clicked.connect(self._on_save_screenshot)
-        tools_grid.addWidget(self.btn_screenshot, 1, 2)
+        tools_grid.addWidget(self.btn_screenshot, 0, 2)
 
         main_toolbar_layout.addLayout(tools_grid)
 
@@ -837,27 +1024,34 @@ class MainWindow(QMainWindow):
         main_toolbar_layout.addLayout(brush_size_layout)
 
         # 文件操作按钮
-        btn_load_image = QPushButton("📂 加载影像")
+        btn_load_image = QPushButton("加载影像")
+        btn_load_image.setObjectName("PrimaryButton")
         btn_load_image.setFixedHeight(32)
         btn_load_image.clicked.connect(self._on_load_image)
         main_toolbar_layout.addWidget(btn_load_image)
 
-        btn_load_dicom_folder = QPushButton("📁 加载DICOM文件夹")
+        btn_load_dicom_folder = QPushButton("加载DICOM文件夹")
         btn_load_dicom_folder.setFixedHeight(32)
         btn_load_dicom_folder.clicked.connect(self._on_load_dicom_folder)
         main_toolbar_layout.addWidget(btn_load_dicom_folder)
 
-        btn_load_label = QPushButton("🏷️ 加载标签")
+        btn_load_label = QPushButton("加载标签")
         btn_load_label.setFixedHeight(32)
         btn_load_label.clicked.connect(self._on_load_label)
         main_toolbar_layout.addWidget(btn_load_label)
 
-        btn_save_label = QPushButton("💾 保存标签")
+        btn_reorient_image = QPushButton("重定向图像")
+        btn_reorient_image.setToolTip("类似 ITK-SNAP 的 Reorient Image：按医学方向重排影像和标签")
+        btn_reorient_image.setFixedHeight(32)
+        btn_reorient_image.clicked.connect(self._on_reorient_image)
+        main_toolbar_layout.addWidget(btn_reorient_image)
+
+        btn_save_label = QPushButton("保存标签")
         btn_save_label.setFixedHeight(32)
         btn_save_label.clicked.connect(self._on_save_label)
         main_toolbar_layout.addWidget(btn_save_label)
 
-        btn_compare_labels = QPushButton("🪟 双窗口标签对比")
+        btn_compare_labels = QPushButton("双窗口标签对比")
         btn_compare_labels.setFixedHeight(32)
         btn_compare_labels.clicked.connect(self._on_open_dual_label_windows)
         main_toolbar_layout.addWidget(btn_compare_labels)
@@ -938,7 +1132,7 @@ class MainWindow(QMainWindow):
         active_label_layout.setSpacing(5)
         self.active_label_color_widget = QWidget()
         self.active_label_color_widget.setFixedSize(20, 20)
-        self.active_label_color_widget.setStyleSheet("background-color: red; border: 1px solid black;")
+        self.active_label_color_widget.setStyleSheet("background-color: red; border: 1px solid #0b1220; border-radius: 4px;")
         active_label_layout.addWidget(self.active_label_color_widget)
         self.active_label_name_label = QLabel("活动标签: Label 1")
         active_label_layout.addWidget(self.active_label_name_label)
@@ -956,8 +1150,12 @@ class MainWindow(QMainWindow):
         self.label_opacity_slider = QSlider(Qt.Horizontal)
         self.label_opacity_slider.setMinimum(0)
         self.label_opacity_slider.setMaximum(100)
+        self.label_opacity_slider.setSingleStep(1)
+        self.label_opacity_slider.setPageStep(5)
+        self.label_opacity_slider.setTracking(True)
         self.label_opacity_slider.setValue(50)
         self.label_opacity_slider.valueChanged.connect(self._on_label_opacity_changed)
+        self.label_opacity_slider.sliderReleased.connect(self._flush_label_opacity_update)
         opacity_layout.addWidget(self.label_opacity_slider)
         self.label_opacity_value_label = QLabel("50%")
         self.label_opacity_value_label.setMinimumWidth(40)
@@ -1003,7 +1201,7 @@ class MainWindow(QMainWindow):
         toolbar_3d_layout.setSpacing(5)
 
         # Update（更新3D视图）
-        btn_update_3d = QPushButton("🔄 更新3D视图")
+        btn_update_3d = QPushButton("更新3D视图")
         btn_update_3d.setFixedHeight(32)
         btn_update_3d.clicked.connect(self._on_update_3d_view_clicked)
         toolbar_3d_layout.addWidget(btn_update_3d)
@@ -1011,13 +1209,14 @@ class MainWindow(QMainWindow):
         # 种子点相关按钮 - 水平布局
         seed_layout = QHBoxLayout()
         seed_layout.setSpacing(5)
-        self.btn_add_seed = QPushButton("➕ 添加种子点")
+        self.btn_add_seed = QPushButton("添加种子点")
         self.btn_add_seed.setFixedHeight(32)
         self.btn_add_seed.setCheckable(True)
         self.btn_add_seed.clicked.connect(self._on_toggle_seed_mode)
         seed_layout.addWidget(self.btn_add_seed)
 
-        self.btn_clear_seeds = QPushButton("🗑️ 清除种子点")
+        self.btn_clear_seeds = QPushButton("清除种子点")
+        self.btn_clear_seeds.setObjectName("DangerButton")
         self.btn_clear_seeds.setFixedHeight(32)
         self.btn_clear_seeds.clicked.connect(self._on_clear_seeds)
         seed_layout.addWidget(self.btn_clear_seeds)
@@ -1028,17 +1227,18 @@ class MainWindow(QMainWindow):
         toolbar_3d_layout.addWidget(self.seed_count_label)
 
         # 分割相关按钮
-        btn_label_stats = QPushButton("📊 标签统计")
+        btn_label_stats = QPushButton("标签统计")
         btn_label_stats.setFixedHeight(32)
         btn_label_stats.clicked.connect(self._on_label_statistics)
         toolbar_3d_layout.addWidget(btn_label_stats)
 
-        btn_segment_3d = QPushButton("✂️ 3D分割")
+        btn_segment_3d = QPushButton("3D分割")
         btn_segment_3d.setFixedHeight(32)
         btn_segment_3d.clicked.connect(self._on_segment_3d)
         toolbar_3d_layout.addWidget(btn_segment_3d)
 
-        btn_ai_seg = QPushButton("🤖 AI自动分割")
+        btn_ai_seg = QPushButton("AI自动分割")
+        btn_ai_seg.setObjectName("PrimaryButton")
         btn_ai_seg.setFixedHeight(32)
         btn_ai_seg.clicked.connect(self._on_ai_segmentation)
         toolbar_3d_layout.addWidget(btn_ai_seg)
@@ -1051,12 +1251,12 @@ class MainWindow(QMainWindow):
         quant_analysis_layout = QVBoxLayout()
         quant_analysis_layout.setSpacing(5)
 
-        btn_quant_analysis = QPushButton("📈 运行量化分析")
+        btn_quant_analysis = QPushButton("运行量化分析")
         btn_quant_analysis.setFixedHeight(32)
         btn_quant_analysis.clicked.connect(self._on_quantitative_analysis)
         quant_analysis_layout.addWidget(btn_quant_analysis)
 
-        btn_liver_partition = QPushButton("🧭 独立肝段划分")
+        btn_liver_partition = QPushButton("独立肝段划分")
         btn_liver_partition.setFixedHeight(32)
         btn_liver_partition.clicked.connect(self._on_liver_segment_partition)
         quant_analysis_layout.addWidget(btn_liver_partition)
@@ -1069,12 +1269,12 @@ class MainWindow(QMainWindow):
         three_d_visualization_layout = QVBoxLayout()
         three_d_visualization_layout.setSpacing(5)
 
-        btn_3d_visualization = QPushButton("🎨 打开独立3D窗口")
+        btn_3d_visualization = QPushButton("打开独立3D窗口")
         btn_3d_visualization.setFixedHeight(32)
         btn_3d_visualization.clicked.connect(self._on_3d_visualization)
         three_d_visualization_layout.addWidget(btn_3d_visualization)
 
-        btn_cutting_plane = QPushButton("✂️ 添加切割平面")
+        btn_cutting_plane = QPushButton("添加切割平面")
         btn_cutting_plane.setFixedHeight(32)
         btn_cutting_plane.clicked.connect(self._on_add_cutting_plane)
         three_d_visualization_layout.addWidget(btn_cutting_plane)
@@ -1087,7 +1287,7 @@ class MainWindow(QMainWindow):
         report_layout = QVBoxLayout()
         report_layout.setSpacing(5)
 
-        btn_generate_report = QPushButton("📄 生成PDF报告")
+        btn_generate_report = QPushButton("生成PDF报告")
         btn_generate_report.setFixedHeight(32)
         btn_generate_report.clicked.connect(self._on_generate_report)
         report_layout.addWidget(btn_generate_report)
@@ -1096,7 +1296,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(report_group)
 
         # ===== 9. 数据库对接（522范式） =====
-        btn_open_db_dialog = QPushButton("🗄️ 打开数据库 (522)")
+        btn_open_db_dialog = QPushButton("打开数据库 (522)")
         btn_open_db_dialog.setFixedHeight(32)
         btn_open_db_dialog.clicked.connect(self._on_open_db_dialog)
         content_layout.addWidget(btn_open_db_dialog)
@@ -1106,12 +1306,12 @@ class MainWindow(QMainWindow):
         archive_layout = QVBoxLayout()
         archive_layout.setSpacing(5)
 
-        self.btn_save_case_db = QPushButton("💾 保存病例到库")
+        self.btn_save_case_db = QPushButton("保存病例到库")
         self.btn_save_case_db.setFixedHeight(32)
         self.btn_save_case_db.clicked.connect(self._on_save_case_to_db)
         archive_layout.addWidget(self.btn_save_case_db)
 
-        self.btn_search_case_db = QPushButton("🔍 搜索历史病例")
+        self.btn_search_case_db = QPushButton("搜索历史病例")
         self.btn_search_case_db.setFixedHeight(32)
         self.btn_search_case_db.clicked.connect(self._on_search_case_history)
         archive_layout.addWidget(self.btn_search_case_db)
@@ -1133,8 +1333,9 @@ class MainWindow(QMainWindow):
     def _create_center_panel(self) -> QWidget:
         """创建中间2×2视图区"""
         panel = QWidget()
+        panel.setObjectName("CenterPanel")
         layout = QVBoxLayout()
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(8, 8, 8, 8)
         panel.setLayout(layout)
 
         # 创建2×2视图组件
@@ -1151,6 +1352,7 @@ class MainWindow(QMainWindow):
     def _create_right_panel(self) -> QWidget:
         """创建右侧参数设置区（分割算法参数 + 窗宽窗位）"""
         container = QWidget()
+        container.setObjectName("RightPanel")
         container.setMaximumWidth(250)
         container.setMinimumWidth(220)
 
@@ -1168,8 +1370,8 @@ class MainWindow(QMainWindow):
         # 滚动区域的内容widget
         content_widget = QWidget()
         content_layout = QVBoxLayout(content_widget)
-        content_layout.setContentsMargins(5, 5, 5, 5)
-        content_layout.setSpacing(8)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        content_layout.setSpacing(10)
 
         # 窗宽窗位参数组
         window_group = QGroupBox("窗宽窗位")
@@ -1198,6 +1400,7 @@ class MainWindow(QMainWindow):
 
         # 自动窗宽窗位按钮
         btn_auto_window = QPushButton("自动")
+        btn_auto_window.setObjectName("PrimaryButton")
         btn_auto_window.setFixedHeight(30)
         btn_auto_window.clicked.connect(self._on_auto_window)
         window_layout.addWidget(btn_auto_window)
@@ -1294,31 +1497,55 @@ class MainWindow(QMainWindow):
     def _on_undo(self):
         """撤销操作"""
         if self.undo_history:
-            # 保存当前状态到重做栈
-            if self.current_label_data is not None:
-                self.redo_history.append(np.copy(self.current_label_data))
-                # 限制重做栈大小
-                if len(self.redo_history) > self.max_history_size:
-                    self.redo_history.pop(0)
-
-            # 从撤销栈恢复
-            self.current_label_data = self.undo_history.pop()
-            self.four_view.set_label_data(self.current_label_data)
-            self._refresh_structure_from_current_labels()
+            self._swap_label_history(
+                source_stack=self.undo_history,
+                target_stack=self.redo_history,
+                status_text="已撤销标签修改",
+            )
 
     def _on_redo(self):
         """重做操作"""
         if self.redo_history:
-            # 保存当前状态到撤销栈
-            if self.current_label_data is not None:
-                self.undo_history.append(np.copy(self.current_label_data))
-                # 限制撤销栈大小
-                if len(self.undo_history) > self.max_history_size:
-                    self.undo_history.pop(0)
+            self._swap_label_history(
+                source_stack=self.redo_history,
+                target_stack=self.undo_history,
+                status_text="已重做标签修改",
+            )
 
-            # 从重做栈恢复
-            self.current_label_data = self.redo_history.pop()
-            self.four_view.set_label_data(self.current_label_data)
+    def _swap_label_history(self, source_stack, target_stack, status_text: str):
+        """Fast path for undo/redo: update labels now, defer expensive analysis."""
+        if not source_stack:
+            return
+
+        if self.current_label_data is not None:
+            # The current array is no longer edited after swapping it out, so no deep copy is needed here.
+            target_stack.append(self.current_label_data)
+            if len(target_stack) > self.max_history_size:
+                target_stack.pop(0)
+
+        self.current_label_data = source_stack.pop()
+        self.four_view.set_label_data(self.current_label_data)
+        self._mark_structure_dirty()
+        self.statusBar().showMessage(status_text, 1200)
+
+    def _schedule_structure_refresh(self, delay_ms: int = 350):
+        """Mark structure data stale without blocking undo/redo responsiveness."""
+        self._mark_structure_dirty()
+        if hasattr(self, "_deferred_structure_timer"):
+            self._deferred_structure_timer.stop()
+
+    def _mark_structure_dirty(self):
+        self._structure_dirty = True
+        self.last_vessel_analysis = {}
+        self.last_cut_stats = {}
+        try:
+            if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
+                self.four_view.view_3d.set_structure_data(None)
+        except Exception:
+            pass
+
+    def _run_deferred_structure_refresh(self):
+        if self._structure_dirty:
             self._refresh_structure_from_current_labels()
 
     def _get_current_spacing(self):
@@ -1329,14 +1556,54 @@ class MainWindow(QMainWindow):
 
     def _ensure_dual_label_windows(self):
         """确保医生/AI两个独立标签窗口存在。"""
+        force_matplotlib_3d = False
+        try:
+            main_is_pyvista = bool(getattr(self.four_view.view_3d, "use_pyvista", False))
+            force_matplotlib_3d = not main_is_pyvista
+        except Exception:
+            force_matplotlib_3d = False
+
+        def _window_backend_matches(window):
+            if window is None:
+                return True
+            try:
+                win_is_pyvista = bool(getattr(window.four_view.view_3d, "use_pyvista", False))
+                return win_is_pyvista == (not force_matplotlib_3d)
+            except Exception:
+                return False
+
+        if not _window_backend_matches(self.doctor_label_window):
+            try:
+                self.doctor_label_window.close()
+            except Exception:
+                pass
+            self.doctor_label_window = None
+
+        if not _window_backend_matches(self.ai_label_window):
+            try:
+                self.ai_label_window.close()
+            except Exception:
+                pass
+            self.ai_label_window = None
+
         if self.doctor_label_window is None:
-            self.doctor_label_window = LabelViewerWindow("医生标签窗口", "医生标签", parent=None)
+            self.doctor_label_window = LabelViewerWindow(
+                "医生标签窗口",
+                "医生标签",
+                parent=None,
+                force_matplotlib_3d=force_matplotlib_3d,
+            )
             self.doctor_label_window.destroyed.connect(
                 lambda _obj=None: setattr(self, 'doctor_label_window', None)
             )
 
         if self.ai_label_window is None:
-            self.ai_label_window = LabelViewerWindow("AI标签窗口", "AI标签", parent=None)
+            self.ai_label_window = LabelViewerWindow(
+                "AI标签窗口",
+                "AI标签",
+                parent=None,
+                force_matplotlib_3d=force_matplotlib_3d,
+            )
             self.ai_label_window.destroyed.connect(
                 lambda _obj=None: setattr(self, 'ai_label_window', None)
             )
@@ -1411,7 +1678,12 @@ class MainWindow(QMainWindow):
         for window in windows:
             if window is None:
                 continue
-            window.set_base_image(self.current_image_data, spacing, refresh_3d=refresh_3d)
+            window.set_base_image(
+                self.current_image_data,
+                spacing,
+                metadata=self.current_metadata,
+                refresh_3d=refresh_3d,
+            )
             if reset_labels:
                 empty_label = np.zeros(self.current_image_data.shape, dtype=np.uint8)
                 window.set_label_data(empty_label, source_text="已清空", refresh_3d=refresh_3d)
@@ -1441,6 +1713,65 @@ class MainWindow(QMainWindow):
                 source_text=source_text,
                 refresh_3d=self.ai_label_window.isVisible(),
             )
+
+    def _apply_label_alignment_transform(self, label_data, transform):
+        """Apply diagnostic axis/flip/label transform to a label volume."""
+        arr = np.asarray(label_data).astype(np.uint8)
+        if not isinstance(transform, dict):
+            return arr
+
+        if bool(transform.get("swap_labels_1_2", False)):
+            swapped = np.array(arr, copy=True)
+            label_1 = arr == 1
+            label_2 = arr == 2
+            swapped[label_1] = 2
+            swapped[label_2] = 1
+            arr = swapped
+
+        perm = tuple(int(v) for v in transform.get("perm", [0, 1, 2]))
+        if len(perm) == 3 and sorted(perm) == [0, 1, 2] and perm != (0, 1, 2):
+            arr = np.transpose(arr, perm)
+
+        for axis in transform.get("flip_axes", []):
+            axis = int(axis)
+            if 0 <= axis < arr.ndim:
+                arr = np.flip(arr, axis=axis)
+
+        return np.asarray(arr, dtype=np.uint8)
+
+    def _evaluate_accuracy_with_auto_alignment(self, analyzer, ai_label, doctor_label, spacing):
+        """Evaluate labels, then auto-apply a clear diagnostic alignment transform if needed."""
+        result = analyzer.evaluate_segmentation_accuracy(
+            ai_label=np.asarray(ai_label).astype(np.uint8),
+            doctor_label=np.asarray(doctor_label).astype(np.uint8),
+            spacing=spacing,
+            labels=None,
+        )
+
+        diagnosis = result.get("alignment_diagnosis", {}) if isinstance(result, dict) else {}
+        if not diagnosis or not bool(diagnosis.get("likely_misaligned", False)):
+            result["auto_alignment_applied"] = False
+            return result, np.asarray(ai_label).astype(np.uint8)
+
+        baseline = float(diagnosis.get("baseline_union_dice", 0.0))
+        best = float(diagnosis.get("best_union_dice", 0.0))
+        if (best - baseline) < 0.15:
+            result["auto_alignment_applied"] = False
+            return result, np.asarray(ai_label).astype(np.uint8)
+
+        transform = diagnosis.get("best_transform", {})
+        aligned_ai = self._apply_label_alignment_transform(ai_label, transform)
+        corrected = analyzer.evaluate_segmentation_accuracy(
+            ai_label=aligned_ai,
+            doctor_label=np.asarray(doctor_label).astype(np.uint8),
+            spacing=spacing,
+            labels=None,
+        )
+        corrected["auto_alignment_applied"] = True
+        corrected["applied_transform"] = transform
+        corrected["original_overall"] = result.get("overall", {})
+        corrected["original_alignment_diagnosis"] = diagnosis
+        return corrected, aligned_ai
 
     def _on_open_dual_label_windows(self):
         """打开医生标签窗口 + AI标签窗口。"""
@@ -1499,7 +1830,12 @@ class MainWindow(QMainWindow):
 
         if filepath:
             try:
-                label_data = self.image_io.load_label_map(filepath)
+                label_data = self.image_io.load_label_map(
+                    filepath,
+                    reference_metadata=self.current_metadata,
+                    reference_shape=self.current_image_data.shape if self.current_image_data is not None else None,
+                    force_align=False,
+                )
                 if label_data is not None:
                     # 检查尺寸是否匹配
                     if label_data.shape == self.current_image_data.shape:
@@ -1525,6 +1861,252 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, "错误", "标签加载失败")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"加载标签时发生错误:\n{e}")
+
+    def _hwd_array_to_sitk_image(self, array_data, metadata=None, pixel_id=None):
+        """Convert the app's (H, W, D) array convention to a SimpleITK image."""
+        import SimpleITK as sitk
+
+        arr = np.asarray(array_data)
+        sitk_arr = np.transpose(arr, (2, 0, 1))
+        image = sitk.GetImageFromArray(sitk_arr)
+        if pixel_id is not None:
+            image = sitk.Cast(image, pixel_id)
+
+        meta = metadata if isinstance(metadata, dict) else {}
+        spacing = meta.get("spacing")
+        if spacing is not None and len(spacing) >= 3:
+            image.SetSpacing(tuple(float(v) for v in spacing[:3]))
+
+        origin = meta.get("origin")
+        if origin is not None and len(origin) >= 3:
+            image.SetOrigin(tuple(float(v) for v in origin[:3]))
+
+        direction = meta.get("direction")
+        if direction is not None:
+            direction_arr = np.asarray(direction, dtype=np.float64)
+            if direction_arr.size == 9:
+                image.SetDirection(tuple(direction_arr.reshape(3, 3).flatten()))
+
+        return image
+
+    def _sitk_image_to_hwd_array(self, sitk_image, dtype=None):
+        """Convert a SimpleITK image back to the app's (H, W, D) array convention."""
+        import SimpleITK as sitk
+
+        data = np.transpose(np.asarray(sitk.GetArrayFromImage(sitk_image)), (1, 2, 0))
+        if dtype is not None:
+            data = data.astype(dtype, copy=False)
+        return data
+
+    def _metadata_from_sitk_image(self, sitk_image, previous_metadata=None):
+        spacing = tuple(float(v) for v in sitk_image.GetSpacing())
+        origin = tuple(float(v) for v in sitk_image.GetOrigin())
+        direction_matrix = np.asarray(sitk_image.GetDirection(), dtype=np.float64).reshape(3, 3)
+
+        affine = np.eye(4, dtype=np.float64)
+        affine[:3, :3] = direction_matrix * np.asarray(spacing, dtype=np.float64)
+        affine[:3, 3] = np.asarray(origin, dtype=np.float64)
+
+        metadata = dict(previous_metadata or {})
+        metadata.update({
+            "affine": affine,
+            "spacing": spacing,
+            "origin": origin,
+            "direction": direction_matrix,
+            "sitk_image": sitk_image,
+        })
+        return metadata
+
+    def _get_orientation_code_from_metadata(self, metadata):
+        import SimpleITK as sitk
+
+        direction = None
+        if isinstance(metadata, dict):
+            direction = metadata.get("direction")
+            if direction is None and metadata.get("sitk_image") is not None:
+                direction = metadata["sitk_image"].GetDirection()
+
+        if direction is None:
+            return "LPS"
+
+        try:
+            direction_arr = np.asarray(direction, dtype=np.float64)
+            if direction_arr.size == 9:
+                return sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(
+                    tuple(direction_arr.reshape(3, 3).flatten())
+                )
+        except Exception:
+            pass
+        return "Unknown"
+
+    def _reorient_hwd_array(self, array_data, metadata, target_orientation, is_label=False):
+        import SimpleITK as sitk
+
+        pixel_id = sitk.sitkUInt8 if is_label else None
+        image = self._hwd_array_to_sitk_image(array_data, metadata, pixel_id=pixel_id)
+        orienter = sitk.DICOMOrientImageFilter()
+        orienter.SetDesiredCoordinateOrientation(target_orientation)
+        reoriented = orienter.Execute(image)
+        dtype = np.uint8 if is_label else np.asarray(array_data).dtype
+        return self._sitk_image_to_hwd_array(reoriented, dtype=dtype), reoriented
+
+    def _on_reorient_image(self):
+        """Reorient image and all in-memory labels, similar to ITK-SNAP's Reorient Image."""
+        if self.current_image_data is None:
+            QMessageBox.warning(self, "提示", "请先加载影像，再进行重定向。")
+            return
+
+        current_orientation = self._get_orientation_code_from_metadata(self.current_metadata)
+        options = [
+            "LPS - DICOM / ITK 默认",
+            "RAS - NIfTI / 3D Slicer 常用",
+            "LAI",
+            "RAI",
+            "LPI",
+            "RPI",
+        ]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "重定向图像",
+            f"当前方向: {current_orientation}\n请选择目标方向:",
+            options,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+
+        target_orientation = choice.split()[0].strip().upper()
+        if target_orientation == current_orientation:
+            reply = QMessageBox.question(
+                self,
+                "重定向图像",
+                f"当前影像已经是 {target_orientation} 方向，是否仍然重新应用一次重定向？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        reply = QMessageBox.question(
+            self,
+            "确认重定向",
+            "将同时重定向当前影像、当前标签、医生标签缓存和AI标签缓存。\n"
+            "这会改变数组轴顺序/翻转方向，但不会重新训练或重新分割。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self.statusBar().showMessage(f"正在重定向图像到 {target_orientation} ...")
+            old_shape = tuple(self.current_image_data.shape)
+            previous_metadata = self.current_metadata if isinstance(self.current_metadata, dict) else {}
+
+            reoriented_image, reoriented_sitk = self._reorient_hwd_array(
+                self.current_image_data,
+                previous_metadata,
+                target_orientation,
+                is_label=False,
+            )
+            new_metadata = self._metadata_from_sitk_image(reoriented_sitk, previous_metadata)
+            new_metadata["orientation"] = target_orientation
+            new_metadata["source_orientation"] = current_orientation
+
+            if self.current_label_data is not None:
+                self.undo_history.append(np.copy(self.current_label_data))
+                if len(self.undo_history) > self.max_history_size:
+                    self.undo_history.pop(0)
+                if tuple(self.current_label_data.shape) == old_shape:
+                    self.current_label_data, _ = self._reorient_hwd_array(
+                        self.current_label_data,
+                        previous_metadata,
+                        target_orientation,
+                        is_label=True,
+                    )
+                else:
+                    self.current_label_data = np.zeros(reoriented_image.shape, dtype=np.uint8)
+            else:
+                self.current_label_data = np.zeros(reoriented_image.shape, dtype=np.uint8)
+
+            if self.last_doctor_label_data is not None and tuple(self.last_doctor_label_data.shape) == old_shape:
+                self.last_doctor_label_data, _ = self._reorient_hwd_array(
+                    self.last_doctor_label_data,
+                    previous_metadata,
+                    target_orientation,
+                    is_label=True,
+                )
+
+            if self.last_ai_label_data is not None and tuple(self.last_ai_label_data.shape) == old_shape:
+                self.last_ai_label_data, _ = self._reorient_hwd_array(
+                    self.last_ai_label_data,
+                    previous_metadata,
+                    target_orientation,
+                    is_label=True,
+                )
+
+            self.current_image_data = reoriented_image
+            self.current_metadata = new_metadata
+            self.image_io.current_image_data = self.current_image_data
+            self.image_io.current_image_affine = new_metadata.get("affine")
+            self.image_io.current_image_spacing = new_metadata.get("spacing")
+            self.image_io.current_image_origin = new_metadata.get("origin")
+            self.image_io.current_image_direction = new_metadata.get("direction")
+
+            spacing = new_metadata.get("spacing")
+            self.four_view.set_image_data(self.current_image_data, spacing)
+            self.four_view.set_label_data(self.current_label_data)
+            self._refresh_structure_from_current_labels()
+            self._sync_dual_windows_base_image(reset_labels=False, refresh_3d=False)
+            if self.last_doctor_label_data is not None and self.doctor_label_window is not None:
+                self.doctor_label_window.set_label_data(
+                    self.last_doctor_label_data,
+                    source_text=f"doctor_label_recent ({target_orientation})",
+                    refresh_3d=self.doctor_label_window.isVisible(),
+                )
+            if self.last_ai_label_data is not None and self.ai_label_window is not None:
+                self.ai_label_window.set_label_data(
+                    self.last_ai_label_data,
+                    source_text=f"ai_label_recent ({target_orientation})",
+                    refresh_3d=self.ai_label_window.isVisible(),
+                )
+
+            self.seed_points = []
+            self._update_seed_count()
+            self.redo_history.clear()
+            self.statusBar().showMessage(f"图像已重定向到 {target_orientation}")
+            QMessageBox.information(
+                self,
+                "完成",
+                f"重定向完成\n原方向: {current_orientation}\n目标方向: {target_orientation}\n"
+                f"原尺寸: {old_shape}\n新尺寸: {self.current_image_data.shape}",
+            )
+        except Exception as e:
+            self.statusBar().showMessage("图像重定向失败")
+            QMessageBox.critical(self, "错误", f"重定向图像失败:\n{e}")
+
+    def _load_doctor_label_for_accuracy_if_needed(self):
+        """Return cached doctor label for AI-vs-doctor accuracy evaluation.
+
+        量化分析按钮不再主动弹出文件选择器。医生标签应通过“加载标签”导入，
+        或在运行AI分割前保留/绘制在当前标签图层中；AI分割开始前会自动缓存该图层。
+        """
+        if self.current_image_data is None:
+            return None, "请先加载影像后再进行AI与医生标签匹配。"
+
+        label_data = getattr(self, "last_doctor_label_data", None)
+        if label_data is None:
+            return None, "未找到医生标签。请先通过“加载标签”导入医生标签，或在运行AI分割前保留/绘制人工标签。"
+
+        label_data = np.asarray(label_data).astype(np.uint8)
+        if label_data.shape != self.current_image_data.shape:
+            return (
+                None,
+                f"医生标签尺寸与当前影像不匹配：影像 {self.current_image_data.shape}，医生标签 {label_data.shape}。",
+            )
+
+        return label_data, None
 
     def _on_save_label(self):
         """保存标签"""
@@ -1563,8 +2145,28 @@ class MainWindow(QMainWindow):
 
     def _on_label_opacity_changed(self, value):
         """标签透明度改变"""
-        opacity = value / 100.0
+        self._pending_label_opacity = value / 100.0
         self.label_opacity_value_label.setText(f"{value}%")
+
+        # 拖动时合并高频重绘，避免滑块被三张切面图同步刷新拖慢。
+        if getattr(self.label_opacity_slider, "isSliderDown", lambda: False)():
+            if not self._label_opacity_timer.isActive():
+                self._label_opacity_timer.start()
+        else:
+            self._flush_label_opacity_update()
+
+    def _flush_label_opacity_update(self):
+        """立即应用最后一次标签透明度。"""
+        if hasattr(self, "_label_opacity_timer") and self._label_opacity_timer.isActive():
+            self._label_opacity_timer.stop()
+        self._apply_pending_label_opacity()
+
+    def _apply_pending_label_opacity(self):
+        """把待应用的标签透明度同步到三个2D视图。"""
+        opacity = float(getattr(self, "_pending_label_opacity", 0.5))
+        if abs(opacity - float(getattr(self, "_last_applied_label_opacity", -1.0))) < 0.001:
+            return
+        self._last_applied_label_opacity = opacity
 
         # 更新所有视图的标签透明度
         if hasattr(self.four_view, 'axial_view'):
@@ -1597,6 +2199,53 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"设置窗位时发生错误: {e}")
 
+    def _compute_robust_window(self, image_data):
+        """Compute a robust display window that keeps loaded images visible."""
+        arr = np.asarray(image_data, dtype=np.float32)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return 400.0, 40.0
+
+        p_low, p_high = np.percentile(arr, [0.5, 99.5])
+        if not np.isfinite(p_low) or not np.isfinite(p_high) or p_high <= p_low:
+            p_low = float(np.min(arr))
+            p_high = float(np.max(arr))
+
+        window_width = max(1.0, float(p_high - p_low))
+        window_level = float((p_high + p_low) / 2.0)
+        window_width = min(window_width, float(self.window_width_spin.maximum()))
+        window_level = max(
+            float(self.window_level_spin.minimum()),
+            min(float(self.window_level_spin.maximum()), window_level),
+        )
+        return window_width, window_level
+
+    def _apply_window_to_views(self, window_width, window_level):
+        """Apply window settings to all 2D viewers without changing data."""
+        self.window_width_spin.blockSignals(True)
+        self.window_level_spin.blockSignals(True)
+        try:
+            self.window_width_spin.setValue(float(window_width))
+            self.window_level_spin.setValue(float(window_level))
+        finally:
+            self.window_width_spin.blockSignals(False)
+            self.window_level_spin.blockSignals(False)
+
+        if hasattr(self.four_view, 'axial_view'):
+            self.four_view.axial_view.set_window(window_width, window_level)
+            self.four_view.coronal_view.set_window(window_width, window_level)
+            self.four_view.sagittal_view.set_window(window_width, window_level)
+
+    def _auto_window_loaded_image(self):
+        """Silently make newly loaded image data visible."""
+        if self.current_image_data is None:
+            return
+        try:
+            window_width, window_level = self._compute_robust_window(self.current_image_data)
+            self._apply_window_to_views(window_width, window_level)
+        except Exception as e:
+            print(f"自动设置加载影像窗宽窗位失败: {e}")
+
     def _on_auto_window(self):
         """自动计算窗宽窗位"""
         if self.current_image_data is None:
@@ -1604,26 +2253,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 计算图像的统计信息
-            img_data = self.current_image_data
-            min_val = np.min(img_data)
-            max_val = np.max(img_data)
-            mean_val = np.mean(img_data)
-            std_val = np.std(img_data)
-
-            # 自动计算窗宽窗位
-            window_width = std_val * 4  # 4倍标准差
-            window_level = mean_val
-
-            # 更新界面
-            self.window_width_spin.setValue(window_width)
-            self.window_level_spin.setValue(window_level)
-
-            # 应用到视图
-            if hasattr(self.four_view, 'axial_view'):
-                self.four_view.axial_view.set_window(window_width, window_level)
-                self.four_view.coronal_view.set_window(window_width, window_level)
-                self.four_view.sagittal_view.set_window(window_width, window_level)
+            window_width, window_level = self._compute_robust_window(self.current_image_data)
+            self._apply_window_to_views(window_width, window_level)
 
             QMessageBox.information(self, "成功",
                                     f"自动窗宽窗位已设置\n窗宽: {window_width:.1f}\n窗位: {window_level:.1f}")
@@ -1783,7 +2414,9 @@ class MainWindow(QMainWindow):
         if color.isValid():
             # 更新活动标签颜色
             color_str = color.name()
-            self.active_label_color_widget.setStyleSheet(f"background-color: {color_str}; border: 1px solid black;")
+            self.active_label_color_widget.setStyleSheet(
+                f"background-color: {color_str}; border: 1px solid #0b1220; border-radius: 4px;"
+            )
             # 更新视图中的标签颜色
             if hasattr(self.four_view, 'axial_view'):
                 self.four_view.axial_view.set_label_color(self.active_label_id, color_str)
@@ -1801,6 +2434,11 @@ class MainWindow(QMainWindow):
             return False
 
         try:
+            if self._structure_dirty:
+                self.statusBar().showMessage("正在更新血管结构识别...")
+                QApplication.processEvents()
+                self._refresh_structure_from_current_labels()
+
             spacing = self.current_metadata['spacing'] if (
                 self.current_metadata and 'spacing' in self.current_metadata
             ) else None
@@ -1833,7 +2471,9 @@ class MainWindow(QMainWindow):
             # 种子点依赖点击同步十字线，强制切到指针模式避免点了无效
             self._on_tool_selected('pointer')
             self.btn_add_seed.setText("✅ 种子点模式开启")
-            self.btn_add_seed.setStyleSheet("background-color: #d1fae5; color: #065f46;")
+            self.btn_add_seed.setStyleSheet(
+                "background-color: #1f6feb; color: #ffffff; border: 1px solid #58a6ff; border-radius: 6px;"
+            )
             self.statusBar().showMessage("种子点模式已开启：已切换到指针工具，请在三视图点击添加种子点", 5000)
         else:
             self.btn_add_seed.setText("➕ 添加种子点")
@@ -1857,13 +2497,13 @@ class MainWindow(QMainWindow):
         if self.seed_points is None:
             self.seed_points = []
         valid_seeds = []
-        sx, sy, sz = self.current_image_data.shape
+        h, w, d = self.current_image_data.shape
         for seed in self.seed_points:
             try:
                 x, y, z = int(seed[0]), int(seed[1]), int(seed[2])
             except Exception:
                 continue
-            if 0 <= x < sx and 0 <= y < sy and 0 <= z < sz:
+            if 0 <= x < w and 0 <= y < h and 0 <= z < d:
                 valid_seeds.append((x, y, z))
         # 去重保持顺序
         valid_seeds = list(dict.fromkeys(valid_seeds))
@@ -1894,11 +2534,15 @@ class MainWindow(QMainWindow):
         progress.show()
 
         # 后台线程执行，避免界面卡死
+        spacing = self.current_metadata['spacing'] if (
+            self.current_metadata and 'spacing' in self.current_metadata
+        ) else (1.0, 1.0, 1.0)
         worker = SegmentationWorker(
             algorithm=self.segmentation,
             image_data=self.current_image_data,
             seed_points=list(self.seed_points),
-            params=params
+            params=params,
+            spacing=spacing
         )
         self._segment_worker = worker
 
@@ -2010,6 +2654,19 @@ class MainWindow(QMainWindow):
             spacing = self.current_metadata['spacing'] if (
                 self.current_metadata and 'spacing' in self.current_metadata
             ) else (1.0, 1.0, 1.0)
+
+            # 若用户已经在当前图层加载/绘制了医生标签，AI分割会覆盖 current_label_data。
+            # 在覆盖前先缓存为 doctor label，后续“量化分析”即可直接与AI结果比对，
+            # 不再弹出文件选择器打断流程。
+            if previous_label is not None and np.any(previous_label > 0):
+                previous_is_last_ai = (
+                    self.last_ai_label_data is not None
+                    and np.asarray(self.last_ai_label_data).shape == previous_label.shape
+                    and np.array_equal(np.asarray(self.last_ai_label_data), previous_label)
+                )
+                if not previous_is_last_ai:
+                    self._set_doctor_compare_label(previous_label, source_text="AI分割前的医生/人工标签")
+
             mask = self.ai_interface.segment(
                 self.current_image_data,
                 spacing=spacing,
@@ -2017,6 +2674,26 @@ class MainWindow(QMainWindow):
             )
 
             if mask is not None:
+                if self.last_doctor_label_data is not None and self.last_doctor_label_data.shape == mask.shape:
+                    try:
+                        from quantitative_analysis import QuantitativeAnalyzer
+
+                        analyzer = QuantitativeAnalyzer()
+                        accuracy_check, aligned_mask = self._evaluate_accuracy_with_auto_alignment(
+                            analyzer,
+                            ai_label=mask,
+                            doctor_label=self.last_doctor_label_data,
+                            spacing=spacing,
+                        )
+                        if accuracy_check.get("auto_alignment_applied", False):
+                            mask = aligned_mask
+                            print(
+                                "AI标签方向自动修正: "
+                                f"{accuracy_check.get('applied_transform', {})}"
+                            )
+                    except Exception as align_exc:
+                        print(f"AI标签方向自动修正检查失败: {align_exc}")
+
                 # 更新当前标签数据
                 self.current_label_data = mask
                 # 更新视图
@@ -2153,6 +2830,7 @@ class MainWindow(QMainWindow):
                 # 传递spacing信息（如果可用）
                 spacing = metadata.get('spacing') if metadata else None
                 self.four_view.set_image_data(data, spacing)
+                self._auto_window_loaded_image()
 
                 # 初始化标签数据
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
@@ -2260,7 +2938,6 @@ class MainWindow(QMainWindow):
         # 重置所有工具按钮
         self.btn_pointer.setChecked(False)
         self.btn_zoom.setChecked(False)
-        self.btn_pan.setChecked(False)
         self.btn_brush.setChecked(False)
         self.btn_eraser.setChecked(False)
 
@@ -2272,8 +2949,6 @@ class MainWindow(QMainWindow):
             self.btn_pointer.setChecked(True)
         elif tool == 'zoom':
             self.btn_zoom.setChecked(True)
-        elif tool == 'pan':
-            self.btn_pan.setChecked(True)
         elif tool == 'brush':
             self.btn_brush.setChecked(True)
         elif tool == 'eraser':
@@ -2362,36 +3037,89 @@ class MainWindow(QMainWindow):
                 tumor_vessel_assessment
             )
 
-            # 显示分析结果
-            result_text = "量化分析结果:\n\n"
-            result_text += "肝脏体积分析:\n"
-            for key, value in volumes.items():
-                if key != 'total_liver':
-                    result_text += f"{key.replace('segment_', '段 ')}: {value:.2f} ml\n"
-            result_text += f"总体积: {volumes.get('total_liver', 0):.2f} ml\n\n"
+            # 显示分析结果（医生标签 vs AI标签）
+            segmentation_accuracy = None
+            segmentation_accuracy_note = None
+            doctor_label_for_eval = getattr(self, "last_doctor_label_data", None)
+            ai_label_for_eval = getattr(self, "last_ai_label_data", None)
 
-            result_text += "血管量化指标:\n"
-            for key, value in vascular_metrics.items():
-                if isinstance(value, float):
-                    result_text += f"{key}: {value:.2f}\n"
-                else:
-                    result_text += f"{key}: {value}\n"
+            current_label_candidate = None
+            if self.current_label_data is not None:
+                current_label_candidate = np.asarray(self.current_label_data).astype(np.uint8)
 
-            result_text += "\n肿瘤-血管距离评估:\n"
-            min_dist = tumor_vessel_assessment.get("min_distance", float("inf"))
-            mean_dist = tumor_vessel_assessment.get("mean_distance", float("inf"))
-            if np.isfinite(min_dist):
-                result_text += f"最小距离: {min_dist:.2f} mm\n"
-                result_text += f"平均距离: {mean_dist:.2f} mm\n"
+            # 量化分析不再弹出资源管理器。优先使用缓存的医生标签和AI标签；
+            # 若其中一个缺失，再尝试从当前可见标签图层推断另一个标签。
+            if current_label_candidate is not None and np.any(current_label_candidate > 0):
+                if (
+                    doctor_label_for_eval is None
+                    and ai_label_for_eval is not None
+                    and current_label_candidate.shape == np.asarray(ai_label_for_eval).shape
+                    and not np.array_equal(current_label_candidate, np.asarray(ai_label_for_eval).astype(np.uint8))
+                ):
+                    doctor_label_for_eval = current_label_candidate
+                    self._set_doctor_compare_label(doctor_label_for_eval, source_text="当前可见医生/人工标签")
+                elif (
+                    ai_label_for_eval is None
+                    and doctor_label_for_eval is not None
+                    and current_label_candidate.shape == np.asarray(doctor_label_for_eval).shape
+                    and not np.array_equal(current_label_candidate, np.asarray(doctor_label_for_eval).astype(np.uint8))
+                ):
+                    ai_label_for_eval = current_label_candidate
+                    self._set_ai_compare_label(ai_label_for_eval, source_text="当前可见AI标签")
+
+            if doctor_label_for_eval is None:
+                segmentation_accuracy_note = (
+                    "未找到医生标签。请先加载医生标签，或先在当前标签图层完成/保留人工标签后再运行AI分割。"
+                )
+            elif ai_label_for_eval is None:
+                segmentation_accuracy_note = "未找到AI自动分割标签。请先运行AI自动分割，或加载AI标签作为当前可见标签。"
             else:
-                result_text += "最小距离: 未知\n平均距离: 未知\n"
-            result_text += f"风险等级: {tumor_vessel_assessment.get('risk_level', '未知')}\n"
-            result_text += f"风险评分: {tumor_vessel_assessment.get('risk_score', 0)}\n"
+                doctor_arr = np.asarray(doctor_label_for_eval).astype(np.uint8)
+                ai_arr = np.asarray(ai_label_for_eval).astype(np.uint8)
+                if doctor_arr.shape != ai_arr.shape:
+                    segmentation_accuracy_note = (
+                        f"标签尺寸不匹配：医生标签 {doctor_arr.shape}，AI标签 {ai_arr.shape}。请先统一两者的方向和尺寸。"
+                    )
+                elif not np.any(doctor_arr > 0):
+                    segmentation_accuracy_note = "医生标签为空，无法计算匹配指标。"
+                elif not np.any(ai_arr > 0):
+                    segmentation_accuracy_note = "AI标签为空，无法计算匹配指标。"
+                else:
+                    try:
+                        segmentation_accuracy, aligned_ai_for_eval = self._evaluate_accuracy_with_auto_alignment(
+                            analyzer,
+                            ai_label=ai_arr,
+                            doctor_label=doctor_arr,
+                            spacing=spacing,
+                        )
+                        ai_label_for_eval = aligned_ai_for_eval
+                    except Exception as metric_exc:
+                        segmentation_accuracy_note = f"分割匹配指标计算失败：{metric_exc}"
 
-            result_text += "\n手术风险评估:\n"
-            result_text += f"整体风险: {risk_assessment.get('overall_risk', '未知')}\n"
-            result_text += f"建议: {risk_assessment.get('recommendation', '无')}\n"
+            result_lines = ["AI Segmentation Matching Results (Doctor vs AI):", ""]
+            if segmentation_accuracy is not None and segmentation_accuracy.get("status") == "ok":
+                overall = segmentation_accuracy.get("overall", {})
+                dice = float(overall.get("dice", 0.0))
+                hd95 = float(overall.get("hd95_mm", float("inf")))
+                jaccard = float(overall.get("jaccard", 0.0))
+                asd = float(overall.get("asd_mm", float("inf")))
+                final_match = float(
+                    segmentation_accuracy.get(
+                        "final_matching_degree_percent",
+                        overall.get("matching_degree_percent", overall.get("accuracy_percent", 0.0)),
+                    )
+                )
 
+                result_lines.append(f"Dice: {dice:.4f}")
+                result_lines.append(f"HD95: {hd95:.4f} mm" if np.isfinite(hd95) else "HD95: inf")
+                result_lines.append(f"Jaccard: {jaccard:.4f}")
+                result_lines.append(f"ASD: {asd:.4f} mm" if np.isfinite(asd) else "ASD: inf")
+                result_lines.append(f"Matching Degree (Accuracy): {final_match:.2f}%")
+            else:
+                result_lines.append("Unable to compute segmentation metrics.")
+                result_lines.append(f"Reason: {segmentation_accuracy_note or '医生标签或AI标签不可用。'}")
+
+            result_text = "\n".join(result_lines)
             self._show_long_text_dialog("量化分析结果", result_text)
 
             # 保存分析结果
@@ -2400,7 +3128,8 @@ class MainWindow(QMainWindow):
                 'vascular_metrics': vascular_metrics,
                 'tumor_vessel_assessment': tumor_vessel_assessment,
                 'risk_assessment': risk_assessment,
-                'couinaud_segmentation': segmentation.astype(np.uint8)
+                'couinaud_segmentation': segmentation.astype(np.uint8),
+                'segmentation_accuracy': segmentation_accuracy,
             }
             if getattr(self, 'last_cut_stats', None):
                 self.quantitative_results['cut_stats'] = self.last_cut_stats
@@ -2721,24 +3450,16 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 计算z坐标
-            z = 0
-            if view_type == 'axial':
-                if hasattr(self.four_view, 'axial_view'):
-                    z = self.four_view.axial_view.current_slice
-            elif view_type == 'coronal':
-                if hasattr(self.four_view, 'coronal_view'):
-                    z = self.four_view.coronal_view.current_slice
-            elif view_type == 'sagittal':
-                if hasattr(self.four_view, 'sagittal_view'):
-                    z = self.four_view.sagittal_view.current_slice
+            if hasattr(self, 'four_view') and hasattr(self.four_view, '_current_voxel'):
+                vx, vy, vz = self.four_view._current_voxel()
+            else:
+                vx = int(self.four_view.sagittal_view.current_slice)
+                vy = int(self.four_view.coronal_view.current_slice)
+                vz = int(self.four_view.axial_view.current_slice)
 
             # 种子点模式：点击三视图时记录当前3D十字准心对应体素
             if self.seed_mode_enabled and hasattr(self, 'four_view'):
                 try:
-                    vx = int(self.four_view.sagittal_view.current_slice)
-                    vy = int(self.four_view.coronal_view.current_slice)
-                    vz = int(self.four_view.axial_view.current_slice)
                     seed = (vx, vy, vz)
                     # 去重+轻微防抖
                     if seed != self._last_seed and seed not in self.seed_points:
@@ -2750,19 +3471,18 @@ class MainWindow(QMainWindow):
                     pass
 
             # 更新光标位置标签
-            self.cursor_pos_label.setText(f"位置 (x,y,z): ({int(x)}, {int(y)}, {int(z)})")
+            self.cursor_pos_label.setText(f"位置 (x,y,z): ({int(vx)}, {int(vy)}, {int(vz)})")
 
             # 更新光标下的强度值
-            if (0 <= x < self.current_image_data.shape[0] and
-                    0 <= y < self.current_image_data.shape[1] and
-                    0 <= z < self.current_image_data.shape[2]):
-                intensity = self.current_image_data[int(x), int(y), int(z)]
+            h, w, d = self.current_image_data.shape
+            if 0 <= vx < w and 0 <= vy < h and 0 <= vz < d:
+                intensity = self.current_image_data[int(vy), int(vx), int(vz)]
                 self.cursor_intensity_value_label.setText(f"  强度: {intensity:.1f}")
                 self.cursor_layer_label.setText(f"  图层: 影像")
 
                 # 更新光标下的标签值
                 if self.current_label_data is not None:
-                    label_value = self.current_label_data[int(x), int(y), int(z)]
+                    label_value = self.current_label_data[int(vy), int(vx), int(vz)]
                     self.cursor_label_value_label.setText(f"  标签: {label_value}")
                 else:
                     self.cursor_label_value_label.setText("  标签: --")
@@ -2775,25 +3495,14 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # 获取当前十字准线位置
-            if hasattr(self.four_view, 'axial_view'):
-                axial_slice = self.four_view.axial_view.current_slice
-                coronal_slice = self.four_view.coronal_view.current_slice
-                sagittal_slice = self.four_view.sagittal_view.current_slice
-
-                # 根据变化的视图更新其他视图
-                if view == 'axial':
-                    # 轴位切片变化，更新冠状位和矢状位的十字准线
-                    self.four_view.coronal_view.set_slice(axial_slice)
-                    self.four_view.sagittal_view.set_slice(axial_slice)
-                elif view == 'coronal':
-                    # 冠状位切片变化，更新轴位和矢状位的十字准线
-                    self.four_view.axial_view.set_slice(coronal_slice)
-                    self.four_view.sagittal_view.set_slice(coronal_slice)
-                elif view == 'sagittal':
-                    # 矢状位切片变化，更新轴位和冠状位的十字准线
-                    self.four_view.axial_view.set_slice(sagittal_slice)
-                    self.four_view.coronal_view.set_slice(sagittal_slice)
+            # 仅更新状态显示，不在此处反向 set_slice。
+            # 三视图联动由 FourViewWidget._update_views_from_voxel 统一管理，
+            # 否则会在滚轮翻页时把 x/y/z 互相覆盖，导致节点位置漂移。
+            if hasattr(self, 'four_view') and hasattr(self.four_view, 'axial_view'):
+                vx = int(self.four_view.sagittal_view.current_slice)
+                vy = int(self.four_view.coronal_view.current_slice)
+                vz = int(self.four_view.axial_view.current_slice)
+                self.cursor_pos_label.setText(f"位置 (x,y,z): ({vx}, {vy}, {vz})")
         except Exception as e:
             print(f"更新切片时发生错误: {e}")
 
@@ -2829,6 +3538,7 @@ class MainWindow(QMainWindow):
 
     def _reset_analysis_state(self):
         """在新病例/清空标签时重置AI结构分析和切割状态。"""
+        self._structure_dirty = False
         self.last_vessel_analysis = {}
         self.last_cut_stats = {}
         if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
@@ -2860,6 +3570,7 @@ class MainWindow(QMainWindow):
                 self.four_view.view_3d.set_structure_data(
                     self.last_vessel_analysis.get("structure_map")
                 )
+            self._structure_dirty = False
         except Exception as e:
             print(f"基于标签更新结构识别失败: {e}")
 
@@ -2943,6 +3654,7 @@ class MainWindow(QMainWindow):
                     # 传递spacing信息（如果可用）
                     spacing = metadata.get('spacing') if metadata else None
                     self.four_view.set_image_data(data, spacing)
+                    self._auto_window_loaded_image()
 
                     # 初始化标签数据
                     self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
@@ -3092,10 +3804,16 @@ class MainWindow(QMainWindow):
             # 传递 spacing
             spacing = metadata.get('spacing') if metadata else None
             self.four_view.set_image_data(data, spacing)
+            self._auto_window_loaded_image()
 
             # 2. 加载 Mask
             if os.path.exists(mask_path):
-                mask_data = self.image_io.load_label_map(mask_path)
+                mask_data = self.image_io.load_label_map(
+                    mask_path,
+                    reference_metadata=metadata,
+                    reference_shape=data.shape,
+                    force_align=False,
+                )
                 if mask_data is not None:
                     # 确保尺寸匹配
                     if mask_data.shape == data.shape:
@@ -3294,6 +4012,7 @@ class MainWindow(QMainWindow):
             # 传递spacing信息（如果可用）
             spacing = metadata.get('spacing') if metadata else None
             self.four_view.set_image_data(data, spacing)
+            self._auto_window_loaded_image()
             # 初始化标签数据
             self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
             self.four_view.set_label_data(self.current_label_data)
@@ -3352,6 +4071,7 @@ class MainWindow(QMainWindow):
 
                 spacing = metadata.get('spacing') if metadata else None
                 self.four_view.set_image_data(data, spacing)
+                self._auto_window_loaded_image()
 
                 self.current_label_data = np.zeros(data.shape, dtype=np.uint8)
                 self.four_view.set_label_data(self.current_label_data)

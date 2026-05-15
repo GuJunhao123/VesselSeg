@@ -8,6 +8,7 @@
 import sys
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
 from ui_layout import MainWindow
 
 def _force_window_visible(app: QApplication, window: MainWindow) -> None:
@@ -52,8 +53,10 @@ def main():
 
     # 创建应用程序
     app = QApplication(sys.argv)
-    app.setApplicationName("医学影像分割软件")
+    app.setApplicationName("VesselSeg 医学影像分割工作站")
     app.setOrganizationName("MedicalImageSegmentation")
+    app.setStyle("Fusion")
+    app.setFont(QFont("Microsoft YaHei UI", 10))
 
     # 创建主窗口
     window = MainWindow()

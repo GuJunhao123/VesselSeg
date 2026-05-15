@@ -66,12 +66,44 @@ class AISegmentationInterface:
         # - fast: 速度优先
         speed_profile = str(os.environ.get("VESSELSEG_SPEED_PROFILE", "quality")).strip().lower()
         self.speed_profile = speed_profile if speed_profile in ("quality", "fast") else "quality"
+        postprocess_profile = str(os.environ.get("VESSELSEG_POSTPROCESS_PROFILE", "")).strip().lower()
+        if not postprocess_profile:
+            postprocess_profile = "balanced"
+        self.postprocess_profile = postprocess_profile if postprocess_profile in ("clean", "balanced", "recall") else "balanced"
+        if self.postprocess_profile == "clean":
+            self.cleanup_min_retain_ratio = 0.40
+            self.final_min_retain_ratio = 0.60
+            self.prune_min_retain_ratio = 0.0
+            self.primary_max_components = 3
+            self.primary_min_ratio = 0.12
+            self.primary_min_voxels = 120
+            self.auto_volume_weight = 0.20
+        elif self.postprocess_profile == "balanced":
+            self.cleanup_min_retain_ratio = 0.45
+            self.final_min_retain_ratio = 0.55
+            self.prune_min_retain_ratio = 0.60
+            self.primary_max_components = 3
+            self.primary_min_ratio = 0.10
+            self.primary_min_voxels = 120
+            self.auto_volume_weight = 0.20
+        else:
+            self.cleanup_min_retain_ratio = 0.78
+            self.final_min_retain_ratio = 0.88
+            self.prune_min_retain_ratio = 0.94
+            self.primary_max_components = 5
+            self.primary_min_ratio = 0.06
+            self.primary_min_voxels = 80
+            self.auto_volume_weight = 0.45
+        default_fragment_level = "conservative" if self.postprocess_profile == "recall" else "balanced"
+        fragment_level = os.environ.get("VESSELSEG_FRAGMENT_CLEAN_LEVEL", default_fragment_level)
+        self.fragment_clean_level = str(fragment_level).strip().lower()
         default_infer_mode = "stable" if self.speed_profile == "fast" else "auto"
         # PyTorch推理模式：auto(stable+legacy融合) / stable / legacy
         infer_mode = os.environ.get("VESSELSEG_PYTORCH_INFER_MODE", default_infer_mode)
         self.pytorch_infer_mode = str(infer_mode).strip().lower() if infer_mode is not None else default_infer_mode
-        # 启用ROI聚焦推理，降低全腹部假阳性碎片
-        roi_flag = os.environ.get("VESSELSEG_ROI_FOCUS", "1")
+        # 质量模式默认全图推理，避免 ROI 裁剪漏掉远端血管分支；fast 模式才默认启用 ROI。
+        default_roi_focus = "1" if self.speed_profile == "fast" else "0"
+        roi_flag = os.environ.get("VESSELSEG_ROI_FOCUS", default_roi_focus)
         self.roi_focus_enabled = str(roi_flag).strip().lower() not in ("0", "false", "off", "no")
         # 稳定路径默认启用1mm各向同性重采样，降低厚层扫描带来的条带碎片
         iso_flag = os.environ.get("VESSELSEG_STABLE_ISO", "1")
@@ -99,6 +131,30 @@ class AISegmentationInterface:
             self.sw_batch_size = 2 if torch.cuda.is_available() else 1
         amp_flag = os.environ.get("VESSELSEG_USE_AMP", "1")
         self.use_amp = str(amp_flag).strip().lower() not in ("0", "false", "off", "no")
+        # 召回增强会把低置信度血管候选救回来；它能减少漏分，但也容易制造假阳性。
+        # 默认只在显式 recall 模式启用，平衡/清理模式优先保证与医生标签的主体一致性。
+        default_recall_boost = "1" if self.postprocess_profile == "recall" else "0"
+        recall_flag = os.environ.get("VESSELSEG_RECALL_BOOST", default_recall_boost)
+        self.recall_boost_enabled = str(recall_flag).strip().lower() not in ("0", "false", "off", "no")
+        default_recall_profile = "aggressive" if self.postprocess_profile == "recall" else "balanced"
+        recall_profile = str(os.environ.get("VESSELSEG_RECALL_PROFILE", default_recall_profile)).strip().lower()
+        self.recall_profile = recall_profile if recall_profile in ("conservative", "balanced", "aggressive") else "balanced"
+        recall_defaults = {
+            "conservative": (0.40, -0.03),
+            "balanced": (0.33, -0.10),
+            "aggressive": (0.28, -0.18),
+        }
+        default_prob, default_margin = recall_defaults[self.recall_profile]
+        try:
+            self.recall_min_vessel_prob = float(os.environ.get("VESSELSEG_RECALL_MIN_PROB", default_prob))
+        except Exception:
+            self.recall_min_vessel_prob = default_prob
+        try:
+            self.recall_bg_margin = float(os.environ.get("VESSELSEG_RECALL_BG_MARGIN", default_margin))
+        except Exception:
+            self.recall_bg_margin = default_margin
+        self.recall_min_vessel_prob = float(min(0.75, max(0.05, self.recall_min_vessel_prob)))
+        self.recall_bg_margin = float(min(0.50, max(-0.60, self.recall_bg_margin)))
         # 保存最近一次血管结构分析结果
         self.last_vessel_analysis: Dict[str, Any] = {}
     
@@ -576,6 +632,24 @@ class AISegmentationInterface:
             union_sizes[0] = 0
             sorted_ids = np.argsort(union_sizes)[::-1]
             largest = int(union_sizes[sorted_ids[0]]) if sorted_ids.size > 0 else 0
+            if self.postprocess_profile == "recall":
+                max_union_components = max(3, self.primary_max_components)
+                union_min_voxels = 300
+                union_min_ratio = 0.06
+                union_near_mm = 70.0
+                union_span_factor = 0.85
+            elif self.postprocess_profile == "balanced":
+                max_union_components = max(2, self.primary_max_components)
+                union_min_voxels = 800
+                union_min_ratio = 0.14
+                union_near_mm = 55.0
+                union_span_factor = 0.70
+            else:
+                max_union_components = 2
+                union_min_voxels = 1500
+                union_min_ratio = 0.28
+                union_near_mm = 45.0
+                union_span_factor = 0.60
 
             keep_union_ids = []
             first_centroid_mm = None
@@ -598,7 +672,10 @@ class AISegmentationInterface:
                     continue
 
                 # 第二大连通域需足够大且与主体空间邻近，避免保留远处整块假阳性
-                if len(keep_union_ids) < 2 and size >= max(1500, int(0.28 * largest)):
+                if (
+                    len(keep_union_ids) < max_union_components
+                    and size >= max(union_min_voxels, int(union_min_ratio * largest))
+                ):
                     near_main = False
                     coords = np.argwhere(union_comp == cid)
                     if coords.size > 0 and first_centroid_mm is not None and first_span_mm is not None:
@@ -606,10 +683,12 @@ class AISegmentationInterface:
                         centroid_mm = np.array([centroid[0] * sx, centroid[1] * sy, centroid[2] * sz], dtype=np.float64)
                         dist_mm = float(np.linalg.norm(centroid_mm - first_centroid_mm))
                         ref_mm = float(np.linalg.norm(first_span_mm))
-                        max_allow_mm = max(45.0, 0.60 * ref_mm)
+                        max_allow_mm = max(union_near_mm, union_span_factor * ref_mm)
                         near_main = dist_mm <= max_allow_mm
                     if near_main:
                         keep_union_ids.append(int(cid))
+                        continue
+                    if self.postprocess_profile != "clean":
                         continue
                 break
 
@@ -649,7 +728,12 @@ class AISegmentationInterface:
                 max_span = int(span.max())
 
                 # 过滤“单层薄片”类伪阳性：很扁且体素数不大
-                if min_span <= 2 and max_span >= 18 and size < max(4000, int(0.05 * largest)):
+                thin_limit = max(4000, int(0.05 * largest))
+                if self.postprocess_profile == "recall":
+                    thin_limit = max(250, int(0.015 * largest))
+                elif self.postprocess_profile == "balanced":
+                    thin_limit = max(1200, int(0.03 * largest))
+                if min_span <= 2 and max_span >= 18 and size < thin_limit:
                     continue
 
                 if not keep_ids:
@@ -657,7 +741,10 @@ class AISegmentationInterface:
                     continue
 
                 # 额外保留次级主分支（足够大）
-                if len(keep_ids) < 2 and size >= max(500, int(0.2 * largest)):
+                if (
+                    len(keep_ids) < self.primary_max_components
+                    and size >= max(self.primary_min_voxels, int(self.primary_min_ratio * largest))
+                ):
                     keep_ids.append(int(cid))
                     continue
 
@@ -741,6 +828,90 @@ class AISegmentationInterface:
 
         return out
 
+    def _keep_primary_union_components(
+        self,
+        mask: np.ndarray,
+        max_components: int = 1,
+        min_ratio: float = 0.12,
+        min_voxels: int = 500,
+    ) -> np.ndarray:
+        """在PV/HV联合血管上保留主体连通树，用于去掉远端假阳性碎片。"""
+        from scipy import ndimage
+
+        if mask is None or mask.ndim != 3:
+            return mask
+
+        vessel = mask > 0
+        if not np.any(vessel):
+            return mask
+
+        structure = ndimage.generate_binary_structure(3, 2)
+        comp, n_comp = ndimage.label(vessel, structure=structure)
+        if n_comp <= max(1, int(max_components)):
+            return mask.astype(np.uint8)
+
+        sizes = np.bincount(comp.ravel())
+        sizes[0] = 0
+        ids = np.argsort(sizes)[::-1]
+        largest = int(sizes[ids[0]]) if ids.size > 0 and ids[0] != 0 else 0
+        if largest <= 0:
+            return mask.astype(np.uint8)
+
+        keep_ids = []
+        for cid in ids:
+            if cid == 0:
+                continue
+            size = int(sizes[cid])
+            if size <= 0:
+                continue
+
+            if not keep_ids:
+                keep_ids.append(int(cid))
+                continue
+
+            if (
+                len(keep_ids) < max(1, int(max_components))
+                and size >= max(int(min_voxels), int(float(min_ratio) * largest))
+            ):
+                keep_ids.append(int(cid))
+
+        if not keep_ids:
+            return mask.astype(np.uint8)
+
+        out = np.zeros_like(mask, dtype=np.uint8)
+        keep = np.isin(comp, keep_ids)
+        out[keep] = mask[keep]
+        return out
+
+    def _retains_enough_label_volume(
+        self,
+        before_mask: np.ndarray,
+        after_mask: np.ndarray,
+        min_ratio: float,
+        min_voxels: int = 250,
+        context: str = "后处理",
+    ) -> bool:
+        """保护真实小分支，避免清理步骤把标签体素裁得过多。"""
+        if min_ratio <= 0.0:
+            return True
+        if before_mask is None or after_mask is None:
+            return True
+
+        for label in (1, 2):
+            before = int(np.sum(before_mask == label))
+            after = int(np.sum(after_mask == label))
+            if before < int(min_voxels):
+                continue
+            if after < int(min_ratio * before):
+                print(
+                    f"{context}触发召回保护: label={label}, "
+                    f"before={before}, after={after}, "
+                    f"retain={after / max(before, 1):.3f}, "
+                    f"min={min_ratio:.2f}"
+                )
+                return False
+        return True
+
     def _prune_far_small_fragments(
         self,
         mask: np.ndarray,
@@ -763,7 +934,7 @@ class AISegmentationInterface:
         spacing_mm = (sx, sy, sz)
         structure = ndimage.generate_binary_structure(3, 2)
         out = np.copy(mask).astype(np.uint8)
-        level = str(os.environ.get("VESSELSEG_FRAGMENT_CLEAN_LEVEL", "balanced")).strip().lower()
+        level = str(getattr(self, "fragment_clean_level", "balanced")).strip().lower()
         is_aggressive = level in ("aggressive", "high", "2")
         is_conservative = level in ("conservative", "low", "0")
 
@@ -1015,6 +1186,39 @@ class AISegmentationInterface:
             raise RuntimeError(f"模型输出维度异常: {tuple(logits.shape)}")
         return logits
 
+    def _logits_to_label(self, logits: "torch.Tensor") -> "torch.Tensor":
+        """把 logits 转为标签；可选召回增强，减少血管漏分。"""
+        probs = torch.softmax(logits.float(), dim=1)
+        pred_label = torch.argmax(probs, dim=1)
+        if (
+            not self.recall_boost_enabled
+            or probs.shape[1] < 3
+            or self.recall_min_vessel_prob <= 0.0
+        ):
+            return pred_label
+
+        vessel_probs = probs[:, 1:3]
+        vessel_prob, vessel_idx = torch.max(vessel_probs, dim=1)
+        bg_prob = probs[:, 0]
+        rescue_mask = (
+            (pred_label == 0)
+            & (vessel_prob >= float(self.recall_min_vessel_prob))
+            & ((vessel_prob - bg_prob) >= float(self.recall_bg_margin))
+        )
+        rescued = int(rescue_mask.sum().item())
+        if rescued <= 0:
+            return pred_label
+
+        boosted = pred_label.clone()
+        boosted[rescue_mask] = vessel_idx[rescue_mask] + 1
+        print(
+            f"recall boost: rescued={rescued}, "
+            f"profile={self.recall_profile}, "
+            f"min_prob={self.recall_min_vessel_prob:.2f}, "
+            f"bg_margin={self.recall_bg_margin:.2f}"
+        )
+        return boosted
+
     def _run_pytorch_infer_once(
         self,
         inferer: "SlidingWindowInferer",
@@ -1035,7 +1239,7 @@ class AISegmentationInterface:
                 finite_ok = bool(torch.isfinite(logits).all().item())
                 if not finite_ok:
                     raise RuntimeError("logits含NaN/Inf")
-                pred_label = torch.argmax(logits, dim=1).to(dtype=torch.uint8).cpu().numpy()
+                pred_label = self._logits_to_label(logits).to(dtype=torch.uint8).cpu().numpy()
         return pred_label
 
     def _infer_pred_with_guard(
@@ -1145,6 +1349,8 @@ class AISegmentationInterface:
             if self.roi_focus_enabled
             else (slice(0, original_shape[0]), slice(0, original_shape[1]), slice(0, original_shape[2]))
         )
+        roi_shape = tuple(int(s.stop - s.start) for s in roi_slices)
+        print(f"stable ROI focus={self.roi_focus_enabled}, roi_shape={roi_shape}, full_shape={original_shape}")
         image_roi = np.asarray(image_data[roi_slices], dtype=np.float32)
         input_arr, swapped_xy = self._prepare_stable_infer_input(image_roi, metadata)
 
@@ -1362,13 +1568,15 @@ class AISegmentationInterface:
                         keep |= cmask
                         continue
 
-                    # 次级大分支：仅在距离主体不远时保留
-                    if size >= max(240, int(0.12 * max(largest, 1))):
+                    # 次级大分支：放宽保留，避免 stable/legacy 融合时误删真实远端分支。
+                    if size >= max(160, int(0.05 * max(largest, 1))):
                         if dist_to_core is None:
                             keep |= cmask
                         else:
                             min_dist = float(dist_to_core[cmask].min()) if np.any(cmask) else 1e9
-                            if min_dist <= max(spacing_mm) * 8.0:
+                            if min_dist <= max(35.0, max(spacing_mm) * 12.0):
+                                keep |= cmask
+                            elif size >= max(600, int(0.18 * max(largest, 1))):
                                 keep |= cmask
 
             if not np.any(keep):
@@ -1499,6 +1707,16 @@ class AISegmentationInterface:
 
             if n_comp >= 10 or largest_ratio < 0.55:
                 candidates = []
+                severe_fragmented = n_comp >= 10 or largest_ratio < 0.45
+
+                main_tree_mask = self._keep_primary_union_components(
+                    mask,
+                    max_components=1 if self.postprocess_profile != "recall" else 2,
+                    min_ratio=0.16 if self.postprocess_profile == "clean" else 0.12,
+                    min_voxels=600 if self.postprocess_profile == "clean" else 450,
+                )
+                if np.any(main_tree_mask > 0):
+                    candidates.append(("main_tree", main_tree_mask))
 
                 cleaned_mask = self._cleanup_fragmented_vessels(mask, spacing=spacing)
                 if np.any(cleaned_mask > 0):
@@ -1506,31 +1724,37 @@ class AISegmentationInterface:
 
                 primary_mask = self._keep_primary_components_per_label(
                     cleaned_mask if np.any(cleaned_mask > 0) else mask,
-                    max_components=2,
-                    min_ratio=0.20,
-                    min_voxels=140,
+                    max_components=self.primary_max_components,
+                    min_ratio=self.primary_min_ratio,
+                    min_voxels=self.primary_min_voxels,
                 )
                 if np.any(primary_mask > 0):
                     candidates.append(("primary", primary_mask))
 
                 best_name = None
                 best_mask = None
-                best_score = float(q_before["score"])
+                before_vox = max(float(q_before["voxels"]), 1.0)
+                best_score = float(q_before["score"]) + self.auto_volume_weight
 
                 for name, cand in candidates:
-                    accept = True
-                    for label in (1, 2):
-                        before = int(np.sum(mask == label))
-                        after = int(np.sum(cand == label))
-                        if before >= 250 and after < int(0.40 * before):
-                            accept = False
-                            break
-                    if not accept:
+                    min_retain = self.cleanup_min_retain_ratio
+                    if severe_fragmented and name in ("main_tree", "cleaned", "primary"):
+                        # 严重碎片化时，很多被删除体素本身就是假阳性；此时不能用过高的
+                        # 体素保留率阻止清理，否则会把远端假阳性原样留下。
+                        min_retain = min(min_retain, 0.45 if self.postprocess_profile != "recall" else 0.65)
+                    if not self._retains_enough_label_volume(
+                        mask,
+                        cand,
+                        min_retain,
+                        context=f"自动去碎片候选{name}",
+                    ):
                         continue
 
                     q = self._evaluate_mask_quality(cand)
-                    if float(q["score"]) > best_score:
-                        best_score = float(q["score"])
+                    retain_bonus = min(1.0, float(q["voxels"]) / before_vox)
+                    score = float(q["score"]) + self.auto_volume_weight * retain_bonus
+                    if score > best_score:
+                        best_score = score
                         best_name = name
                         best_mask = cand
 
@@ -1583,19 +1807,17 @@ class AISegmentationInterface:
             if int(q_final["components"]) >= 8 or float(q_final["largest_ratio"]) < 0.55:
                 primary_final = self._keep_primary_components_per_label(
                     mask,
-                    max_components=1,
-                    min_ratio=0.28,
-                    min_voxels=220,
+                    max_components=self.primary_max_components,
+                    min_ratio=self.primary_min_ratio,
+                    min_voxels=self.primary_min_voxels,
                 )
                 if np.any(primary_final > 0):
-                    accept = True
-                    for label in (1, 2):
-                        before = int(np.sum(mask == label))
-                        after = int(np.sum(primary_final == label))
-                        if before >= 250 and after < int(0.45 * before):
-                            accept = False
-                            break
-                    if accept:
+                    if self._retains_enough_label_volume(
+                        mask,
+                        primary_final,
+                        self.final_min_retain_ratio,
+                        context="最终形态收敛",
+                    ):
                         mask = primary_final
                         q2 = self._evaluate_mask_quality(mask)
                         print(
@@ -1612,7 +1834,15 @@ class AISegmentationInterface:
                 before = self._evaluate_mask_quality(mask)
                 after = self._evaluate_mask_quality(pruned)
                 # 仅在连通性不变差时接受
-                if after["score"] >= before["score"] - 0.02:
+                if (
+                    after["score"] >= before["score"] - 0.02
+                    and self._retains_enough_label_volume(
+                        mask,
+                        pruned,
+                        self.prune_min_retain_ratio,
+                        context="远离碎片清理",
+                    )
+                ):
                     mask = pruned
                     print(
                         f"远离碎片清理后: components={int(after['components'])}, "
@@ -1687,7 +1917,8 @@ class AISegmentationInterface:
                 print(
                     f"使用参数: 模型变体={self.model_variant}, "
                     f"血管分解方法={self.decomposition_method}, 推理模式={infer_mode}, "
-                    f"速度预设={self.speed_profile}"
+                    f"速度预设={self.speed_profile}, 后处理={self.postprocess_profile}, "
+                    f"召回={self.recall_profile}"
                 )
 
                 if infer_mode == "legacy":
@@ -1767,8 +1998,8 @@ class AISegmentationInterface:
                     best_name = None
                     best_score = -1e9
                     for name, quality in candidate_quality.items():
-                        # 轻微偏好体素更完整的结果，避免“过瘦主干”
-                        score = quality["score"] + 0.20 * (quality["voxels"] / max_vox)
+                        # 质量模式更偏向完整体素量，避免自动选择“过瘦主干”。
+                        score = quality["score"] + self.auto_volume_weight * (quality["voxels"] / max_vox)
                         if score > best_score:
                             best_score = score
                             best_name = name

@@ -1,0 +1,463 @@
+
+
+===== PAGE 1 =====
+Anatomical Hierarchical Decomposition for
+Hepatic Vessel Segmentation
+Anonymized Authors
+Anonymized Affiliations
+email@anonymized.com
+Abstract.Accurate segmentation of hepatic and portal veins is critical
+for planning liver resections and guiding surgical interventions. Stan-
+dard voxel-wise methods often struggle with extreme variations in ves-
+sel scale and complex topologies, which frequently leads to fragmented
+branches and ambiguous bifurcations. We address these issues through
+a hierarchical framework that treats vascular segmentation as a task
+of structured anatomical decomposition. By integrating geometric reg-
+ularization with hierarchical modeling, our approach captures vascular
+organization and leverages anatomical priors inherent in hepatic struc-
+tures. Specifically, the Adaptive Anatomical Hierarchy Decomposition
+(AAHD) module partitions the vessel tree into trunks, small branches,
+and junctions to guide feature learning based on anatomical structure.
+In parallel, the Topology-Guided Feature Refinement (TGFR) module
+incorporates junction-specific information into the main segmentation
+stream to improve connectivity at bifurcations. A Hierarchical Anatomi-
+cal Consistency Loss (HACL) is further employed to enforce spatial rela-
+tionships between trunk, branch, and junction components while main-
+taining structural consistency within each vascular system. Experiments
+on public benchmarks indicate that our framework outperforms current
+state-of-the-art methods, particularly when segmenting sub-millimeter
+branches and maintaining bifurcation integrity. Beyond standard overlap
+metrics, our method demonstrates superior topological robustness and
+cross-dataset generalization. This backbone-agnostic paradigm enhances
+structural coherence in existing architectures with negligible parameter
+overhead.
+Keywords:Liver vessel segmentation·Anatomical prior·Multi-object
+segmentation
+1 Introduction
+Accurate segmentation of hepatic vessels from enhanced computed tomography
+(CT) is essential for assessing tumor resectability, performing living-donor liver
+transplantation, and planning anatomic resections [20,3,18]. The liver consists
+of two anatomically distinct vascular systems, namely the hepatic veins (HV)
+and portal veins (PV), which must be precisely separated to define Couinaud
+functional segments and safe resection margins [7,11]. However, achieving such
+
+===== PAGE 2 =====
+2 Anonymized Author et al.
+precision remains a significant challenge due to the intricate morphological char-
+acteristics of the liver’s circulatory network [12].
+This difficulty stems from the fact that hepatic vasculature is organized
+hierarchically with significant scale variations, ranging from major trunks to
+sub-millimeter branches [21]. This complexity, combined with sharp geometric
+changes at bifurcations and low contrast against the liver parenchyma, makes
+accurate prediction difficult. Effective models must maintain connectivity within
+each vessel tree while ensuring anatomical exclusivity between different systems
+[15]. Although deep networks achieve high voxel-wise overlap, they often fail to
+capture hierarchical anatomical roles because these properties are typically only
+weakly constrained during training.
+Traditional techniques like vesselness filtering [4], active contours, and center-
+line tracking [13] are noise-sensitive and frequently miss distal branches. While
+deep learning models have evolved from U-Net [19] to self-configuring frame-
+works like nnU-Net [8], and more recent works have explored topology-aware
+objectives [27,22,14], state-of-the-art models still struggle to preserve structural
+integrity. In particular, peripheral discontinuities and scale ambiguity persist
+because current methods rarely integrate hierarchical anatomical roles directly
+into feature refinement [10,17] or structural regularization [1,26].
+Considering the hierarchical topology of hepatic vessels, an anatomically con-
+sistent hierarchical decomposition strategy is proposed for structural vessel seg-
+mentation. Specifically, we partition vessels into trunk, branch, and junction
+components via adaptive thresholding for supervision by anatomical role. Fea-
+tures are refined through asymmetric gating driven by topology, while structural
+separation is enforced by a hierarchical consistency loss incorporating orthogo-
+nality and exclusion penalties. By embedding anatomical priors as differentiable
+constraints, this paradigm effectively mitigates scale-related artifacts and en-
+hances the robustness of bifurcations. The key contributions are summarized as
+follows:
+1. Based on vascular branching priors, our hierarchical factorization into trunk,
+branch, and junction roles prevents optimization issues caused by scale dif-
+ferences and provides a geometric guide to resolve topological gaps;
+2. Topology-guided refinement is achieved through junction-sensitive gating,
+while a hierarchical anatomical consistency loss enforces residual relation-
+ships and inter-role constraints;
+3. Extensive experiments on public benchmarks show that our method im-
+proves the preservation of fine branches and generalizes well across different
+datasets.
+2 Method
+This work introduces a hierarchical decomposition strategy to encode anatomical
+organization as differentiable constraints. The systematic integration of these
+components is shown in Fig. 1. By partitioning vessels into functional roles and
+refining features via topology-driven mechanisms, the model preserves structural
+
+===== PAGE 3 =====
+Anatomical Hierarchical Decomposition for Hepatic Vessel Segmentation 3
+Topology
+Gate
+U-Net Backbone
+Lglobal
+Final Pred
+Small Seg
+Trunk Seg
+Trunk
+Head
+Small
+Head
+Junction
+Head
+Structural Role Heads
+Conv 3D
+GN
+ReLU
+Conv 3D
+CT Volume
+Trunk GT
+Small GT
+Junction GT
+Otsu Criterion
+SmallTrunk (dilated)
+Label
+Auxiliary
+Decoder
+Junction Seg
+Global
+Head
+Ltrunk
+Lsmall
+Ljunc
+Loss
+Auxiliary Decoder
+Conv 3D Dilated
+Conv
+Role Head Topology Gate
+Lexclusivity
+Lcontainment
+Lorthogonal
+Regularizers
+(c) Hierarchical Anatomical
+Consistency Loss(a) Adaptive Anatomical
+Hierarchy Decomposition(b) Topology-Guided Feature Refinement
+Fig. 1.Architecture of the proposed framework. Primary features from the backbone
+are first processed by AAHD, which provides structured supervision by decomposing
+labels into trunk, small branch, and junction components. These hierarchical repre-
+sentations are then enhanced by the TGFR module using dilated convolutions and
+topology gated representations. Finally, the framework is optimized by HACL through
+orthogonality and exclusion penalties to maintain anatomical consistency.
+continuity across scales. This unified approach combines adaptive supervision
+with geometric regularization to resolve vascular fragmentation.
+2.1 Adaptive Anatomical Hierarchy Decomposition
+The AAHD module partitions each vascular maskMv into trunk, small branch,
+and junction categories to resolve scale-induced ambiguities. This process begins
+by extracting a single-voxel-wide medial axisS=Skeleton(M v)through 3D
+topological thinning. Following the calculation of the Euclidean distance trans-
+formd(x), we collect the radius distributionRS ={d(s)|s∈S}. The optimal
+separation threshold is determined asτ∗ = Otsu(R S). The radius field is then
+propagated to all vessel voxels via nearest-neighbor assignment:
+Φ(x) =d
+
+arg min
+s∈S
+∥x−s∥ 2
+
+, M t ={x∈M v |Φ(x)≥τ ∗},(1)
+whereΦ(x)andM t denote the voxel-wise radius field and the trunk mask, re-
+spectively. Small branchesMs represent the complementMv \M t, while junction
+regionsM j are localized by intersecting these branches with the trunk dilated
+byk= 2iterations:
+Mj = (M t ⊕ B)(k) ∩M s,(2)
+
+===== PAGE 4 =====
+4 Anonymized Author et al.
+(a) (b) (c) (d) (e) (f)
+Fig. 2.Transformation pipeline for hepatic and portal vessel decomposition: (a) Orig-
+inal 2D CT slice, (b) combined label mask, (c) extracted skeletons, (d) trunk regions
+after radius propagation, (e) small branches and junctions, and (f) 3D visualization of
+the final hierarchical labels.
+with⊕andBdenoting the morphological dilation operator and a unit-radius
+spherical structuring element, respectively. This operation isolates branch voxels
+located within the dilated trunk neighborhood, thereby identifying the specific
+transition zones near bifurcations. The complete pipeline is visualized in Fig. 2.
+2.2 Topology-Guided Feature Refinement
+To address fragmented bifurcations, the TGFR module refines backbone de-
+coder features using localized topological cues. LetF pri denote the backbone
+decoder output. An auxiliary decoder processes stopped-gradient primary fea-
+turessg[F pri]to produce auxiliary representationF aux and junction prediction
+Jvia a dedicated junction head. These generate topology gateGand modulation
+featureF m:
+G= sg[σ(J)],F m = sg[ψ dil(Faux)],
+Fref =F pri +G ⊙ F m, (3)
+whereσand⊙denote the sigmoid function and element-wise multiplication,
+respectively. By leveraging junction cues for gating, the module selectively con-
+centrates feature refinement on anatomically complex bifurcations where con-
+nectivity is most prone to fragmentation. The stop-gradient operator decouples
+the auxiliary branch from the backbone and prevents refinement-induced gradi-
+ents from flowing into the auxiliary pathway, allowing topological cues to act as
+a forward-only structural prior for stabilizing bifurcation regions.
+2.3 Hierarchical Anatomical Consistency Loss
+The HACL enforces structural plausibility by regularizing decomposed vascular
+roles. For each systemv∈ {hv, pv}, the composite objective is defined as:
+Ltotal =L global +λ tLtrunk +λ sLsmall +λ jLjunc +L consist,(4)
+whereL global combines Dice and Cross-Entropy loss, whileL trunk andL junc
+utilize Dice and binary cross-entropy loss, respectively. In contrast to trunk su-
+pervision, the small branch termLsmall is defined as a probabilistic residual via
+L1 loss to capture distal structures:
+Lsmall =E
+ ˆPs − ˆPg ⊙(1− ˆPt)
+
+,(5)
+
+===== PAGE 5 =====
+Anatomical Hierarchical Decomposition for Hepatic Vessel Segmentation 5
+where ˆPg, ˆPt, ˆPs, and ˆPj denote the predicted probability maps for the global
+vessel, trunk, small branch, and junction, respectively, andE[·]denotes voxel-
+wise spatial averaging. This residual formulation encouragesˆPs to capture vessel
+regions not explained by the trunk prediction, thereby preventing optimization
+redundancy. Anatomical integrity is further reinforced byLconsist, which is a
+weighted sum of role-based exclusivity, sum-to-global containment, and orthog-
+onality terms:
+Lconsist =αL excl +βL cont +γL orth,(6)
+with the individual components formulated as:
+Lexcl =E[ ˆPt ⊙ ˆPs ⊙ ˆPg],L cont =E
+
+ReLU
+ P
+k∈{t,s,j} ˆPk − ˆPg
+
+,
+Lorth =E[ ˆPj ⊙( ˆPt + ˆPs)],
+(7)
+these regularizations stabilize training and prevent unrealistic topological errors.
+3 Experiments
+3.1 Datasets and Evaluation Metrics
+The framework is evaluated on two public contrast-enhanced 3D CT datasets
+featuring expert hepatic and portal vein annotations. Primary training and val-
+idation are conducted on the Medical Segmentation Decathlon (MSD Task 08)
+dataset [2], using the re-annotated version provided by Xu et al. [26]. This ver-
+sion focuses on a subset of 61 thin-slice cases (axial thickness≤2.0 mm) with
+refined hepatic and portal system masks, which were partitioned into training
+and validation sets at an 8:2 ratio. Furthermore, cross-dataset robustness is eval-
+uated using the 3D-IRCADb dataset [23] as an external test set, which consists
+of 20 cases acquired across varying imaging protocols and contrast phases to test
+generalization capabilities.
+Performance is measured via Dice Similarity Coefficient, 95% Hausdorff Dis-
+tance (HD95), sensitivity, and precision, following standard practices [26].
+3.2 Implementation Details
+All experiments were implemented in PyTorch on NVIDIA RTX 3090 GPUs.
+Prior to training, the CT volumes were resampled to an isotropic resolution of
+1.0 mm, clipped to a window of[0,400]HU, and z-score normalized. The network
+was subsequently trained on96×96×96patches extracted via label-weighted
+cropping. Furthermore, data augmentations including random flipping, axial ro-
+tations, and Gaussian noise were employed to improve model generalization. Op-
+timization was performed using AdamW for 1,000 epochs, with an initial learning
+rate of1×10 −3 and a cosine annealing schedule to ensure stable convergence. To
+ensure structural stability and anatomical coherence, optimal hyperparameters
+were determined through a coarse to fine grid search within the range[0.01,0.5]
+on the validation set, resulting in loss weights ofλt = 0.2, λ s = 0.1, λ j = 0.05
+and auxiliary coefficients ofα=β= 0.05, γ= 0.02.
+
+===== PAGE 6 =====
+6 Anonymized Author et al.
+3.3 Comparison with State-of-the-Art Methods
+The proposed framework is evaluated against several state-of-the-art 3D segmen-
+tation models, including U-Net [19], U-Net++ [29], nnU-Net [8], V-Net [16], UN-
+ETR [6], Swin-UNETR [5], Mobile-UViT [24], SuperLightNet [28], Ori-Net [9],
+CoTUNet [25], and VSNet [26]. To ensure a fair comparison, all baseline mod-
+els are re-trained using the same preprocessing and optimization settings as our
+framework.
+T able 1.Comparison on MSD Task08 and cross-dataset evaluation on 3D-IRCADb.
+Red: best, Blue: second best.
+Method Dice↑Prec↑Sen↑HD95↓Dice per class↑
+(%) (%) (%) (mm) HV (%) PV (%)
+(a) MSD Task08
+U-Net [19] 78.10 84.57 72.02 15.23 80.51 75.68
+V-Net [16] 77.63 81.10 74.08 15.40 80.03 75.23
+U-Net++ [29] 79.54 84.87 74.28 14.18 81.75 77.32
+nnU-Net [8] 79.14 82.84 75.26 16.73 80.98 77.31
+UNETR [6] 69.45 74.32 64.31 29.69 72.61 66.29
+Swin-UNETR [5] 78.13 82.38 73.58 15.66 80.42 75.84
+CoTUNet [25] 78.49 83.00 74.07 15.86 80.76 76.21
+Ori-Net [9] 78.48 84.18 71.90 15.16 80.66 76.30
+Mobile-UViT [24] 78.44 83.14 73.95 14.72 80.86 76.03
+SuperLightNet [28] 76.83 84.21 70.30 16.07 79.40 74.25
+VSNet [26] 80.90 82.66 77.35 14.76 82.51 79.28
+Ours (Ori-Net)81.85 85.92 79.53 14.00 83.30 80.40
+Ours (Mobile-UViT)81.88 87.11 79.22 13.45 83.56 80.20
+(b) 3D-IRCADb
+U-Net [19] 63.28 63.24 66.17 32.23 64.25 62.32
+V-Net [16] 59.75 62.24 62.11 35.23 59.51 59.99
+U-Net++ [29] 63.28 63.07 66.26 33.98 64.24 62.33
+nnU-Net [8] 62.47 61.85 66.35 33.55 63.04 61.90
+UNETR [6] 49.72 47.84 55.38 53.66 50.62 48.83
+Swin-UNETR [5] 62.64 61.92 66.30 31.45 63.73 61.56
+CoTUNet [25] 63.39 59.15 65.43 35.00 64.97 61.82
+Ori-Net [9] 63.10 61.66 65.83 32.77 63.86 62.35
+Mobile-UViT [24] 62.39 62.75 65.72 32.17 62.45 62.34
+SuperLightNet [28] 59.19 62.32 60.68 38.76 59.36 59.03
+VSNet [26] 63.62 63.82 66.35 31.67 64.91 62.33
+Ours (Ori-Net)64.22 64.49 66.85 30.86 65.51 62.93
+Ours (Mobile-UViT)64.75 67.09 68.05 29.01 65.23 64.26
+As shown in Tables 1, our approach consistently improves accuracy across
+in-domain and cross-dataset tests. Improved Dice scores and lower HD95 val-
+
+===== PAGE 7 =====
+Anatomical Hierarchical Decomposition for Hepatic Vessel Segmentation 7
+V-Net Swin-UNETRnnU-Net Mobile-UViTOur GT
+Fig. 3.Visual comparison of segmentation results on challenging cases. Hepatic veins
+are depicted in red and portal veins in green.
+ues suggest enhanced boundary stability, especially in peripheral regions. Our
+method adds only 0.02M parameters to the 11.06M Mobile-UViT backbone, a
+marginal 0.18% increase. This indicates gains stem from hierarchical structural
+constraints rather than increased model capacity. Unlike baselines struggling
+with domain shifts, our method maintains stable performance and preserves fine
+branches without extra computational burden. Fig. 3 presents visual compar-
+isons evaluating structural fidelity. The proposed strategy demonstrates superior
+preservation of fine peripheral branches and bifurcation continuity compared to
+baselines.
+3.4 Ablation Study
+Ablation experiments summarized in Table 2 evaluate the impact of hierarchi-
+cal decomposition, the consistency loss, and the gradient modulation mechanism.
+Results for the HACL module show that role-specific supervision and anatomical
+constraints (Lexcl,L orth,L cont) improve both Dice and HD95 metrics by reduc-
+ing structural errors. For the AAHD module, Otsu-based adaptive thresholding
+
+===== PAGE 8 =====
+8 Anonymized Author et al.
+T able 2.Ablation studies on MSD Task08. (a) Effect of HACL components. (b) Com-
+parison of AAHD decomposition strategies. (c) Comparison of TGFR gradient modu-
+lation variants. Bold: best.
+Configuration Dice (%)↑Prec↑Sen↑HD95↓Dice per class↑
+(%) (%) (%) (mm) HV (%) PV (%)
+(a) HACL component ablation
+Lglobal only 80.65 86.87 75.44 15.99 82.18 79.12
++L t,s,j (role-specific) 81.19 85.57 77.30 14.29 82.79 79.59
++L excl (exclusivity) 81.24 86.44 76.79 14.57 82.99 79.48
++L orth (orthogonality) 81.51 86.13 77.41 13.98 83.06 79.97
+F ull HACL 81.88 87.11 79.22 13.45 83.56 80.20
+(b) AAHD decomposition strategy ablation
+Fixed (τ= 1.0) 80.24 84.70 76.29 19.66 81.66 78.81
+Fixed (τ= 1.5) 80.30 83.35 77.56 17.55 81.59 79.01
+Fixed (τ= 2.0) 80.20 83.42 77.37 24.14 81.40 79.01
+Median-based 80.85 84.35 78.04 17.64 82.34 79.37
+Mean-based 81.04 86.43 76.25 14.83 83.16 78.93
+Ours 81.88 87.11 79.22 13.45 83.56 80.20
+(c) TGFR gradient modulation variants
+No Shield 80.43 85.44 76.50 14.82 82.06 78.81
+Task Isolation 81.09 82.81 79.15 15.77 82.80 79.37
+Ours 81.88 87.11 79.22 13.45 83.56 80.20
+performs better than fixed heuristics, demonstrating its robustness to vascular
+variations. Furthermore, the TGFR ablation evaluates three variants. No Shield,
+TaskIsolation,andourAsymmetricShieldemploygradientflowwithrefinement,
+blocked gradients without refinement, and blocked gradients with refinement, re-
+spectively. Our design achieves the best performance by enabling junction-based
+feature enhancement while preventing auxiliary task interference in the shared
+encoder.
+4 Conclusion
+We presented a hierarchical framework for liver vessel segmentation that uses
+anatomical decomposition and geometric regularization to handle varying vessel
+scales and fragile topologies. Our experiments show that this approach improves
+both segmentation accuracy and structural integrity across different network
+architectures. Although the current method relies on anatomically derived role
+supervision, future research could investigate end-to-end adaptive role learning
+to improve performance in the presence of complex pathological changes or vary-
+ing imaging conditions.
+
+===== PAGE 9 =====
+Anatomical Hierarchical Decomposition for Hepatic Vessel Segmentation 9
+References
+1. Abbas, A.K., Gallagher, A., Vraimakis, T., Borgars, J., Mohamad Shahir, A.N.,
+Raja, J., Ramakrishnan, A., Ali, S.: Midline-constrained loss in the anatomical
+landmarksegmentationof3dlivermodels.In:AnnualConferenceonMedicalImage
+Understanding and Analysis. pp. 216–229. Springer (2025)
+2. Antonelli, M., Reinke, A., Bakas, S., Farahani, K., Kopp-Schneider, A., Landman,
+B.A., Litjens, G., Menze, B., Ronneberger, O., Summers, R.M., et al.: The medical
+segmentation decathlon. Nature communications13(1), 4128 (2022)
+3. Fan, W., Fang, H., Li, R., Lin, Y., An, C., Luo, X.: Anatomy-aware frequency-
+attention transformer networks for liver couinaud ct/mr segmentation. In: Inter-
+national Conference on Medical Image Computing and Computer-Assisted Inter-
+vention. pp. 55–65. Springer (2025)
+4. Frangi, A.F., Niessen, W.J., Vincken, K.L., Viergever, M.A.: Multiscale vessel en-
+hancement filtering. In: International conference on medical image computing and
+computer-assisted intervention. pp. 130–137. Springer (1998)
+5. Hatamizadeh, A., Nath, V., Tang, Y., Yang, D., Roth, H.R., Xu, D.: Swin unetr:
+Swin transformers for semantic segmentation of brain tumors in mri images. In:
+International MICCAI brainlesion workshop. pp. 272–284. Springer (2021)
+6. Hatamizadeh, A., Tang, Y., Nath, V., Yang, D., Myronenko, A., Landman, B.,
+Roth, H.R., Xu, D.: Unetr: Transformers for 3d medical image segmentation. In:
+Proceedings of the IEEE/CVF winter conference on applications of computer vi-
+sion. pp. 574–584 (2022)
+7. He, B., Wu, T., Zhang, Y., Luo, H., Chen, H., Jia, F.: 3d sa-loifm: A three-
+dimensional framework for segmentation-assisted learning of informative feature
+matching in liver ct-3d us rigid registration. Biomedical Signal Processing and
+Control118, 109664 (2026)
+8. Isensee, F., Jaeger, P.F., Kohl, S.A., Petersen, J., Maier-Hein, K.H.: nnu-net: a
+self-configuring method for deep learning-based biomedical image segmentation.
+Nature methods18(2), 203–211 (2021)
+9. Jiang,W.,Li,Y.,Jia,Y.,Feng,Y.,Yi,Z.,Chen,M.,Wang,J.:Ori-net:Orientation-
+guided neural network for automated coronary arteries segmentation. Expert Sys-
+tems with Applications238, 121905 (2024)
+10. Jiang, Y., Peng, Y., Shan, X., Jin, L., Cui, Y.: Macf-net: a multi-path attention and
+adaptive context fusion network for general medical image segmentation. Digital
+Signal Processing174, 105988 (2026)
+11. Jimenez-Pastor, A., Marti-Aguado, D., Pereira, B., Alfaro-Cervello, C., Perez-
+Girbes, A., Alberich-Bayarri, A., Marti-Bonmati, L.: Impact of hepatic vessels on
+whole liver proton density fat fraction and r2* quantification. European Radiology
+Experimental10(1), 1 (2026)
+12. Kang, C.M., Ku, H.J., Moon, H.H., Kim, S.E., Jo, J.H., Choi, Y.I., Shin, D.H.:
+Predicting safe liver resection volume for major hepatectomy using artificial intel-
+ligence. Journal of Clinical Medicine13(2), 381 (2024)
+13. Kirbas, C., Quek, F.: A review of vessel extraction techniques and algorithms.
+ACM Computing Surveys (CSUR)36(2), 81–121 (2004)
+14. Kirchhoff, Y., Rokuss, M.R., Roy, S., Kovacs, B., Ulrich, C., Wald, T., Zenk, M.,
+Vollmuth, P., Kleesiek, J., Isensee, F., et al.: Skeleton recall loss for connectiv-
+ity conserving and resource efficient segmentation of thin tubular structures. In:
+European Conference on Computer Vision. pp. 218–234. Springer (2024)
+
+===== PAGE 10 =====
+10 Anonymized Author et al.
+15. Li, C., Ma, W., Sun, L., Ding, X., Huang, Y., Wang, G., Yu, Y.: Hierarchical deep
+network with uncertainty-aware semi-supervised learning for vessel segmentation.
+Neural Computing and Applications34(4), 3151–3164 (2022)
+16. Milletari, F., Navab, N., Ahmadi, S.A.: V-net: Fully convolutional neural networks
+for volumetric medical image segmentation. In: 2016 fourth international confer-
+ence on 3D vision (3DV). pp. 565–571. Ieee (2016)
+17. Ni, X., Chen, F., Ding, D., Shi, P., Zhong, J.: Multiscale feature fusion network
+with morphological perception function for liver vessel segmentation. Engineering
+Applications of Artificial Intelligence163, 113146 (2026)
+18. Rai, Z.L., Holroyd, N.A., Magbagbeola, M., Doganay, E., Doyle, K., Caselton, L.,
+Stilli, A., Stoyanov, D., Walker-Samuel, S., Davidson, B.R.: Real time evaluation of
+whole organ perfusion by magnetic resonance imaging in ex vivo machine-perfused
+liver. NMR in Biomedicine39(3), e70236 (2026)
+19. Ronneberger, O., Fischer, P., Brox, T.: U-net: Convolutional networks for biomedi-
+cal image segmentation. In: International Conference on Medical image computing
+and computer-assisted intervention. pp. 234–241. Springer (2015)
+20. Selle, D., Preim, B., Schenk, A., Peitgen, H.: Analysis of vasculature for liver sur-
+gical planning. IEEE TRANSACTIONS ON MEDICAL IMAGING21(11), 1344–
+1357 (2002)
+21. Shen, B., Huang, X., Li, Y., Li, X., Ma, L., Shi, Y., Chen, S.: Udv-net: A hybrid
+cnn and transformer vein segmentation network with vascular prior and spatial
+awareness. Medical Image Analysis p. 103929 (2026)
+22. Shit, S., Paetzold, J.C., Sekuboyina, A., Ezhov, I., Unger, A., Zhylka, A., Pluim,
+J.P., Bauer, U., Menze, B.H.: cldice-a novel topology-preserving loss function for
+tubular structure segmentation. In: Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition. pp. 16560–16569 (2021)
+23. Soler, L., Hostettler, A., Agnus, V., Charnoz, A., Fasquel, J.B., Moreau, J., Os-
+swald, A.B., Bouhadjar, M., Marescaux, J.: 3d image reconstruction for compar-
+ison of algorithm database. URL: https://www.ircad.fr/research/data-sets/liver-
+segmentation-3d-ircadb-0113(2010)
+24. Tang, F., Nian, B., Ding, J., Ma, W., Quan, Q., Dong, C., Yang, J., Liu, W., Zhou,
+S.K.: Mobile u-vit: Revisiting large kernel and u-shaped vit for efficient medical
+image segmentation. In: Proceedings of the 33rd ACM International Conference
+on Multimedia. pp. 3408–3417 (2025)
+25. Wu, Y., Qi, S., Wang, M., Zhao, S., Pang, H., Xu, J., Bai, L., Ren, H.: Transformer-
+based 3d u-net for pulmonary vessel segmentation and artery-vein separation from
+ct images. Medical & Biological Engineering & Computing pp. 1–15 (2023)
+26. Xu, J., Dong, A., Yang, Y., Jin, S., Zeng, J., Xu, Z., Jiang, W., Zhang, L., Dong,
+J., Wang, B.: Vsnet: Vessel structure-aware network for hepatic and portal vein
+segmentation. Medical Image Analysis101, 103458 (2025)
+27. Xu, Z., Lu, D., Wang, Y., Luo, J., Jayender, J., Ma, K., Zheng, Y., Li, X.: Noisy
+labels are treasure: mean-teacher-assisted confident learning for hepatic vessel seg-
+mentation.In:Internationalconferenceonmedicalimagecomputingandcomputer-
+assisted intervention. pp. 3–13. Springer (2021)
+28. Yu, F., Cao, J., Liu, L., Jiang, M.: Superlightnet: Lightweight parameter aggre-
+gation network for multimodal brain tumor segmentation. In: Proceedings of the
+Computer Vision and Pattern Recognition Conference. pp. 5197–5206 (2025)
+29. Zhou, Z., Rahman Siddiquee, M.M., Tajbakhsh, N., Liang, J.: Unet++: A nested
+u-net architecture for medical image segmentation. In: International workshop on
+deep learning in medical image analysis. pp. 3–11. Springer (2018)

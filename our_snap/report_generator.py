@@ -203,6 +203,60 @@ class ReportGenerator:
                 elements.append(Paragraph(f'建议: {risk.get("recommendation", "无")}', self.styles['CustomNormal']))
                 elements.append(Spacer(1, 0.5*cm))
 
+            # AI分割精度评估（对比医生标签）
+            if 'segmentation_accuracy' in report_data:
+                elements.append(Paragraph('AI分割精度评估（对比医生标签）', self.styles['CustomSection']))
+                sa = report_data.get('segmentation_accuracy', {})
+                if isinstance(sa, dict) and sa.get('status') == 'ok':
+                    overall = sa.get('overall', {}) if isinstance(sa.get('overall', {}), dict) else {}
+                    asd_mm = float(overall.get('asd_mm', float('inf')))
+                    hd95_mm = float(overall.get('hd95_mm', float('inf')))
+                    asd_text = f"{asd_mm:.4f} mm" if np.isfinite(asd_mm) else "inf"
+                    hd95_text = f"{hd95_mm:.4f} mm" if np.isfinite(hd95_mm) else "inf"
+                    acc_data = [
+                        ['Dice', f"{float(overall.get('dice', 0.0)):.4f}"],
+                        ['Jaccard', f"{float(overall.get('jaccard', 0.0)):.4f}"],
+                        ['ASD', asd_text],
+                        ['HD95', hd95_text],
+                        [
+                            '匹配程度(精度)',
+                            f"{float(overall.get('matching_degree_percent', overall.get('accuracy_percent', 0.0))):.2f}%",
+                        ],
+                    ]
+                    table = Table(acc_data, colWidths=[5*cm, 6*cm])
+                    table.setStyle(self._two_col_table_style())
+                    elements.append(table)
+
+                    per_label = sa.get('per_label', {}) if isinstance(sa.get('per_label', {}), dict) else {}
+                    if per_label:
+                        for metric_key in sorted(per_label.keys()):
+                            metric = per_label.get(metric_key, {})
+                            if not isinstance(metric, dict):
+                                continue
+                            item_asd = float(metric.get('asd_mm', float('inf')))
+                            item_hd95 = float(metric.get('hd95_mm', float('inf')))
+                            item_asd_text = f"{item_asd:.4f} mm" if np.isfinite(item_asd) else "inf"
+                            item_hd95_text = f"{item_hd95:.4f} mm" if np.isfinite(item_hd95) else "inf"
+                            elements.append(
+                                Paragraph(
+                                    (
+                                        f"{metric_key}: Dice={float(metric.get('dice', 0.0)):.4f}, "
+                                        f"Jaccard={float(metric.get('jaccard', 0.0)):.4f}, "
+                                        f"ASD={item_asd_text}, HD95={item_hd95_text}, "
+                                        f"匹配程度={float(metric.get('matching_degree_percent', metric.get('accuracy_percent', 0.0))):.2f}%"
+                                    ),
+                                    self.styles['CustomNormal'],
+                                )
+                            )
+                else:
+                    elements.append(
+                        Paragraph(
+                            f"精度评估不可用：{sa.get('message', '无可用数据')}" if isinstance(sa, dict) else "精度评估不可用",
+                            self.styles['CustomNormal'],
+                        )
+                    )
+                elements.append(Spacer(1, 0.5*cm))
+
             # AI血管结构识别摘要（主干/细支/分叉/5级）
             if 'vessel_analysis' in report_data:
                 elements.append(Paragraph('AI血管结构识别摘要', self.styles['CustomSection']))
@@ -360,6 +414,44 @@ class ReportGenerator:
             summary.append('\n手术风险评估:')
             summary.append(f'  整体风险: {risk.get("overall_risk", "未知")}')
             summary.append(f'  建议: {risk.get("recommendation", "无")}')
+
+        # AI分割精度评估（对比医生标签）
+        if 'segmentation_accuracy' in report_data:
+            sa = report_data.get('segmentation_accuracy', {})
+            summary.append('\nAI分割精度评估（对比医生标签）:')
+            if isinstance(sa, dict) and sa.get('status') == 'ok':
+                overall = sa.get('overall', {}) if isinstance(sa.get('overall', {}), dict) else {}
+                asd_mm = float(overall.get('asd_mm', float('inf')))
+                hd95_mm = float(overall.get('hd95_mm', float('inf')))
+                summary.append(f"  Dice: {float(overall.get('dice', 0.0)):.4f}")
+                summary.append(f"  Jaccard: {float(overall.get('jaccard', 0.0)):.4f}")
+                summary.append(f"  ASD: {asd_mm:.4f} mm" if np.isfinite(asd_mm) else "  ASD: inf")
+                summary.append(f"  HD95: {hd95_mm:.4f} mm" if np.isfinite(hd95_mm) else "  HD95: inf")
+                summary.append(
+                    f"  匹配程度(精度): "
+                    f"{float(overall.get('matching_degree_percent', overall.get('accuracy_percent', 0.0))):.2f}%"
+                )
+
+                per_label = sa.get('per_label', {}) if isinstance(sa.get('per_label', {}), dict) else {}
+                if per_label:
+                    for metric_key in sorted(per_label.keys()):
+                        metric = per_label.get(metric_key, {})
+                        if not isinstance(metric, dict):
+                            continue
+                        item_asd = float(metric.get('asd_mm', float('inf')))
+                        item_hd95 = float(metric.get('hd95_mm', float('inf')))
+                        summary.append(
+                            f"  {metric_key}: Dice={float(metric.get('dice', 0.0)):.4f}, "
+                            f"Jaccard={float(metric.get('jaccard', 0.0)):.4f}, "
+                            f"ASD={(f'{item_asd:.4f} mm' if np.isfinite(item_asd) else 'inf')}, "
+                            f"HD95={(f'{item_hd95:.4f} mm' if np.isfinite(item_hd95) else 'inf')}, "
+                            f"匹配程度={float(metric.get('matching_degree_percent', metric.get('accuracy_percent', 0.0))):.2f}%"
+                        )
+            else:
+                if isinstance(sa, dict):
+                    summary.append(f"  不可用: {sa.get('message', '无可用数据')}")
+                else:
+                    summary.append("  不可用")
 
         # AI结构识别摘要
         if 'vessel_analysis' in report_data:

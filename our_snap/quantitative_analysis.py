@@ -2,10 +2,19 @@
 # -*- coding: utf-8 -*-
 """Quantitative analysis and risk assessment utilities."""
 
-from typing import Any, Dict, Optional, Tuple
+from itertools import permutations, product
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import ndimage
+
+try:
+    import torch
+    from monai.metrics import DiceMetric, HausdorffDistanceMetric
+except Exception:
+    torch = None
+    DiceMetric = None
+    HausdorffDistanceMetric = None
 
 try:
     from quantification import VesselQuantifier
@@ -203,6 +212,490 @@ class QuantitativeAnalyzer:
         area += float(np.sum(m[:, 0, :]) + np.sum(m[:, -1, :])) * sx * sz
         area += float(np.sum(m[:, :, 0]) + np.sum(m[:, :, -1])) * sx * sy
         return float(area)
+
+    def _binary_surface(self, mask: np.ndarray) -> np.ndarray:
+        """Return 1-voxel-thick binary surface."""
+        m = np.asarray(mask).astype(bool)
+        if not np.any(m):
+            return np.zeros_like(m, dtype=bool)
+        structure = ndimage.generate_binary_structure(3, 1)
+        eroded = ndimage.binary_erosion(m, structure=structure, iterations=1, border_value=0)
+        surface = m & (~eroded)
+        if not np.any(surface):
+            # Keep degenerate tiny masks evaluable.
+            surface = m.copy()
+        return surface
+
+    def _to_binary_onehot_tensors(
+        self, pred_mask: np.ndarray, ref_mask: np.ndarray
+    ) -> Optional[Tuple["torch.Tensor", "torch.Tensor"]]:
+        if torch is None:
+            return None
+        pred = np.asarray(pred_mask).astype(bool)
+        ref = np.asarray(ref_mask).astype(bool)
+        pred_fg = torch.from_numpy(pred.astype(np.float32))
+        ref_fg = torch.from_numpy(ref.astype(np.float32))
+        pred_oh = torch.stack([1.0 - pred_fg, pred_fg], dim=0).unsqueeze(0)
+        ref_oh = torch.stack([1.0 - ref_fg, ref_fg], dim=0).unsqueeze(0)
+        return pred_oh, ref_oh
+
+    def _monai_binary_dice(self, pred_mask: np.ndarray, ref_mask: np.ndarray) -> Optional[float]:
+        if DiceMetric is None:
+            return None
+        pred = np.asarray(pred_mask).astype(bool)
+        ref = np.asarray(ref_mask).astype(bool)
+        if not np.any(pred) and not np.any(ref):
+            return 1.0
+        tensors = self._to_binary_onehot_tensors(pred, ref)
+        if tensors is None:
+            return None
+        pred_oh, ref_oh = tensors
+        metric = DiceMetric(include_background=False, reduction="mean_batch")
+        metric(y_pred=pred_oh, y=ref_oh)
+        value = metric.aggregate()
+        metric.reset()
+        try:
+            dice = float(value.detach().cpu().flatten()[0].item())
+        except Exception:
+            dice = float(value) if value is not None else float("nan")
+        if not np.isfinite(dice):
+            return 0.0
+        return float(np.clip(dice, 0.0, 1.0))
+
+    def _monai_binary_hd95(
+        self,
+        pred_mask: np.ndarray,
+        ref_mask: np.ndarray,
+        spacing: Tuple[float, float, float],
+    ) -> Optional[float]:
+        if HausdorffDistanceMetric is None:
+            return None
+        pred = np.asarray(pred_mask).astype(bool)
+        ref = np.asarray(ref_mask).astype(bool)
+        if not np.any(pred) and not np.any(ref):
+            return 0.0
+        if (not np.any(pred)) != (not np.any(ref)):
+            return float("inf")
+        tensors = self._to_binary_onehot_tensors(pred, ref)
+        if tensors is None:
+            return None
+        pred_oh, ref_oh = tensors
+        metric = HausdorffDistanceMetric(
+            include_background=False,
+            reduction="mean_batch",
+            percentile=95,
+        )
+        metric(y_pred=pred_oh, y=ref_oh, spacing=spacing)
+        value = metric.aggregate()
+        metric.reset()
+        try:
+            hd95 = float(value.detach().cpu().flatten()[0].item())
+        except Exception:
+            hd95 = float(value) if value is not None else float("nan")
+        if np.isnan(hd95):
+            return float("inf")
+        if hd95 < 0:
+            return 0.0
+        return float(hd95)
+
+    def _overlap_stats(self, pred_mask: np.ndarray, ref_mask: np.ndarray) -> Dict[str, float]:
+        pred = np.asarray(pred_mask).astype(bool)
+        ref = np.asarray(ref_mask).astype(bool)
+        pred_voxels = int(np.sum(pred))
+        ref_voxels = int(np.sum(ref))
+        intersection = int(np.sum(pred & ref))
+        union = pred_voxels + ref_voxels - intersection
+
+        if pred_voxels == 0 and ref_voxels == 0:
+            dice = 1.0
+            jaccard = 1.0
+        else:
+            dice = (2.0 * intersection) / max(float(pred_voxels + ref_voxels), 1.0)
+            jaccard = float(intersection) / max(float(union), 1.0)
+
+        monai_dice = self._monai_binary_dice(pred, ref)
+        if monai_dice is not None:
+            dice = monai_dice
+
+        return {
+            "pred_voxels": float(pred_voxels),
+            "ref_voxels": float(ref_voxels),
+            "intersection_voxels": float(intersection),
+            "union_voxels": float(union),
+            "dice": float(dice),
+            "jaccard": float(jaccard),
+        }
+
+    def _surface_distance_stats(
+        self,
+        pred_mask: np.ndarray,
+        ref_mask: np.ndarray,
+        spacing: Tuple[float, float, float],
+    ) -> Dict[str, float]:
+        pred = np.asarray(pred_mask).astype(bool)
+        ref = np.asarray(ref_mask).astype(bool)
+
+        if not np.any(pred) and not np.any(ref):
+            return {
+                "asd_mm": 0.0,
+                "hd95_mm": 0.0,
+                "mean_pred_to_ref_mm": 0.0,
+                "mean_ref_to_pred_mm": 0.0,
+            }
+        if (not np.any(pred)) != (not np.any(ref)):
+            inf = float("inf")
+            return {
+                "asd_mm": inf,
+                "hd95_mm": inf,
+                "mean_pred_to_ref_mm": inf,
+                "mean_ref_to_pred_mm": inf,
+            }
+
+        pred_surface = self._binary_surface(pred)
+        ref_surface = self._binary_surface(ref)
+        if not np.any(pred_surface) or not np.any(ref_surface):
+            inf = float("inf")
+            return {
+                "asd_mm": inf,
+                "hd95_mm": inf,
+                "mean_pred_to_ref_mm": inf,
+                "mean_ref_to_pred_mm": inf,
+            }
+
+        ref_distance = ndimage.distance_transform_edt(~ref_surface, sampling=spacing)
+        pred_distance = ndimage.distance_transform_edt(~pred_surface, sampling=spacing)
+
+        pred_to_ref = ref_distance[pred_surface]
+        ref_to_pred = pred_distance[ref_surface]
+        if pred_to_ref.size == 0 or ref_to_pred.size == 0:
+            inf = float("inf")
+            return {
+                "asd_mm": inf,
+                "hd95_mm": inf,
+                "mean_pred_to_ref_mm": inf,
+                "mean_ref_to_pred_mm": inf,
+            }
+
+        # Standard symmetric HD95:
+        # HD95 = max( percentile95(pred->ref), percentile95(ref->pred) )
+        hd95_pred_to_ref = float(np.percentile(pred_to_ref, 95))
+        hd95_ref_to_pred = float(np.percentile(ref_to_pred, 95))
+        hd95_mm = max(hd95_pred_to_ref, hd95_ref_to_pred)
+        monai_hd95_mm = self._monai_binary_hd95(pred, ref, spacing)
+        if monai_hd95_mm is not None:
+            hd95_mm = float(monai_hd95_mm)
+        merged = np.concatenate([pred_to_ref, ref_to_pred], axis=0)
+        return {
+            "asd_mm": float(np.mean(merged)),
+            "hd95_mm": float(hd95_mm),
+            "hd95_monai_mm": float(hd95_mm),
+            "hd95_pred_to_ref_mm": float(hd95_pred_to_ref),
+            "hd95_ref_to_pred_mm": float(hd95_ref_to_pred),
+            "mean_pred_to_ref_mm": float(np.mean(pred_to_ref)),
+            "mean_ref_to_pred_mm": float(np.mean(ref_to_pred)),
+        }
+
+    def _accuracy_percent_from_metrics(self, dice: float, jaccard: float, asd_mm: float, hd95_mm: float) -> float:
+        """
+        Paper-style matching degree (0-100).
+
+        The referenced vessel-segmentation paper reports Dice/DSC as the main
+        percentage accuracy metric and reports distance metrics such as HD95
+        separately. Therefore the final "matching degree" should be the Dice
+        percentage, while Jaccard/ASD/HD95 remain independent quality indicators.
+        """
+        dice_score = float(np.clip(dice, 0.0, 1.0))
+        return float(dice_score * 100.0)
+
+    def _swap_pv_hv_labels(self, mask: np.ndarray) -> np.ndarray:
+        """Swap label ids 1<->2 while keeping other labels unchanged."""
+        arr = np.asarray(mask)
+        out = np.array(arr, copy=True)
+        m1 = arr == 1
+        m2 = arr == 2
+        out[m1] = 2
+        out[m2] = 1
+        return out
+
+    def _apply_axis_transform(
+        self,
+        arr: np.ndarray,
+        perm: Tuple[int, int, int],
+        flips: Tuple[bool, bool, bool],
+    ) -> np.ndarray:
+        out = np.transpose(arr, perm) if perm != (0, 1, 2) else arr
+        for axis, need_flip in enumerate(flips):
+            if need_flip:
+                out = np.flip(out, axis=axis)
+        return out
+
+    def _diagnose_axis_or_label_mismatch(
+        self,
+        ai: np.ndarray,
+        doctor: np.ndarray,
+        label_ids: Sequence[int],
+        baseline_union_dice: float,
+    ) -> Dict[str, Any]:
+        """
+        Try axis permutations/flips and optional label 1<->2 swap.
+        Used only as diagnostics to determine whether poor match is likely caused
+        by orientation/index-space mismatch rather than model prediction quality.
+        """
+        ai_arr = np.asarray(ai)
+        doctor_arr = np.asarray(doctor)
+        if ai_arr.ndim != 3 or doctor_arr.ndim != 3:
+            return {"performed": False, "reason": "non_3d_input"}
+        if ai_arr.shape != doctor_arr.shape:
+            return {
+                "performed": False,
+                "reason": "shape_mismatch",
+                "ai_shape": tuple(int(v) for v in ai_arr.shape),
+                "doctor_shape": tuple(int(v) for v in doctor_arr.shape),
+            }
+
+        # Only run expensive diagnosis when baseline overlap is suspiciously low.
+        baseline_union_dice = float(np.clip(baseline_union_dice, 0.0, 1.0))
+        if baseline_union_dice >= 0.80:
+            return {
+                "performed": False,
+                "reason": "baseline_good_enough",
+                "baseline_union_dice": baseline_union_dice,
+            }
+
+        ref_union = doctor_arr > 0
+        valid_label_ids = [int(v) for v in label_ids if int(v) > 0]
+
+        candidates = []
+        seen = set()
+        for perm in permutations((0, 1, 2)):
+            permuted_shape = tuple(int(ai_arr.shape[p]) for p in perm)
+            if permuted_shape != tuple(int(v) for v in doctor_arr.shape):
+                continue
+            for flips in product((False, True), repeat=3):
+                key = (perm, flips)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append((perm, flips))
+
+        if not candidates:
+            return {
+                "performed": False,
+                "reason": "no_valid_axis_candidates",
+                "baseline_union_dice": baseline_union_dice,
+            }
+
+        best = {
+            "union_dice": baseline_union_dice,
+            "union_jaccard": float("nan"),
+            "label_mean_dice": baseline_union_dice,
+            "perm": (0, 1, 2),
+            "flips": (False, False, False),
+            "swap_labels_1_2": False,
+        }
+
+        tested = 0
+        for swap_labels in (False, True):
+            base = self._swap_pv_hv_labels(ai_arr) if swap_labels else ai_arr
+            for perm, flips in candidates:
+                tested += 1
+                transformed = self._apply_axis_transform(base, perm=perm, flips=flips)
+                if transformed.shape != doctor_arr.shape:
+                    continue
+
+                union_stats = self._overlap_stats(transformed > 0, ref_union)
+                union_dice = float(union_stats["dice"])
+                union_jaccard = float(union_stats["jaccard"])
+
+                label_dices = []
+                for lid in valid_label_ids:
+                    pred_l = transformed == lid
+                    ref_l = doctor_arr == lid
+                    if np.any(pred_l) or np.any(ref_l):
+                        label_dices.append(float(self._overlap_stats(pred_l, ref_l)["dice"]))
+                label_mean_dice = float(np.mean(label_dices)) if label_dices else union_dice
+
+                better = False
+                if union_dice > float(best["union_dice"]) + 1e-8:
+                    better = True
+                elif abs(union_dice - float(best["union_dice"])) <= 1e-8 and label_mean_dice > float(best["label_mean_dice"]) + 1e-8:
+                    better = True
+
+                if better:
+                    best = {
+                        "union_dice": union_dice,
+                        "union_jaccard": union_jaccard,
+                        "label_mean_dice": label_mean_dice,
+                        "perm": tuple(int(v) for v in perm),
+                        "flips": tuple(bool(v) for v in flips),
+                        "swap_labels_1_2": bool(swap_labels),
+                    }
+
+        improvement = float(best["union_dice"]) - baseline_union_dice
+        non_identity_transform = (
+            best["perm"] != (0, 1, 2)
+            or any(best["flips"])
+            or bool(best["swap_labels_1_2"])
+        )
+        likely_misaligned = bool(
+            non_identity_transform
+            and improvement >= 0.15
+            and float(best["union_dice"]) >= 0.45
+        )
+
+        return {
+            "performed": True,
+            "tested_candidates": int(tested),
+            "baseline_union_dice": baseline_union_dice,
+            "best_union_dice": float(best["union_dice"]),
+            "best_union_jaccard": float(best["union_jaccard"]),
+            "best_label_mean_dice": float(best["label_mean_dice"]),
+            "improvement_dice": float(improvement),
+            "best_transform": {
+                "perm": list(best["perm"]),
+                "flip_axes": [int(i) for i, f in enumerate(best["flips"]) if f],
+                "swap_labels_1_2": bool(best["swap_labels_1_2"]),
+            },
+            "likely_misaligned": likely_misaligned,
+            "note": (
+                "Likely axis/flip/label-id mismatch"
+                if likely_misaligned
+                else "No strong evidence of orientation mismatch"
+            ),
+        }
+
+    def evaluate_segmentation_accuracy(
+        self,
+        ai_label: np.ndarray,
+        doctor_label: np.ndarray,
+        spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        labels: Optional[Sequence[int]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compare AI segmentation against doctor labels with Dice/Jaccard/ASD/HD95.
+
+        Returns per-label metrics, merged-vessel metrics, and an aggregated
+        accuracy percentage score in [0, 100].
+        """
+        ai = np.asarray(ai_label)
+        doctor = np.asarray(doctor_label)
+        if ai.ndim != 3 or doctor.ndim != 3:
+            raise ValueError(f"ai/doctor label must be 3D, got {ai.ndim} and {doctor.ndim}")
+        if ai.shape != doctor.shape:
+            raise ValueError(f"shape mismatch: ai={ai.shape}, doctor={doctor.shape}")
+
+        sx, sy, sz = self._normalize_spacing(spacing)
+        spacing_xyz_mm = (sx, sy, sz)
+        # Distance maps use ndarray axis order. This project stores labels as (H, W, D),
+        # while spacing input is (x, y, z), so we map to (y, x, z) for EDT sampling.
+        distance_sampling_mm = (sy, sx, sz)
+        available_nonzero_labels = sorted(
+            [int(v) for v in np.unique(np.concatenate([ai.ravel(), doctor.ravel()])) if int(v) > 0]
+        )
+        requested_label_ids = [int(v) for v in labels] if labels is not None else [1, 2]
+        requested_label_ids = [v for v in requested_label_ids if v > 0]
+        requested_label_ids = list(dict.fromkeys(requested_label_ids))
+        label_ids = [v for v in requested_label_ids if v in available_nonzero_labels]
+        fallback_note = ""
+        if not label_ids and available_nonzero_labels:
+            label_ids = list(available_nonzero_labels)
+            fallback_note = (
+                f"requested labels {requested_label_ids} not found in current case, "
+                "fallback to all non-zero labels."
+            )
+        compare_all_nonzero = len(label_ids) == 0
+        label_name_map = {1: "pv", 2: "hv"}
+
+        per_label: Dict[str, Dict[str, Any]] = {}
+        label_scores: list = []
+
+        for label_id in label_ids:
+            ai_mask = ai == label_id
+            doctor_mask = doctor == label_id
+
+            overlap = self._overlap_stats(ai_mask, doctor_mask)
+            surface_distance = self._surface_distance_stats(ai_mask, doctor_mask, distance_sampling_mm)
+            accuracy_percent = self._accuracy_percent_from_metrics(
+                overlap["dice"],
+                overlap["jaccard"],
+                surface_distance["asd_mm"],
+                surface_distance["hd95_mm"],
+            )
+            label_scores.append(float(accuracy_percent))
+
+            key = f"label_{label_id}_{label_name_map.get(label_id, 'class')}"
+            per_label[key] = {
+                "label_id": int(label_id),
+                "dice": float(overlap["dice"]),
+                "jaccard": float(overlap["jaccard"]),
+                "asd_mm": float(surface_distance["asd_mm"]),
+                "hd95_mm": float(surface_distance["hd95_mm"]),
+                "mean_ai_to_doctor_surface_mm": float(surface_distance["mean_pred_to_ref_mm"]),
+                "mean_doctor_to_ai_surface_mm": float(surface_distance["mean_ref_to_pred_mm"]),
+                "ai_voxels": int(overlap["pred_voxels"]),
+                "doctor_voxels": int(overlap["ref_voxels"]),
+                "intersection_voxels": int(overlap["intersection_voxels"]),
+                "matching_degree_percent": float(accuracy_percent),
+                "accuracy_percent": float(accuracy_percent),
+            }
+
+        if compare_all_nonzero:
+            ai_union = ai > 0
+            doctor_union = doctor > 0
+        else:
+            ai_union = np.isin(ai, label_ids)
+            doctor_union = np.isin(doctor, label_ids)
+        union_overlap = self._overlap_stats(ai_union, doctor_union)
+        union_distance = self._surface_distance_stats(ai_union, doctor_union, distance_sampling_mm)
+        union_accuracy_percent = self._accuracy_percent_from_metrics(
+            union_overlap["dice"],
+            union_overlap["jaccard"],
+            union_distance["asd_mm"],
+            union_distance["hd95_mm"],
+        )
+        alignment_diagnosis = self._diagnose_axis_or_label_mismatch(
+            ai=ai,
+            doctor=doctor,
+            label_ids=label_ids if label_ids else requested_label_ids,
+            baseline_union_dice=float(union_overlap["dice"]),
+        )
+
+        # Paper-style final matching degree: overall Dice/DSC percentage.
+        # Per-label percentages are still returned for debugging, but the single
+        # final score should match the reported overall Dice value.
+        final_matching_percent = float(union_accuracy_percent)
+
+        return {
+            "status": "ok",
+            "requested_labels": requested_label_ids,
+            "labels_evaluated": label_ids,
+            "compare_scope": "all_nonzero_labels" if compare_all_nonzero else "selected_labels",
+            "fallback_note": fallback_note,
+            "spacing_mm": spacing_xyz_mm,
+            "distance_sampling_mm": distance_sampling_mm,
+            "per_label": per_label,
+            "overall": {
+                "dice": float(union_overlap["dice"]),
+                "jaccard": float(union_overlap["jaccard"]),
+                "asd_mm": float(union_distance["asd_mm"]),
+                "hd95_mm": float(union_distance["hd95_mm"]),
+                "ai_voxels": int(union_overlap["pred_voxels"]),
+                "doctor_voxels": int(union_overlap["ref_voxels"]),
+                "intersection_voxels": int(union_overlap["intersection_voxels"]),
+                "matching_degree_percent": float(final_matching_percent),
+                "accuracy_percent": float(final_matching_percent),
+                "union_matching_percent": float(union_accuracy_percent),
+            },
+            "final_matching_degree_percent": float(final_matching_percent),
+            "macro_matching_degree_percent": float(np.mean(label_scores) if label_scores else final_matching_percent),
+            "macro_accuracy_percent": float(np.mean(label_scores) if label_scores else final_matching_percent),
+            "score_definition": {
+                "formula": "Matching Degree (%) = Dice Similarity Coefficient (DSC) * 100",
+                "range": "0-100%",
+                "meaning": "参考论文将 Dice/DSC 作为主要分割精度百分比；Jaccard、ASD、HD95 作为独立指标显示，不再混入任意阈值加权公式",
+            },
+            "alignment_diagnosis": alignment_diagnosis,
+        }
 
     def couinaud_segmentation(
         self,
