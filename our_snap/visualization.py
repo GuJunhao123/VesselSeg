@@ -26,6 +26,9 @@ class SliceViewer(QWidget):
     mouse_clicked = pyqtSignal(float, float)
     mouse_dragged = pyqtSignal(float, float)
     window_changed = pyqtSignal(float, float)
+    label_edit_started = pyqtSignal()
+    label_changed = pyqtSignal()
+    label_edit_finished = pyqtSignal()
     
     def __init__(self, view_type: str, parent=None):
         """
@@ -191,6 +194,7 @@ class SliceViewer(QWidget):
         self.last_mouse_pos = None
         self.last_mouse_canvas_pos = None
         self.pending_pointer_sync_pos = None
+        self._label_edit_active = False
     
     def set_image_data(self, image_data: np.ndarray, spacing=None):
         """
@@ -1237,6 +1241,7 @@ class SliceViewer(QWidget):
         pending_pointer_sync_pos = self.pending_pointer_sync_pos
         if self.mouse_button == 1 and self.tool_mode == 'pointer' and pending_pointer_sync_pos is not None:
             self.mouse_clicked.emit(pending_pointer_sync_pos[0], pending_pointer_sync_pos[1])
+        self._finish_label_edit()
         self.mouse_pressed = False
         self.mouse_button = None
         self.last_mouse_pos = None
@@ -1387,19 +1392,42 @@ class SliceViewer(QWidget):
         
         return (orig_x, orig_y, orig_z)
     
-    def _apply_brush(self, orig_x: int, orig_y: int, orig_z: int, label_value: int):
-        """Apply circular brush to a single slice at the given voxel."""
+    def _begin_label_edit(self):
+        if not self._label_edit_active:
+            self._label_edit_active = True
+            self.label_edit_started.emit()
+
+    def _finish_label_edit(self):
+        if self._label_edit_active:
+            self.label_edit_finished.emit()
+        self._label_edit_active = False
+
+    def _iter_brush_voxels(self, orig_x: int, orig_y: int, orig_z: int):
+        """Yield label-array coordinates affected by the current circular brush."""
         H, W, D = self.label_data.shape
         if not (0 <= orig_x < W and 0 <= orig_y < H and 0 <= orig_z < D):
-            return False
-        
+            return
+
         brush_radius = self.brush_size
         for dy in range(-brush_radius, brush_radius + 1):
             for dx in range(-brush_radius, brush_radius + 1):
-                if dx*dx + dy*dy <= brush_radius*brush_radius:
+                if dx * dx + dy * dy <= brush_radius * brush_radius:
                     nx, ny = orig_x + dx, orig_y + dy
                     if 0 <= nx < W and 0 <= ny < H:
-                        self.label_data[ny, nx, orig_z] = label_value
+                        yield ny, nx, orig_z
+
+    def _apply_brush(self, orig_x: int, orig_y: int, orig_z: int, label_value: int):
+        """Apply circular brush to a single slice at the given voxel."""
+        voxels = list(self._iter_brush_voxels(orig_x, orig_y, orig_z))
+        if not voxels:
+            return False
+
+        if not any(self.label_data[ny, nx, nz] != label_value for ny, nx, nz in voxels):
+            return False
+
+        self._begin_label_edit()
+        for ny, nx, nz in voxels:
+            self.label_data[ny, nx, nz] = label_value
         return True
     
     def _paint_label(self, x: float, y: float):
@@ -1519,9 +1547,6 @@ class SliceViewer(QWidget):
         if not (0 <= orig_x < w and 0 <= orig_y < h and 0 <= orig_z < d):
             return None
         return (int(orig_x), int(orig_y), int(orig_z))
-
-    label_changed = pyqtSignal()
-
 
 class ThreeDViewer(QWidget):
     """3D濡澘瀚悷娆忔濞?"""

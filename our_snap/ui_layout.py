@@ -705,6 +705,7 @@ class MainWindow(QMainWindow):
         self.undo_history = []  # 撤销历史栈
         self.redo_history = []  # 重做历史栈
         self.max_history_size = 50  # 最大历史记录数
+        self._label_edit_history_active = False
         self._structure_dirty = False
         self._deferred_structure_timer = QTimer(self)
         self._deferred_structure_timer.setSingleShot(True)
@@ -1261,6 +1262,24 @@ class MainWindow(QMainWindow):
         btn_liver_partition.clicked.connect(self._on_liver_segment_partition)
         quant_analysis_layout.addWidget(btn_liver_partition)
 
+        btn_ai_doctor_matching = QPushButton("医生与ai自动分割标签匹配程度")
+        btn_ai_doctor_matching.setFixedHeight(40)
+        btn_ai_doctor_matching.clicked.connect(self._on_ai_doctor_label_matching)
+        quant_analysis_layout.addWidget(btn_ai_doctor_matching)
+
+        self.quant_metrics_table = QTableWidget(0, 2)
+        self.quant_metrics_table.setHorizontalHeaderLabels(["指标", "数值"])
+        self.quant_metrics_table.verticalHeader().setVisible(False)
+        self.quant_metrics_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.quant_metrics_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.quant_metrics_table.setAlternatingRowColors(True)
+        self.quant_metrics_table.setMinimumHeight(220)
+        self.quant_metrics_table.setMaximumHeight(360)
+        self.quant_metrics_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.quant_metrics_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.quant_metrics_table.setVisible(False)
+        quant_analysis_layout.addWidget(self.quant_metrics_table)
+
         quant_analysis_group.setLayout(quant_analysis_layout)
         content_layout.addWidget(quant_analysis_group)
 
@@ -1345,6 +1364,7 @@ class MainWindow(QMainWindow):
         self.four_view = FourViewWidget(force_matplotlib_3d=force_mpl_3d)
         self.four_view.crosshair_changed.connect(self._on_crosshair_changed)
         self.four_view.slice_changed.connect(self._on_slice_changed)
+        self._connect_label_edit_history()
         layout.addWidget(self.four_view)
 
         return panel
@@ -1494,8 +1514,47 @@ class MainWindow(QMainWindow):
             self.four_view.coronal_view.set_brush_size(value)
             self.four_view.sagittal_view.set_brush_size(value)
 
+    def _connect_label_edit_history(self):
+        """Connect manual brush/eraser edits to the main undo stack."""
+        for view_name in ("axial_view", "coronal_view", "sagittal_view"):
+            view = getattr(self.four_view, view_name, None)
+            if view is None:
+                continue
+            view.label_edit_started.connect(self._on_label_edit_started)
+            view.label_changed.connect(self._on_label_data_changed)
+            view.label_edit_finished.connect(self._on_label_edit_finished)
+
+    def _push_label_history_snapshot(self):
+        """Save the current label volume so the next mutation can be undone."""
+        if self.current_label_data is None:
+            return False
+        self.undo_history.append(np.copy(self.current_label_data))
+        if len(self.undo_history) > self.max_history_size:
+            self.undo_history.pop(0)
+        self.redo_history.clear()
+        return True
+
+    def _on_label_edit_started(self):
+        """Record one undo point per brush/eraser stroke."""
+        if self._label_edit_history_active:
+            return
+        if self.current_label_data is None and getattr(self.four_view, "label_data", None) is not None:
+            self.current_label_data = self.four_view.label_data
+        if self._push_label_history_snapshot():
+            self._label_edit_history_active = True
+
+    def _on_label_data_changed(self):
+        """Keep derived analysis state in sync with manual label edits."""
+        if getattr(self.four_view, "label_data", None) is not None:
+            self.current_label_data = self.four_view.label_data
+        self._mark_structure_dirty()
+
+    def _on_label_edit_finished(self):
+        self._label_edit_history_active = False
+
     def _on_undo(self):
         """撤销操作"""
+        self._label_edit_history_active = False
         if self.undo_history:
             self._swap_label_history(
                 source_stack=self.undo_history,
@@ -1505,6 +1564,7 @@ class MainWindow(QMainWindow):
 
     def _on_redo(self):
         """重做操作"""
+        self._label_edit_history_active = False
         if self.redo_history:
             self._swap_label_history(
                 source_stack=self.redo_history,
@@ -2695,6 +2755,10 @@ class MainWindow(QMainWindow):
                         print(f"AI标签方向自动修正检查失败: {align_exc}")
 
                 # 更新当前标签数据
+                if previous_label is not None and (
+                    previous_label.shape != mask.shape or not np.array_equal(previous_label, mask)
+                ):
+                    self._push_label_history_snapshot()
                 self.current_label_data = mask
                 # 更新视图
                 self.four_view.set_label_data(mask)
@@ -2960,6 +3024,76 @@ class MainWindow(QMainWindow):
             self.four_view.coronal_view.set_tool_mode(tool)
             self.four_view.sagittal_view.set_tool_mode(tool)
 
+    def _quantitative_metric_specs(self):
+        """截图/报告同款血管量化指标顺序。"""
+        return [
+            ("主干/细支比例", ("trunk_small_ratio",), False, 2),
+            ("分支数", ("branch_count",), True, 0),
+            ("分叉点数量", ("junction_count",), True, 0),
+            ("血管总体积 (ml)", ("vascular_volume", "total_vessel_volume_ml"), False, 2),
+            ("门静脉体积 (ml)", ("portal_volume", "pv_volume_ml"), False, 2),
+            ("肝静脉体积 (ml)", ("hepatic_volume", "hv_volume_ml"), False, 2),
+            ("门/肝静脉体积比", ("pv_hv_volume_ratio", "pv_hv_ratio"), False, 2),
+            ("血管总长度 (mm)", ("vascular_length", "total_length_mm"), False, 2),
+            ("门静脉长度 (mm)", ("portal_length", "pv_length_mm"), False, 2),
+            ("肝静脉长度 (mm)", ("hepatic_length", "hv_length_mm"), False, 2),
+            ("平均直径 (mm)", ("mean_diameter",), False, 2),
+            ("最大直径 (mm)", ("max_diameter",), False, 2),
+            ("门静脉平均直径 (mm)", ("portal_mean_diameter", "pv_avg_diameter_mm"), False, 2),
+            ("肝静脉平均直径 (mm)", ("hepatic_mean_diameter", "hv_avg_diameter_mm"), False, 2),
+            ("门静脉分支数", ("portal_branch_count",), True, 0),
+            ("肝静脉分支数", ("hepatic_branch_count",), True, 0),
+            ("血管密度", ("vascular_density",), False, 2),
+            ("血管体积分数", ("volume_fraction",), False, 2),
+            ("血管表面积 (mm²)", ("surface_area",), False, 2),
+            ("平均分支角度 (°)", ("mean_branch_angle",), False, 2),
+            ("血管连通性", ("connectivity",), False, 2),
+            ("血管弯曲度", ("curvature",), False, 2),
+            ("5级+微小分支体素数", ("micro_branch_voxels",), False, 2),
+        ]
+
+    def _resolve_metric_value(self, metrics: dict, keys):
+        for key in keys:
+            if key in metrics:
+                return metrics.get(key)
+        return None
+
+    def _format_quantitative_metric_value(self, value, as_integer: bool = False, decimals: int = 2) -> str:
+        try:
+            numeric = float(value)
+            if not np.isfinite(numeric):
+                return "inf"
+            if as_integer:
+                return str(int(round(numeric)))
+            return f"{numeric:.{decimals}f}"
+        except Exception:
+            return str(value)
+
+    def _update_quantitative_metrics_table(self, metrics: dict):
+        """把运行量化分析的结果写入左侧表格，不再弹出匹配指标窗口。"""
+        table = getattr(self, "quant_metrics_table", None)
+        if table is None:
+            return
+
+        rows = []
+        for label, keys, as_integer, decimals in self._quantitative_metric_specs():
+            value = self._resolve_metric_value(metrics, keys)
+            if value is None:
+                continue
+            rows.append((label, self._format_quantitative_metric_value(value, as_integer, decimals)))
+
+        table.setRowCount(len(rows))
+        for row_index, (label, value_text) in enumerate(rows):
+            label_item = QTableWidgetItem(label)
+            label_item.setToolTip(label)
+            value_item = QTableWidgetItem(value_text)
+            value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(row_index, 0, label_item)
+            table.setItem(row_index, 1, value_item)
+
+        table.resizeRowsToContents()
+        table.setVisible(bool(rows))
+
     def _on_quantitative_analysis(self):
         """运行量化分析"""
         if self.current_image_data is None or self.current_label_data is None:
@@ -3037,91 +3171,6 @@ class MainWindow(QMainWindow):
                 tumor_vessel_assessment
             )
 
-            # 显示分析结果（医生标签 vs AI标签）
-            segmentation_accuracy = None
-            segmentation_accuracy_note = None
-            doctor_label_for_eval = getattr(self, "last_doctor_label_data", None)
-            ai_label_for_eval = getattr(self, "last_ai_label_data", None)
-
-            current_label_candidate = None
-            if self.current_label_data is not None:
-                current_label_candidate = np.asarray(self.current_label_data).astype(np.uint8)
-
-            # 量化分析不再弹出资源管理器。优先使用缓存的医生标签和AI标签；
-            # 若其中一个缺失，再尝试从当前可见标签图层推断另一个标签。
-            if current_label_candidate is not None and np.any(current_label_candidate > 0):
-                if (
-                    doctor_label_for_eval is None
-                    and ai_label_for_eval is not None
-                    and current_label_candidate.shape == np.asarray(ai_label_for_eval).shape
-                    and not np.array_equal(current_label_candidate, np.asarray(ai_label_for_eval).astype(np.uint8))
-                ):
-                    doctor_label_for_eval = current_label_candidate
-                    self._set_doctor_compare_label(doctor_label_for_eval, source_text="当前可见医生/人工标签")
-                elif (
-                    ai_label_for_eval is None
-                    and doctor_label_for_eval is not None
-                    and current_label_candidate.shape == np.asarray(doctor_label_for_eval).shape
-                    and not np.array_equal(current_label_candidate, np.asarray(doctor_label_for_eval).astype(np.uint8))
-                ):
-                    ai_label_for_eval = current_label_candidate
-                    self._set_ai_compare_label(ai_label_for_eval, source_text="当前可见AI标签")
-
-            if doctor_label_for_eval is None:
-                segmentation_accuracy_note = (
-                    "未找到医生标签。请先加载医生标签，或先在当前标签图层完成/保留人工标签后再运行AI分割。"
-                )
-            elif ai_label_for_eval is None:
-                segmentation_accuracy_note = "未找到AI自动分割标签。请先运行AI自动分割，或加载AI标签作为当前可见标签。"
-            else:
-                doctor_arr = np.asarray(doctor_label_for_eval).astype(np.uint8)
-                ai_arr = np.asarray(ai_label_for_eval).astype(np.uint8)
-                if doctor_arr.shape != ai_arr.shape:
-                    segmentation_accuracy_note = (
-                        f"标签尺寸不匹配：医生标签 {doctor_arr.shape}，AI标签 {ai_arr.shape}。请先统一两者的方向和尺寸。"
-                    )
-                elif not np.any(doctor_arr > 0):
-                    segmentation_accuracy_note = "医生标签为空，无法计算匹配指标。"
-                elif not np.any(ai_arr > 0):
-                    segmentation_accuracy_note = "AI标签为空，无法计算匹配指标。"
-                else:
-                    try:
-                        segmentation_accuracy, aligned_ai_for_eval = self._evaluate_accuracy_with_auto_alignment(
-                            analyzer,
-                            ai_label=ai_arr,
-                            doctor_label=doctor_arr,
-                            spacing=spacing,
-                        )
-                        ai_label_for_eval = aligned_ai_for_eval
-                    except Exception as metric_exc:
-                        segmentation_accuracy_note = f"分割匹配指标计算失败：{metric_exc}"
-
-            result_lines = ["AI Segmentation Matching Results (Doctor vs AI):", ""]
-            if segmentation_accuracy is not None and segmentation_accuracy.get("status") == "ok":
-                overall = segmentation_accuracy.get("overall", {})
-                dice = float(overall.get("dice", 0.0))
-                hd95 = float(overall.get("hd95_mm", float("inf")))
-                jaccard = float(overall.get("jaccard", 0.0))
-                asd = float(overall.get("asd_mm", float("inf")))
-                final_match = float(
-                    segmentation_accuracy.get(
-                        "final_matching_degree_percent",
-                        overall.get("matching_degree_percent", overall.get("accuracy_percent", 0.0)),
-                    )
-                )
-
-                result_lines.append(f"Dice: {dice:.4f}")
-                result_lines.append(f"HD95: {hd95:.4f} mm" if np.isfinite(hd95) else "HD95: inf")
-                result_lines.append(f"Jaccard: {jaccard:.4f}")
-                result_lines.append(f"ASD: {asd:.4f} mm" if np.isfinite(asd) else "ASD: inf")
-                result_lines.append(f"Matching Degree (Accuracy): {final_match:.2f}%")
-            else:
-                result_lines.append("Unable to compute segmentation metrics.")
-                result_lines.append(f"Reason: {segmentation_accuracy_note or '医生标签或AI标签不可用。'}")
-
-            result_text = "\n".join(result_lines)
-            self._show_long_text_dialog("量化分析结果", result_text)
-
             # 保存分析结果
             self.quantitative_results = {
                 'volumes': volumes,
@@ -3129,17 +3178,126 @@ class MainWindow(QMainWindow):
                 'tumor_vessel_assessment': tumor_vessel_assessment,
                 'risk_assessment': risk_assessment,
                 'couinaud_segmentation': segmentation.astype(np.uint8),
-                'segmentation_accuracy': segmentation_accuracy,
             }
             if getattr(self, 'last_cut_stats', None):
                 self.quantitative_results['cut_stats'] = self.last_cut_stats
 
+            self._update_quantitative_metrics_table(vascular_metrics)
+
             # 显示状态栏提示
-            self.statusBar().showMessage("量化分析完成")
+            self.statusBar().showMessage("量化分析完成：血管量化指标已更新")
 
         except Exception as e:
             self.statusBar().showMessage("量化分析失败")
             QMessageBox.critical(self, "错误", f"量化分析失败:\n{e}")
+
+    def _compute_ai_doctor_matching_metrics(self, analyzer=None):
+        """计算医生标签与AI自动分割标签的匹配指标。"""
+        if self.current_image_data is None:
+            return None, "请先加载影像后再进行AI与医生标签匹配。"
+
+        if analyzer is None:
+            from quantitative_analysis import QuantitativeAnalyzer
+            analyzer = QuantitativeAnalyzer()
+
+        spacing = self.current_metadata['spacing'] if (
+            self.current_metadata and 'spacing' in self.current_metadata
+        ) else (1.0, 1.0, 1.0)
+
+        doctor_label_for_eval = getattr(self, "last_doctor_label_data", None)
+        ai_label_for_eval = getattr(self, "last_ai_label_data", None)
+
+        current_label_candidate = None
+        if self.current_label_data is not None:
+            current_label_candidate = np.asarray(self.current_label_data).astype(np.uint8)
+
+        # 优先使用缓存的医生标签和AI标签；若缺失，再尝试从当前可见标签图层推断另一个标签。
+        if current_label_candidate is not None and np.any(current_label_candidate > 0):
+            if (
+                doctor_label_for_eval is None
+                and ai_label_for_eval is not None
+                and current_label_candidate.shape == np.asarray(ai_label_for_eval).shape
+                and not np.array_equal(current_label_candidate, np.asarray(ai_label_for_eval).astype(np.uint8))
+            ):
+                doctor_label_for_eval = current_label_candidate
+                self._set_doctor_compare_label(doctor_label_for_eval, source_text="当前可见医生/人工标签")
+            elif (
+                ai_label_for_eval is None
+                and doctor_label_for_eval is not None
+                and current_label_candidate.shape == np.asarray(doctor_label_for_eval).shape
+                and not np.array_equal(current_label_candidate, np.asarray(doctor_label_for_eval).astype(np.uint8))
+            ):
+                ai_label_for_eval = current_label_candidate
+                self._set_ai_compare_label(ai_label_for_eval, source_text="当前可见AI标签")
+
+        if doctor_label_for_eval is None:
+            return None, "未找到医生标签。请先加载医生标签，或先在当前标签图层完成/保留人工标签后再运行AI分割。"
+        if ai_label_for_eval is None:
+            return None, "未找到AI自动分割标签。请先运行AI自动分割，或加载AI标签作为当前可见标签。"
+
+        doctor_arr = np.asarray(doctor_label_for_eval).astype(np.uint8)
+        ai_arr = np.asarray(ai_label_for_eval).astype(np.uint8)
+        if doctor_arr.shape != ai_arr.shape:
+            return None, f"标签尺寸不匹配：医生标签 {doctor_arr.shape}，AI标签 {ai_arr.shape}。请先统一两者的方向和尺寸。"
+        if not np.any(doctor_arr > 0):
+            return None, "医生标签为空，无法计算匹配指标。"
+        if not np.any(ai_arr > 0):
+            return None, "AI标签为空，无法计算匹配指标。"
+
+        try:
+            segmentation_accuracy, _aligned_ai_for_eval = self._evaluate_accuracy_with_auto_alignment(
+                analyzer,
+                ai_label=ai_arr,
+                doctor_label=doctor_arr,
+                spacing=spacing,
+            )
+            return segmentation_accuracy, None
+        except Exception as metric_exc:
+            return None, f"分割匹配指标计算失败：{metric_exc}"
+
+    def _format_ai_doctor_matching_result(self, segmentation_accuracy, note=None):
+        """格式化医生标签与AI标签匹配程度结果。"""
+        result_lines = ["AI Segmentation Matching Results (Doctor vs AI):", ""]
+        if segmentation_accuracy is not None and segmentation_accuracy.get("status") == "ok":
+            overall = segmentation_accuracy.get("overall", {})
+            dice = float(overall.get("dice", 0.0))
+            hd95 = float(overall.get("hd95_mm", float("inf")))
+            jaccard = float(overall.get("jaccard", 0.0))
+            asd = float(overall.get("asd_mm", float("inf")))
+            final_match = float(
+                segmentation_accuracy.get(
+                    "final_matching_degree_percent",
+                    overall.get("matching_degree_percent", overall.get("accuracy_percent", 0.0)),
+                )
+            )
+
+            result_lines.append(f"Dice: {dice:.4f}")
+            result_lines.append(f"HD95: {hd95:.4f} mm" if np.isfinite(hd95) else "HD95: inf")
+            result_lines.append(f"Jaccard: {jaccard:.4f}")
+            result_lines.append(f"ASD: {asd:.4f} mm" if np.isfinite(asd) else "ASD: inf")
+            result_lines.append(f"Matching Degree (Accuracy): {final_match:.2f}%")
+        else:
+            result_lines.append("Unable to compute segmentation metrics.")
+            result_lines.append(f"Reason: {note or '医生标签或AI标签不可用。'}")
+
+        return "\n".join(result_lines)
+
+    def _on_ai_doctor_label_matching(self):
+        """弹出医生标签与AI自动分割标签匹配程度窗口。"""
+        try:
+            self.statusBar().showMessage("正在计算医生与AI标签匹配程度...")
+            segmentation_accuracy, note = self._compute_ai_doctor_matching_metrics()
+            result_text = self._format_ai_doctor_matching_result(segmentation_accuracy, note)
+
+            if not hasattr(self, 'quantitative_results') or not isinstance(self.quantitative_results, dict):
+                self.quantitative_results = {}
+            self.quantitative_results['segmentation_accuracy'] = segmentation_accuracy
+
+            self._show_long_text_dialog("医生与AI自动分割标签匹配程度", result_text)
+            self.statusBar().showMessage("医生与AI标签匹配程度计算完成", 4000)
+        except Exception as e:
+            self.statusBar().showMessage("医生与AI标签匹配程度计算失败", 3000)
+            QMessageBox.critical(self, "错误", f"医生与AI标签匹配程度计算失败:\n{e}")
 
     def _on_liver_segment_partition(self):
         """独立执行肝段自动划分（不依赖完整量化分析流程）。"""
@@ -3541,6 +3699,9 @@ class MainWindow(QMainWindow):
         self._structure_dirty = False
         self.last_vessel_analysis = {}
         self.last_cut_stats = {}
+        if hasattr(self, "quant_metrics_table"):
+            self.quant_metrics_table.setRowCount(0)
+            self.quant_metrics_table.setVisible(False)
         if hasattr(self, 'four_view') and hasattr(self.four_view, 'view_3d'):
             try:
                 self.four_view.view_3d.set_structure_data(None)
